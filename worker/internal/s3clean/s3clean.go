@@ -1,6 +1,6 @@
 // Package s3clean erases tenant objects from one storage root: an S3 bucket prefix or a
 // local directory, the same roots the Rust server's ATTACHMENTS_FOLDER and SENDS_FOLDER
-// name. Keys are relative to the root and always start with tenants/<tenant_id>/.
+// name. Keys are relative to the root and always start with cells/<cell>/tenants/<tenant_id>/.
 package s3clean
 
 import (
@@ -21,6 +21,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Busnes-app/kyvault-worker/internal/config"
 )
 
 // Eraser deletes from one storage root. A missing object is already deleted; any other
@@ -33,10 +35,14 @@ type Eraser interface {
 	DeletePrefix(ctx context.Context, prefix string) error
 }
 
-// CheckKey refuses anything but a clean path strictly inside tenants/.
+// CheckKey refuses anything but a clean path strictly inside cells/<cell>/tenants/<tenant_id>/.
 func CheckKey(key string) error {
 	k := strings.TrimSuffix(key, "/")
-	if k != path.Clean(k) || !strings.HasPrefix(k, "tenants/") || strings.Contains(k, "..") || strings.ContainsRune(k, '\\') {
+	if k == "" || k != path.Clean(k) || strings.Contains(k, "..") || strings.ContainsRune(k, '\\') {
+		return fmt.Errorf("s3clean: refusing unsafe key %q", key)
+	}
+	parts := strings.Split(k, "/")
+	if len(parts) < 4 || parts[0] != "cells" || !config.IsValidCellSlug(parts[1]) || parts[2] != "tenants" || parts[3] == "" || parts[3] == "." {
 		return fmt.Errorf("s3clean: refusing unsafe key %q", key)
 	}
 	return nil

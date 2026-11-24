@@ -26,11 +26,15 @@ type Vault struct {
 	URL string
 
 	mu sync.Mutex
-	// Fail makes the next N calls to a path ("users/sync") answer 500.
-	Fail  map[string]int
-	Calls []Call
-	// PurgeRequired is returned by the next orgs/reconcile, then cleared.
-	PurgeRequired []string
+	// Fail makes the next N calls to a path ("users/sync") answer 500 (or FailStatus[path]).
+	Fail       map[string]int
+	FailStatus map[string]int
+	Calls      []Call
+	// Cells is returned by health; defaults to ["eu-west-1"] when empty.
+	Cells []string
+	// PurgeRequired and RegionMismatch are returned by the next orgs/reconcile, then cleared.
+	PurgeRequired  []string
+	RegionMismatch []string
 	// ErasePending is the pending_deletions_queued each users/erase reports.
 	ErasePending int
 	// Queue is the durable cleanup queue; completed items leave it, failed ones stay.
@@ -44,7 +48,7 @@ type Vault struct {
 }
 
 func New(t *testing.T) *Vault {
-	v := &Vault{t: t, Fail: map[string]int{}, Failures: map[string]string{}}
+	v := &Vault{t: t, Fail: map[string]int{}, FailStatus: map[string]int{}, Failures: map[string]string{}, Cells: []string{"eu-west-1"}}
 	srv := httptest.NewServer(v)
 	t.Cleanup(srv.Close)
 	v.URL = srv.URL
@@ -106,18 +110,28 @@ func (v *Vault) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	v.Calls = append(v.Calls, Call{Path: path, Body: body})
 	if v.Fail[path] > 0 {
 		v.Fail[path]--
-		http.Error(w, `{"error":"transient"}`, http.StatusInternalServerError)
+		code := v.FailStatus[path]
+		if code == 0 {
+			code = http.StatusInternalServerError
+		}
+		http.Error(w, `{"error":"simulated"}`, code)
 		return
 	}
 	var out any
 	switch {
 	case path == "health":
-		out = vaultapi.Health{Status: "ok", MultiTenant: !v.SingleTenant, HomeRegion: "us"}
+		out = vaultapi.Health{Status: "ok", MultiTenant: !v.SingleTenant, Cells: append([]string{}, v.Cells...)}
 	case path == "orgs/reconcile":
 		var req vaultapi.ReconcileRequest
 		_ = json.Unmarshal(body, &req)
-		out = vaultapi.ReconcileResult{Applied: len(req.Orgs), FencedTenantIDs: []string{}, PurgeRequiredTenantIDs: append([]string{}, v.PurgeRequired...)}
+		out = vaultapi.ReconcileResult{
+			Applied:                 len(req.Orgs),
+			FencedTenantIDs:         []string{},
+			PurgeRequiredTenantIDs:  append([]string{}, v.PurgeRequired...),
+			RegionMismatchTenantIDs: append([]string{}, v.RegionMismatch...),
+		}
 		v.PurgeRequired = nil
+		v.RegionMismatch = nil
 	case path == "users/logout":
 		out = vaultapi.LogoutResult{Found: true, UserUUID: "u-1"}
 	case path == "users/sync":

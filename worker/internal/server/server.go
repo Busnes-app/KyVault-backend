@@ -264,10 +264,16 @@ func (s *Server) applyOnce(w http.ResponseWriter, r *http.Request, key, kind str
 	// State bookkeeping must finish even if the sender hangs up mid-call.
 	bg := context.WithoutCancel(r.Context())
 	if err := apply(r.Context()); err != nil {
-		s.log().Error("vault mutation failed; left retryable", "kind", kind, "err", err)
 		if rerr := s.State.Release(bg, key, token); rerr != nil {
 			s.log().Error("releasing claim failed; retry waits for the lease", "kind", kind, "err", rerr)
 		}
+		var statusErr *vaultapi.StatusError
+		if errors.As(err, &statusErr) && statusErr.Code == http.StatusForbidden {
+			s.log().Warn("vault refused mutation for unserved cell (C5)", "kind", kind, "err", err)
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+			return
+		}
+		s.log().Error("vault mutation failed; left retryable", "kind", kind, "err", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "vault unavailable"})
 		return
 	}

@@ -55,7 +55,10 @@ const (
 	targetVolume  = "kyvault-e2e-target"
 	pgImage       = "postgres:17-alpine"
 	s3Image       = "rustfs/rustfs:1.0.3"
-	homeRegion    = "eu-west"
+	cellA         = "eu-west-1"
+	cellB         = "eu-west-2"
+	foreignCell   = "us-east-1"
+	servedCells   = cellA + "," + cellB
 	domain        = "https://vault.e2e.test"
 	bucket        = "kyvault"
 	s3Access      = "e2eaccesskey"
@@ -658,7 +661,7 @@ func replicaEnv(port string) []string {
 		"DATA_FOLDER=/data",
 		"DATABASE_URL=postgresql://vault:vaultpw@127.0.0.1:" + pgPort + "/vault",
 		"TENANCY_MODE=multi",
-		"HOME_REGION=" + homeRegion,
+		"KY_CELLS=" + servedCells,
 		"TENANCY_INTERNAL_API_SECRET=" + internalToken,
 		"TENANCY_PG_NOTIFY_ENABLED=true",
 		"SSO_ENABLED=true", "SSO_ONLY=true", "SSO_AUTHORITY=" + issuer,
@@ -811,6 +814,7 @@ func (e *env) startWorker(t *testing.T, fromZero bool) {
 		"PATH=" + os.Getenv("PATH"), "HOME=" + e.dir, "SSL_CERT_FILE=" + e.caFile,
 		"WORKER_LISTEN_ADDR=127.0.0.1:" + workerPort,
 		"DATABASE_URL=" + pgURL,
+		"KY_CELLS=" + servedCells,
 		"VAULT_INTERNAL_API_URL=" + r1,
 		"TENANCY_INTERNAL_API_SECRET=" + internalToken,
 		"SSO_AUTHORITY=" + issuer, "SSO_CLIENT_ID=" + clientID, "SSO_CLIENT_SECRET=" + clientSecret,
@@ -905,6 +909,6 @@ func uploadAttachment(t *testing.T, base, token, cipher, attID string, size int)
 		map[string]string{"Authorization": "Bearer " + token, "Content-Type": mw.FormDataContentType()}, buf.Bytes())
 }
 
-func attachmentKey(tenant, cipher, att string) string {
-	return "attachments/tenants/" + tenant + "/attachments/" + cipher + "/" + att
+func attachmentKey(cell, tenant, cipher, att string) string {
+	return "attachments/cells/" + cell + "/tenants/" + tenant + "/attachments/" + cipher + "/" + att
 }

@@ -21,9 +21,15 @@ const MaxPollInterval = 60 * time.Second
 // MinInternalSecretLen is the minimum TENANCY_INTERNAL_API_SECRET length.
 const MinInternalSecretLen = 32
 
+// MaxCells is the maximum number of cells one deployment may serve (Cells C2).
+const MaxCells = 32
+
 type Config struct {
 	ListenAddr  string
 	DatabaseURL string
+
+	// Cells is the set of home_region slugs this deployment serves (KY_CELLS, C1/C2/C5).
+	Cells []string
 
 	// Rust vault private management API.
 	VaultAPIURL    string
@@ -48,7 +54,7 @@ type Config struct {
 	StorageRenewBefore time.Duration
 
 	// Storage roots, exactly as the Rust server resolves them: a local directory or
-	// s3://bucket/prefix. Object keys (tenants/<tid>/...) are relative to these.
+	// s3://bucket/prefix. Object keys (cells/<cell>/tenants/<tid>/...) are relative to these.
 	AttachmentsRoot string
 	SendsRoot       string
 
@@ -76,11 +82,17 @@ func LoadFromEnv() (Config, error) {
 		return b
 	}
 
+	cells, err := ParseCells(env("KY_CELLS"))
+	if err != nil {
+		errs = append(errs, fmt.Errorf("KY_CELLS: %w", err))
+	}
+
 	issuer := strings.TrimRight(env("SSO_AUTHORITY"), "/")
 	dataFolder := env("DATA_FOLDER")
 	cfg := Config{
 		ListenAddr:         envOr("WORKER_LISTEN_ADDR", "127.0.0.1:8085"),
 		DatabaseURL:        env("DATABASE_URL"),
+		Cells:              cells,
 		VaultAPIURL:        strings.TrimRight(env("VAULT_INTERNAL_API_URL"), "/"),
 		InternalSecret:     env("TENANCY_INTERNAL_API_SECRET"),
 		KyIdentityURL:      strings.TrimRight(envOr("KYIDENTITY_BASE_URL", issuer), "/"),
@@ -149,6 +161,9 @@ func (c Config) Validate() error {
 	req("SSO_CLIENT_SECRET", c.ClientSecret)
 	req("SYNC_WEBHOOK_SECRET", c.SyncWebhookSecret)
 
+	if err := ValidateCells(c.Cells); err != nil {
+		errs = append(errs, fmt.Errorf("KY_CELLS: %w", err))
+	}
 	if c.DatabaseURL != "" && !strings.HasPrefix(c.DatabaseURL, "postgres://") && !strings.HasPrefix(c.DatabaseURL, "postgresql://") {
 		errs = append(errs, errors.New("DATABASE_URL must be a PostgreSQL connection string"))
 	}
@@ -174,6 +189,61 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are required for s3:// storage roots"))
 	}
 	return errors.Join(errs...)
+}
+
+// IsValidCellSlug reports whether s matches ^[a-z][a-z0-9-]{1,31}$, the cell / home_region
+// slug grammar shared with the Rust server and KyIdentity.
+func IsValidCellSlug(s string) bool {
+	if len(s) < 2 || len(s) > 32 {
+		return false
+	}
+	if s[0] < 'a' || s[0] > 'z' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// ParseCells parses a comma-separated KY_CELLS list into 1..=MaxCells unique valid slugs.
+func ParseCells(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, errors.New("must list at least one cell slug")
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, strings.TrimSpace(p))
+	}
+	if err := ValidateCells(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ValidateCells enforces 1..=MaxCells unique valid cell slugs.
+func ValidateCells(cells []string) error {
+	if len(cells) == 0 {
+		return errors.New("must list at least one cell slug")
+	}
+	if len(cells) > MaxCells {
+		return fmt.Errorf("may list at most %d cells (got %d)", MaxCells, len(cells))
+	}
+	seen := make(map[string]struct{}, len(cells))
+	for _, c := range cells {
+		if !IsValidCellSlug(c) {
+			return fmt.Errorf("invalid cell slug %q", c)
+		}
+		if _, dup := seen[c]; dup {
+			return fmt.Errorf("duplicate cell slug %q", c)
+		}
+		seen[c] = struct{}{}
+	}
+	return nil
 }
 
 // ValidateInternalURL accepts https anywhere, and plain http only to a loopback, private

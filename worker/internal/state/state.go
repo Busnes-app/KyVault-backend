@@ -30,6 +30,12 @@ type Store interface {
 	// SaveCursor raises name's revision to rev; it never moves backwards.
 	SaveCursor(ctx context.Context, name string, rev int64) error
 
+	// KnownOrgCell returns the immutable first-seen home_region (cell) for orgID.
+	KnownOrgCell(ctx context.Context, orgID string) (string, bool, error)
+	// RememberOrgCell records orgID's home_region on first sight; subsequent calls for the
+	// same orgID are no-ops (C4: org home_region is immutable).
+	RememberOrgCell(ctx context.Context, orgID, cell string) error
+
 	// Claim takes a lease on key until leaseUntil. A pending key whose lease expired
 	// is claimable again. expiresAt bounds how long the key is retained.
 	Claim(ctx context.Context, key, kind, token string, now, leaseUntil, expiresAt time.Time) (Claim, error)

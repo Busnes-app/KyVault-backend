@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 func setBase(t *testing.T) {
 	for k, v := range map[string]string{
 		"DATABASE_URL":                "postgres://w@db/worker",
+		"KY_CELLS":                    "eu-west-1,eu-west-2",
 		"VAULT_INTERNAL_API_URL":      "http://vault:8000",
 		"TENANCY_INTERNAL_API_SECRET": strings.Repeat("s", 32),
 		"SSO_AUTHORITY":               "https://id.example/",
@@ -26,6 +29,9 @@ func TestDefaults(t *testing.T) {
 	cfg, err := LoadFromEnv()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.Cells, []string{"eu-west-1", "eu-west-2"}) {
+		t.Fatalf("cells: %v", cfg.Cells)
 	}
 	if cfg.OIDCIssuer != "https://id.example" || cfg.KyIdentityURL != cfg.OIDCIssuer || cfg.OIDCJWKSURL != "https://id.example/.well-known/jwks.json" {
 		t.Fatalf("issuer defaults: %+v", cfg)
@@ -58,7 +64,12 @@ func TestS3RootsAndClamp(t *testing.T) {
 }
 
 func TestRefusals(t *testing.T) {
+	tooMany := make([]string, MaxCells+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("us-east-%d", i+1)
+	}
 	cases := map[string]string{
+		"KY_CELLS":                    "",
 		"TENANCY_INTERNAL_API_SECRET": "short",
 		"VAULT_INTERNAL_API_URL":      "http://vault.example.com",
 		"SYNC_WEBHOOK_SECRET":         "",
@@ -73,6 +84,24 @@ func TestRefusals(t *testing.T) {
 			t.Setenv(k, v)
 			if _, err := LoadFromEnv(); err == nil {
 				t.Fatalf("%s=%q accepted", k, v)
+			}
+		})
+	}
+	for _, badCells := range []string{
+		"EU-WEST-1",
+		"a",
+		"1cell",
+		"eu-west-1,eu-west-1",
+		"eu-west-1,",
+		"../escape",
+		strings.Repeat("a", 33),
+		strings.Join(tooMany, ","),
+	} {
+		t.Run("KY_CELLS/"+badCells, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("KY_CELLS", badCells)
+			if _, err := LoadFromEnv(); err == nil {
+				t.Fatalf("KY_CELLS=%q accepted", badCells)
 			}
 		})
 	}

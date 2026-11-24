@@ -81,13 +81,18 @@ func (e *env) seed(t *testing.T) {
 func (e *env) committed(t *testing.T, tenant string) int64 {
 	return e.num(t, `SELECT
 		(SELECT COALESCE(SUM(file_size), 0) FROM attachments WHERE tenant_id = $1) +
-		(SELECT COALESCE(SUM(OCTET_LENGTH(data)), 0) FROM ciphers WHERE tenant_id = $1) +
+		(SELECT COALESCE(SUM(
+			COALESCE(OCTET_LENGTH(name), 0) + COALESCE(OCTET_LENGTH(notes), 0) +
+			COALESCE(OCTET_LENGTH(fields), 0) + COALESCE(OCTET_LENGTH(data), 0) +
+			COALESCE(OCTET_LENGTH(password_history), 0) + COALESCE(OCTET_LENGTH(key), 0)
+		), 0) FROM ciphers WHERE tenant_id = $1) +
 		(SELECT COALESCE(SUM(OCTET_LENGTH(wrapped_user_key) + COALESCE(OCTET_LENGTH(wrapped_private_key), 0)), 0)
-		   FROM tenant_recovery_bundles WHERE tenant_id = $1 AND revoked_at IS NULL)`, tenant)
+		   FROM tenant_recovery_bundles WHERE tenant_id = $1)`, tenant)
 }
 
 type tenantRow struct {
 	Status                           string
+	HomeRegion                       string
 	AppEnabled                       bool
 	Epoch, Ceiling, Pool, Reserved   int64
 	ReportSeq, Applied               int64
@@ -99,10 +104,10 @@ type tenantRow struct {
 func (e *env) tenant(t *testing.T, id string) (tenantRow, bool) {
 	t.Helper()
 	var r tenantRow
-	err := e.db.QueryRow(context.Background(), `SELECT status, app_enabled, access_epoch, storage_ceiling_bytes,
+	err := e.db.QueryRow(context.Background(), `SELECT status, home_region, app_enabled, access_epoch, storage_ceiling_bytes,
 		storage_pool_bytes, storage_reserved_bytes, storage_report_seq, storage_last_applied_seq,
 		storage_grant_expires_at, storage_pending_seq, authority_refreshed_at, storage_seq_stale, erased_at
-		FROM tenants WHERE id = $1`, id).Scan(&r.Status, &r.AppEnabled, &r.Epoch, &r.Ceiling, &r.Pool, &r.Reserved,
+		FROM tenants WHERE id = $1`, id).Scan(&r.Status, &r.HomeRegion, &r.AppEnabled, &r.Epoch, &r.Ceiling, &r.Pool, &r.Reserved,
 		&r.ReportSeq, &r.Applied, &r.Expires, &r.PendingSeq, &r.AuthorityAt, &r.Stale, &r.ErasedAt)
 	if err == pgx.ErrNoRows {
 		return r, false
@@ -142,13 +147,20 @@ func lastOK(k *kyid, org string, seq int64) (exchange, bool) {
 	return exchange{}, false
 }
 
+func cellFor(tenant string) string {
+	if tenant == orgB {
+		return cellB
+	}
+	return cellA
+}
+
 func TestLivePostgres(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
 
-	e.kyid.setOrg(orgA, "active", true, homeRegion)
-	e.kyid.setOrg(orgB, "active", true, homeRegion)
-	e.kyid.setOrg(orgC, "active", true, "us-east")
+	e.kyid.setOrg(orgA, "active", true, cellA)
+	e.kyid.setOrg(orgB, "active", true, cellB)
+	e.kyid.setOrg(orgC, "active", true, foreignCell)
 	e.seed(t)
 	e.startWorker(t, false)
 
@@ -156,12 +168,12 @@ func TestLivePostgres(t *testing.T) {
 		for _, base := range []string{r1, r2} {
 			r := internal(t, base, "GET", "health", nil)
 			var h struct {
-				Status      string `json:"status"`
-				MultiTenant bool   `json:"multi_tenant"`
-				HomeRegion  string `json:"home_region"`
+				Status      string   `json:"status"`
+				MultiTenant bool     `json:"multi_tenant"`
+				Cells       []string `json:"cells"`
 			}
 			r.json(t, &h)
-			if r.code != 200 || h.Status != "ok" || !h.MultiTenant || h.HomeRegion != homeRegion {
+			if r.code != 200 || h.Status != "ok" || !h.MultiTenant || strings.Join(h.Cells, ",") != servedCells {
 				t.Fatalf("%s health: %d %s", base, r.code, r.body)
 			}
 		}
@@ -169,7 +181,7 @@ func TestLivePostgres(t *testing.T) {
 			t.Fatalf("single-tenant health: want 404, got %d %s", r.code, r.body)
 		}
 		for _, tbl := range []string{"tenants", "tenant_pending_deletions", "tenant_erased_subjects",
-			"tenant_recovery_bundles", "worker_sync_cursors", "worker_processed_events"} {
+			"tenant_recovery_bundles", "worker_sync_cursors", "worker_processed_events", "worker_known_orgs"} {
 			if e.num(t, "SELECT count(*) FROM information_schema.tables WHERE table_name = $1", tbl) != 1 {
 				t.Fatalf("table %s missing on PostgreSQL", tbl)
 			}
@@ -188,7 +200,7 @@ func TestLivePostgres(t *testing.T) {
 					t.Fatalf("%s health with %v: want 401, got %d", base, h, r.code)
 				}
 			}
-			body := []byte(`{"orgs":[{"id":"dddddddd-0000-4000-8000-000000000004","status":"active","enabled":true}]}`)
+			body := []byte(`{"orgs":[{"id":"dddddddd-0000-4000-8000-000000000004","status":"active","enabled":true,"home_region":"eu-west-1"}]}`)
 			if r := call(t, "POST", base+"/internal/tenancy/v1/orgs/reconcile",
 				map[string]string{"Authorization": "Bearer nope", "Content-Type": "application/json"}, body); r.code != 401 {
 				t.Fatalf("unauthenticated reconcile: %d", r.code)
@@ -202,12 +214,12 @@ func TestLivePostgres(t *testing.T) {
 	t.Run("3 org reconcile and two-replica fencing", func(t *testing.T) {
 		for _, id := range []string{orgA, orgB} {
 			r := e.mustTenant(t, id)
-			if r.Status != "active" || !r.AppEnabled || r.AuthorityAt == nil || time.Now().Unix()-*r.AuthorityAt > 60 {
+			if r.Status != "active" || !r.AppEnabled || r.HomeRegion != cellFor(id) || r.AuthorityAt == nil || time.Now().Unix()-*r.AuthorityAt > 60 {
 				t.Fatalf("tenant %s after initial reconcile: %+v", id, r)
 			}
 		}
 		if _, ok := e.tenant(t, orgC); ok {
-			t.Fatal("other region's org was provisioned here")
+			t.Fatal("other cell's org was provisioned here")
 		}
 
 		// Hub connections on replica 2; the fence is applied through replica 1.
@@ -228,7 +240,7 @@ func TestLivePostgres(t *testing.T) {
 		before := e.mustTenant(t, orgA)
 		stampA2, rtA2 := e.stamp(t, a2)
 		stampB1, _ := e.stamp(t, b1)
-		e.kyid.setOrg(orgA, "suspended", true, homeRegion)
+		e.kyid.setOrg(orgA, "suspended", true, cellA)
 
 		eventually(t, 15*time.Second, "tenant A suspended", func() error {
 			if r := e.mustTenant(t, orgA); r.Status != "suspended" || r.Epoch != before.Epoch+1 {
@@ -276,7 +288,7 @@ func TestLivePostgres(t *testing.T) {
 			t.Fatalf("replica 2 rejected tenant B: %d", c)
 		}
 
-		e.kyid.setOrg(orgA, "active", true, homeRegion)
+		e.kyid.setOrg(orgA, "active", true, cellA)
 		eventually(t, 15*time.Second, "tenant A reactivated", func() error {
 			if r := e.mustTenant(t, orgA); r.Status != "active" || r.Epoch != before.Epoch+1 {
 				return fmt.Errorf("%+v", r)
@@ -436,7 +448,7 @@ func TestLivePostgres(t *testing.T) {
 		if r := uploadAttachment(t, r2, tokA2, pcA2, att.AttachmentID, int(size)); r.code != 200 {
 			t.Fatalf("upload to admitted attachment: %d %s", r.code, r.body)
 		}
-		if !s3Exists(t, attachmentKey(orgA, pcA2, att.AttachmentID)) {
+		if !s3Exists(t, attachmentKey(cellA, orgA, pcA2, att.AttachmentID)) {
 			t.Fatal("admitted upload not in S3")
 		}
 		if r := e.mustTenant(t, orgA); r.Reserved != 0 {
@@ -456,7 +468,7 @@ func TestLivePostgres(t *testing.T) {
 		}
 		pre.json(t, &preAtt)
 		epoch := e.mustTenant(t, orgA).Epoch
-		e.kyid.setOrg(orgA, "suspended", true, homeRegion)
+		e.kyid.setOrg(orgA, "suspended", true, cellA)
 		eventually(t, 15*time.Second, "tenant A fenced", func() error {
 			if r := e.mustTenant(t, orgA); r.Epoch != epoch+1 {
 				return fmt.Errorf("%+v", r)
@@ -466,10 +478,10 @@ func TestLivePostgres(t *testing.T) {
 		if r := uploadAttachment(t, r2, tokA1, pcA1, preAtt.AttachmentID, 1000); r.code == 200 {
 			t.Fatal("fenced tenant finalized an upload")
 		}
-		if s3Exists(t, attachmentKey(orgA, pcA1, preAtt.AttachmentID)) {
+		if s3Exists(t, attachmentKey(cellA, orgA, pcA1, preAtt.AttachmentID)) {
 			t.Fatal("fenced upload reached S3")
 		}
-		e.kyid.setOrg(orgA, "active", true, homeRegion)
+		e.kyid.setOrg(orgA, "active", true, cellA)
 		eventually(t, 15*time.Second, "tenant A grant after reactivation", func() error {
 			r := e.mustTenant(t, orgA)
 			if r.Status != "active" || r.Expires == nil || *r.Expires < time.Now().Unix() {
@@ -500,7 +512,7 @@ func TestLivePostgres(t *testing.T) {
 			if r := uploadAttachment(t, up.base, tok, up.cipher, a.AttachmentID, 4096); r.code != 200 {
 				t.Fatalf("upload for %s: %d %s", up.u.uuid, r.code, r.body)
 			}
-			if !s3Exists(t, attachmentKey(up.u.tenant, up.cipher, a.AttachmentID)) {
+			if !s3Exists(t, attachmentKey(cellFor(up.u.tenant), up.u.tenant, up.cipher, a.AttachmentID)) {
 				t.Fatal("upload not in S3")
 			}
 			e.exec(t, "UPDATE ciphers SET notes = $1 WHERE uuid = $2", a.AttachmentID, up.cipher)
@@ -565,7 +577,7 @@ func TestLivePostgres(t *testing.T) {
 
 	t.Run("6 user erasure keeps shared org data", func(t *testing.T) {
 		attA1 := e.str(t, "SELECT notes FROM ciphers WHERE uuid = $1", pcA1)
-		keyA1 := attachmentKey(orgA, pcA1, attA1)
+		keyA1 := attachmentKey(cellA, orgA, pcA1, attA1)
 		if !s3Exists(t, keyA1) {
 			t.Fatal("precondition: A1 attachment in S3")
 		}
@@ -636,8 +648,8 @@ func TestLivePostgres(t *testing.T) {
 		}
 		before := snapB()
 		attB1 := e.str(t, "SELECT notes FROM ciphers WHERE uuid = $1", pcB1)
-		keyB1 := attachmentKey(orgB, pcB1, attB1)
-		keyA2 := attachmentKey(orgA, pcA2, e.str(t, "SELECT notes FROM ciphers WHERE uuid = $1", pcA2))
+		keyB1 := attachmentKey(cellB, orgB, pcB1, attB1)
+		keyA2 := attachmentKey(cellA, orgA, pcA2, e.str(t, "SELECT notes FROM ciphers WHERE uuid = $1", pcA2))
 		if !s3Exists(t, keyB1) || !s3Exists(t, keyA2) {
 			t.Fatal("precondition: objects in S3")
 		}
@@ -645,7 +657,7 @@ func TestLivePostgres(t *testing.T) {
 			t.Fatalf("precondition: sends root must be missing: %v", err)
 		}
 
-		e.kyid.setOrg(orgA, "deleted", false, homeRegion)
+		e.kyid.setOrg(orgA, "deleted", false, cellA)
 		eventually(t, 15*time.Second, "purge with failing prefix cleanup", func() error {
 			r := e.mustTenant(t, orgA)
 			if r.Status != "purge_pending" {
@@ -695,7 +707,7 @@ func TestLivePostgres(t *testing.T) {
 		if n := e.num(t, "SELECT count(*) FROM tenant_pending_deletions WHERE tenant_id = $1", orgA); n != 0 {
 			t.Fatalf("%d pending deletions left", n)
 		}
-		if n := s3Count(t, "attachments/tenants/"+orgA+"/"); n != 0 {
+		if n := s3Count(t, "attachments/cells/"+cellA+"/tenants/"+orgA+"/"); n != 0 {
 			t.Fatalf("%d tenant A objects left", n)
 		}
 		if after := snapB(); after != before {
@@ -756,6 +768,69 @@ func TestLivePostgres(t *testing.T) {
 		}
 		if cursor("suite_orgs") < orgsCur || cursor("suite_erased") < erasedCur {
 			t.Fatal("cursor moved backwards")
+		}
+	})
+
+	t.Run("9 cells C4 and C5 invariants", func(t *testing.T) {
+		// C5: direct internal API and signed webhook refuse unserved-cell orgC with 403.
+		if r := internal(t, r1, "POST", "orgs/reconcile", map[string]any{
+			"orgs": []map[string]any{{
+				"id": orgC, "status": "active", "enabled": true, "home_region": foreignCell, "revision": 100,
+			}},
+			"touch_all_active": false,
+		}); r.code != 403 {
+			t.Fatalf("reconcile for unserved cell: want 403, got %d %s", r.code, r.body)
+		}
+		if _, ok := e.tenant(t, orgC); ok {
+			t.Fatal("unserved-cell orgC was created by direct reconcile")
+		}
+		if r := internal(t, r1, "POST", "users/sync", map[string]any{
+			"event_type": "user.updated", "issuer": issuer, "subject": "sub-c1",
+			"tenant_id": orgC, "email": "c1@e2e.test", "display_name": "C1", "active": true,
+		}); r.code != 403 {
+			t.Fatalf("users/sync for unserved cell: want 403, got %d %s", r.code, r.body)
+		}
+		evC := map[string]any{"id": "sub-c1", "externalId": "sub-c1", "userName": "c1", "active": true, "org_id": orgC}
+		if r := e.webhook(t, "user.updated", fmt.Sprintf("evt-c5-%d", time.Now().UnixNano()), evC); r.code != 403 {
+			t.Fatalf("webhook for unserved cell: want 403, got %d %s", r.code, r.body)
+		}
+
+		// C5: an erasure for foreign orgC advances suite_erased cursor without stalling.
+		erasedBefore := e.num(t, "SELECT COALESCE((SELECT revision FROM worker_sync_cursors WHERE name = 'suite_erased'), 0)")
+		e.kyid.erase("sub-c-erased", orgC)
+		eventually(t, 15*time.Second, "foreign erasure skipped and cursor advanced", func() error {
+			cur := e.num(t, "SELECT COALESCE((SELECT revision FROM worker_sync_cursors WHERE name = 'suite_erased'), 0)")
+			if cur <= erasedBefore {
+				return fmt.Errorf("cursor still %d", cur)
+			}
+			return nil
+		})
+
+		// C4: mutating orgB's home_region refuses the move, fences orgB, and stays fenced across polls.
+		tokB1 := e.accessToken(t, b1)
+		if c := revisionDate(t, r2, tokB1); c != 200 {
+			t.Fatalf("b1 before C4 move: %d", c)
+		}
+		beforeB := e.mustTenant(t, orgB)
+		e.kyid.setOrg(orgB, "active", true, foreignCell)
+		eventually(t, 15*time.Second, "orgB fenced on C4 home_region mismatch", func() error {
+			r := e.mustTenant(t, orgB)
+			if r.Epoch != beforeB.Epoch+1 || r.AuthorityAt != nil {
+				return fmt.Errorf("%+v", r)
+			}
+			return nil
+		})
+		// Wait past a subsequent empty heartbeat poll to prove touch_all_active does not un-fence orgB.
+		time.Sleep(2 * time.Second)
+		afterB := e.mustTenant(t, orgB)
+		if afterB.HomeRegion != cellB {
+			t.Fatalf("C4 violation: orgB home_region mutated to %q, want %q", afterB.HomeRegion, cellB)
+		}
+		if afterB.AuthorityAt != nil || afterB.Ceiling != 0 {
+			t.Fatalf("orgB did not stay fenced after C4 mismatch: %+v", afterB)
+		}
+		if c := revisionDate(t, r2, tokB1); c == 200 {
+			t.Fatal("replica 2 still accepts b1 token after C4 mismatch fence")
 		}
 	})
 }

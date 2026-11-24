@@ -8,9 +8,10 @@ import (
 
 // Memory is an in-process Store for tests and single-process development.
 type Memory struct {
-	mu      sync.Mutex
-	cursors map[string]int64
-	events  map[string]memEvent
+	mu       sync.Mutex
+	cursors  map[string]int64
+	orgCells map[string]string
+	events   map[string]memEvent
 }
 
 type memEvent struct {
@@ -21,7 +22,11 @@ type memEvent struct {
 }
 
 func NewMemory() *Memory {
-	return &Memory{cursors: map[string]int64{}, events: map[string]memEvent{}}
+	return &Memory{
+		cursors:  map[string]int64{},
+		orgCells: map[string]string{},
+		events:   map[string]memEvent{},
+	}
 }
 
 func (m *Memory) Cursor(_ context.Context, name string) (int64, error) {
@@ -35,6 +40,25 @@ func (m *Memory) SaveCursor(_ context.Context, name string, rev int64) error {
 	defer m.mu.Unlock()
 	if rev > m.cursors[name] {
 		m.cursors[name] = rev
+	}
+	return nil
+}
+
+func (m *Memory) KnownOrgCell(_ context.Context, orgID string) (string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cell, ok := m.orgCells[orgID]
+	return cell, ok, nil
+}
+
+func (m *Memory) RememberOrgCell(_ context.Context, orgID, cell string) error {
+	if orgID == "" || cell == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.orgCells[orgID]; !exists {
+		m.orgCells[orgID] = cell
 	}
 	return nil
 }

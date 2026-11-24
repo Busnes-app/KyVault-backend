@@ -176,20 +176,25 @@ func (id *identity) sawQuery(prefix string) bool {
 func newSyncer(t *testing.T) (*Syncer, *identity, *fakevault.Vault) {
 	id, dir := newIdentity(t)
 	v := fakevault.New(t)
-	return &Syncer{Directory: dir, Vault: v.Client(t), State: state.NewMemory(), Issuer: issuer,
+	v.Cells = []string{"eu-west-1", "eu-west-2"}
+	return &Syncer{Directory: dir, Vault: v.Client(t), State: state.NewMemory(), Cells: []string{"eu-west-1", "eu-west-2"}, Issuer: issuer,
 		StorageWantBytes: 256 << 20, StorageRenewBefore: 180 * time.Second}, id, v
 }
 
-func org(id string, rev int64, status string, enabled bool) map[string]any {
+func orgInCell(id, cell string, rev int64, status string, enabled bool) map[string]any {
 	return map[string]any{
-		"id": id, "status": status, "revision": rev, "home_region": "eu", "enabled": enabled,
+		"id": id, "status": status, "revision": rev, "home_region": cell, "enabled": enabled,
 		"quotas": map[string]any{"storage_gb": 5}, "storage": map[string]any{"pool_bytes": 1 << 30, "over_since": nil},
 	}
 }
 
+func org(id string, rev int64, status string, enabled bool) map[string]any {
+	return orgInCell(id, "eu-west-1", rev, status, enabled)
+}
+
 func TestSyncOrgsFollowsPagesAndReconciles(t *testing.T) {
 	s, id, v := newSyncer(t)
-	id.orgs = []map[string]any{org(orgA, 1, "active", true), org(orgB, 2, "suspended", true), org(orgC, 3, "active", false)}
+	id.orgs = []map[string]any{org(orgA, 1, "active", true), orgInCell(orgB, "eu-west-2", 2, "suspended", true), org(orgC, 3, "active", false)}
 	ctx := context.Background()
 
 	if err := s.SyncOrgs(ctx, false); err != nil {
@@ -203,7 +208,7 @@ func TestSyncOrgsFollowsPagesAndReconciles(t *testing.T) {
 		t.Fatalf("reconcile calls = %+v", calls)
 	}
 	got := calls[0].Orgs[2]
-	if got.ID != orgC || got.Status != "active" || got.Enabled || got.HomeRegion != "eu" || got.Revision != 3 || string(got.Quotas) != `{"storage_gb":5}` {
+	if got.ID != orgC || got.Status != "active" || got.Enabled || got.HomeRegion != "eu-west-1" || got.Revision != 3 || string(got.Quotas) != `{"storage_gb":5}` {
 		t.Fatalf("org mapped wrongly: %+v (quotas %s)", got, got.Quotas)
 	}
 	if c, _ := s.State.Cursor(ctx, CursorOrgs); c != 3 {
@@ -220,6 +225,55 @@ func TestSyncOrgsFollowsPagesAndReconciles(t *testing.T) {
 	}
 	if !id.sawQuery("/api/suite/orgs?limit=500&since=3") {
 		t.Fatalf("second poll did not start at the cursor: %v", id.queries)
+	}
+}
+
+func TestReconcileRefusesMismatchedCells(t *testing.T) {
+	s, _, v := newSyncer(t)
+	v.Cells = []string{"us-east-1"}
+	if err := s.Reconcile(context.Background(), false); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("expected cell mismatch error, got %v", err)
+	}
+}
+
+func TestSyncOrgsFiltersForeignCellsAndForwardsC4Move(t *testing.T) {
+	s, id, v := newSyncer(t)
+	var buf bytes.Buffer
+	s.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+	ctx := context.Background()
+
+	// orgA (eu-west-1) and orgB (eu-west-2) are served; orgC (us-east-1) is foreign (C5).
+	id.orgs = []map[string]any{
+		orgInCell(orgA, "eu-west-1", 1, "active", true),
+		orgInCell(orgB, "eu-west-2", 2, "active", true),
+		orgInCell(orgC, "us-east-1", 3, "active", true),
+	}
+	if err := s.SyncOrgs(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	calls := fakevault.CallsTo[vaultapi.ReconcileRequest](v, "orgs/reconcile")
+	if len(calls) != 1 || len(calls[0].Orgs) != 2 || calls[0].Orgs[0].ID != orgA || calls[0].Orgs[1].ID != orgB {
+		t.Fatalf("foreign orgC should be filtered out (C5); calls = %+v", calls)
+	}
+
+	// C4: orgA's home_region mutates to an unserved cell (us-east-1). Because orgA was
+	// previously served here, SyncOrgs MUST still forward it so the vault fences it.
+	id.orgs = append(id.orgs, orgInCell(orgA, "us-east-1", 4, "active", true))
+	v.RegionMismatch = []string{orgA}
+	if err := s.SyncOrgs(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	calls = fakevault.CallsTo[vaultapi.ReconcileRequest](v, "orgs/reconcile")
+	if len(calls) != 2 || len(calls[1].Orgs) != 1 || calls[1].Orgs[0].ID != orgA || calls[1].Orgs[0].HomeRegion != "us-east-1" {
+		t.Fatalf("C4 move for orgA was not forwarded to vault: %+v", calls)
+	}
+	if !strings.Contains(buf.String(), `level=ERROR msg="CELL MISMATCH (C4)`) {
+		t.Fatalf("C4 mismatch not logged loudly:\n%s", buf.String())
+	}
+	// Stored org cell in worker state stays immutable (eu-west-1).
+	cell, ok, _ := s.State.KnownOrgCell(ctx, orgA)
+	if !ok || cell != "eu-west-1" {
+		t.Fatalf("worker org cell mutated to %q (ok=%v)", cell, ok)
 	}
 }
 
@@ -265,7 +319,18 @@ func erasedRow(sub, orgID string, rev int64) map[string]any {
 
 func TestSyncErasedPassesIssuerSubjectTenantRevision(t *testing.T) {
 	s, id, v := newSyncer(t)
-	id.erased = []map[string]any{erasedRow("usr_1", orgA, 4), erasedRow("usr_2", orgA, 6), erasedRow("usr_3", orgB, 9)}
+	// orgA and orgB are served; orgC is in a foreign cell and its erasure must be skipped (C5).
+	id.orgs = []map[string]any{
+		orgInCell(orgA, "eu-west-1", 1, "active", true),
+		orgInCell(orgB, "eu-west-2", 2, "active", true),
+		orgInCell(orgC, "us-east-1", 3, "active", true),
+	}
+	id.erased = []map[string]any{
+		erasedRow("usr_1", orgA, 4),
+		erasedRow("usr_foreign", orgC, 5),
+		erasedRow("usr_2", orgA, 6),
+		erasedRow("usr_3", orgB, 9),
+	}
 	v.ErasePending = 2
 	v.Fail["users/erase"] = 1
 	ctx := context.Background()
@@ -283,6 +348,11 @@ func TestSyncErasedPassesIssuerSubjectTenantRevision(t *testing.T) {
 		t.Fatalf("cursor = %d, want 9", c)
 	}
 	calls := fakevault.CallsTo[vaultapi.EraseRequest](v, "users/erase")
+	for _, c := range calls {
+		if c.TenantID != nil && *c.TenantID == orgC {
+			t.Fatalf("foreign-cell erasure for orgC was forwarded to vault: %+v", c)
+		}
+	}
 	last := calls[len(calls)-1]
 	if last.Issuer != issuer || last.Subject != "usr_3" || last.TenantID == nil || *last.TenantID != orgB || last.Revision == nil || *last.Revision != 9 {
 		t.Fatalf("erase request = %+v", last)
@@ -458,11 +528,12 @@ func TestDrainCleanupReportsAndRetries(t *testing.T) {
 	data := t.TempDir()
 	attRoot, sendRoot := filepath.Join(data, "attachments"), filepath.Join(data, "sends")
 	files := map[string]string{
-		"att":     filepath.Join(attRoot, "tenants", orgA, "attachments", "c1", "a1"),
-		"send":    filepath.Join(sendRoot, "tenants", orgA, "sends", "s1", "f1"),
-		"purgeA":  filepath.Join(attRoot, "tenants", orgB, "attachments", "c2", "a2"),
-		"purgeS":  filepath.Join(sendRoot, "tenants", orgB, "sends", "s2", "f2"),
-		"other":   filepath.Join(attRoot, "tenants", orgC, "attachments", "c3", "a3"),
+		"att":     filepath.Join(attRoot, "cells", "eu-west-1", "tenants", orgA, "attachments", "c1", "a1"),
+		"send":    filepath.Join(sendRoot, "cells", "eu-west-1", "tenants", orgA, "sends", "s1", "f1"),
+		"purgeA":  filepath.Join(attRoot, "cells", "eu-west-2", "tenants", orgB, "attachments", "c2", "a2"),
+		"purgeS":  filepath.Join(sendRoot, "cells", "eu-west-2", "tenants", orgB, "sends", "s2", "f2"),
+		"other":   filepath.Join(attRoot, "cells", "eu-west-1", "tenants", orgC, "attachments", "c3", "a3"),
+		"foreign": filepath.Join(attRoot, "cells", "us-east-1", "tenants", orgA, "attachments", "c4", "a4"),
 		"outside": filepath.Join(data, "db.sqlite3"),
 	}
 	for _, f := range files {
@@ -472,11 +543,12 @@ func TestDrainCleanupReportsAndRetries(t *testing.T) {
 	att := &flakyEraser{Eraser: &s3clean.LocalFS{Root: attRoot}, fail: true}
 	s.Attachments, s.Sends = att, &s3clean.LocalFS{Root: sendRoot}
 	v.Queue = []vaultapi.CleanupItem{
-		{ID: "1", TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgA + "/attachments/c1/a1"},
-		{ID: "2", TenantID: orgA, StorageKind: "send", ObjectKey: "tenants/" + orgA + "/sends/s1"},
-		{ID: "3", TenantID: orgB, StorageKind: "tenant_prefix", ObjectKey: "tenants/" + orgB + "/"},
-		{ID: "4", TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgA + "/attachments/../../../db.sqlite3"},
-		{ID: "5", TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgC + "/attachments/c3/a3"},
+		{ID: "1", TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/attachments/c1/a1"},
+		{ID: "2", TenantID: orgA, StorageKind: "send", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/sends/s1"},
+		{ID: "3", TenantID: orgB, StorageKind: "tenant_prefix", ObjectKey: "cells/eu-west-2/tenants/" + orgB + "/"},
+		{ID: "4", TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/attachments/../../../db.sqlite3"},
+		{ID: "5", TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/eu-west-1/tenants/" + orgC + "/attachments/c3/a3"},
+		{ID: "6", TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/us-east-1/tenants/" + orgA + "/attachments/c4/a4"},
 	}
 	ctx := context.Background()
 
@@ -491,10 +563,10 @@ func TestDrainCleanupReportsAndRetries(t *testing.T) {
 		sort.Strings(ids)
 		return ids
 	}
-	if got := strings.Join(remaining(), ","); got != "1,4,5" {
-		t.Fatalf("queue after outage = %s, want 1,4,5", got)
+	if got := strings.Join(remaining(), ","); got != "1,4,5,6" {
+		t.Fatalf("queue after outage = %s, want 1,4,5,6", got)
 	}
-	if !strings.Contains(v.Failures["1"], "503") || v.Failures["4"] == "" || v.Failures["5"] == "" {
+	if !strings.Contains(v.Failures["1"], "503") || v.Failures["4"] == "" || v.Failures["5"] == "" || !strings.Contains(v.Failures["6"], "unserved cell") {
 		t.Fatalf("failures not reported: %v", v.Failures)
 	}
 	if _, err := os.Stat(files["att"]); err != nil {
@@ -503,10 +575,10 @@ func TestDrainCleanupReportsAndRetries(t *testing.T) {
 
 	att.fail = false
 	_ = s.DrainCleanup(ctx)
-	if got := strings.Join(remaining(), ","); got != "4,5" {
+	if got := strings.Join(remaining(), ","); got != "4,5,6" {
 		t.Fatalf("queue after recovery = %s, want only the refused items", got)
 	}
-	for name, want := range map[string]bool{"att": false, "send": false, "purgeA": false, "purgeS": false, "other": true, "outside": true} {
+	for name, want := range map[string]bool{"att": false, "send": false, "purgeA": false, "purgeS": false, "other": true, "foreign": true, "outside": true} {
 		if _, err := os.Stat(files[name]); (err == nil) != want {
 			t.Errorf("%s exists=%v, want %v", name, err == nil, want)
 		}
@@ -519,38 +591,42 @@ func TestDrainCleanupReportsAndRetries(t *testing.T) {
 
 func TestDrainCleanupUnconfiguredRootFails(t *testing.T) {
 	s, _, v := newSyncer(t)
-	v.Queue = []vaultapi.CleanupItem{{ID: "1", TenantID: orgA, StorageKind: "tenant_prefix", ObjectKey: "tenants/" + orgA + "/"}}
+	v.Queue = []vaultapi.CleanupItem{{ID: "1", TenantID: orgA, StorageKind: "tenant_prefix", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/"}}
 	if err := s.DrainCleanup(context.Background()); err == nil || len(v.Queue) != 1 {
 		t.Fatal("cleanup without storage roots must fail and stay pending")
 	}
 }
 
 func TestCheckItem(t *testing.T) {
+	cells := []string{"eu-west-1", "eu-west-2"}
 	ok := []vaultapi.CleanupItem{
-		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgA + "/attachments/c/a.b"},
-		{TenantID: orgA, StorageKind: "send", ObjectKey: "tenants/" + orgA + "/sends/s"},
-		{TenantID: orgA, StorageKind: "send", ObjectKey: "tenants/" + orgA + "/sends/s/f"},
-		{TenantID: orgA, StorageKind: "tenant_prefix", ObjectKey: "tenants/" + orgA + "/"},
+		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/attachments/c/a.b"},
+		{TenantID: orgA, StorageKind: "send", ObjectKey: "cells/eu-west-2/tenants/" + orgA + "/sends/s"},
+		{TenantID: orgA, StorageKind: "send", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/sends/s/f"},
+		{TenantID: orgA, StorageKind: "tenant_prefix", ObjectKey: "cells/eu-west-2/tenants/" + orgA + "/"},
 	}
 	bad := []vaultapi.CleanupItem{
-		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgA + "/attachments/c"},
-		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgA + "/attachments/c/../x"},
-		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgA + "/attachments/c/.hidden"},
-		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgA + "/sends/s/f"},
-		{TenantID: orgA, StorageKind: "send", ObjectKey: "tenants/" + orgB + "/sends/s"},
-		{TenantID: orgA, StorageKind: "send", ObjectKey: "tenants/" + orgA + "/sends/s/f/g"},
-		{TenantID: orgA, StorageKind: "tenant_prefix", ObjectKey: "tenants/"},
-		{TenantID: orgA, StorageKind: "tenant_prefix", ObjectKey: "tenants/" + orgA + "/attachments/"},
-		{TenantID: "../x", StorageKind: "tenant_prefix", ObjectKey: "tenants/../x/"},
-		{TenantID: orgA, StorageKind: "icon_cache", ObjectKey: "tenants/" + orgA + "/"},
+		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "tenants/" + orgA + "/attachments/c/a.b"},
+		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/us-east-1/tenants/" + orgA + "/attachments/c/a.b"},
+		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/EU-WEST-1/tenants/" + orgA + "/attachments/c/a.b"},
+		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/attachments/c"},
+		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/attachments/c/../x"},
+		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/attachments/c/.hidden"},
+		{TenantID: orgA, StorageKind: "attachment", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/sends/s/f"},
+		{TenantID: orgA, StorageKind: "send", ObjectKey: "cells/eu-west-1/tenants/" + orgB + "/sends/s"},
+		{TenantID: orgA, StorageKind: "send", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/sends/s/f/g"},
+		{TenantID: orgA, StorageKind: "tenant_prefix", ObjectKey: "cells/eu-west-1/tenants/"},
+		{TenantID: orgA, StorageKind: "tenant_prefix", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/attachments/"},
+		{TenantID: "../x", StorageKind: "tenant_prefix", ObjectKey: "cells/eu-west-1/tenants/../x/"},
+		{TenantID: orgA, StorageKind: "icon_cache", ObjectKey: "cells/eu-west-1/tenants/" + orgA + "/"},
 	}
 	for _, it := range ok {
-		if err := checkItem(it); err != nil {
+		if err := checkItem(it, cells); err != nil {
 			t.Errorf("refused %+v: %v", it, err)
 		}
 	}
 	for _, it := range bad {
-		if checkItem(it) == nil {
+		if checkItem(it, cells) == nil {
 			t.Errorf("accepted %+v", it)
 		}
 	}

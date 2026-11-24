@@ -77,6 +77,7 @@ func run(logger *slog.Logger) error {
 		Directory:          &suitedir.Client{Issuer: cfg.KyIdentityURL, ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret},
 		Vault:              vault,
 		State:              st,
+		Cells:              cfg.Cells,
 		Issuer:             cfg.OIDCIssuer,
 		StorageWantBytes:   cfg.StorageWantBytes,
 		StorageRenewBefore: cfg.StorageRenewBefore,
@@ -109,7 +110,7 @@ func run(logger *slog.Logger) error {
 	}()
 	go startSync(ctx, logger, cfg, syn, st, srv)
 
-	logger.Info("kyvault-worker listening", "addr", cfg.ListenAddr)
+	logger.Info("kyvault-worker listening", "addr", cfg.ListenAddr, "cells", cfg.Cells)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

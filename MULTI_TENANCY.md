@@ -11,8 +11,8 @@ Two processes share one PostgreSQL database:
   every vault table**, including `tenants`, `tenant_erased_subjects`,
   `tenant_pending_deletions` and `tenant_recovery_bundles`.
 - **`kyvault-worker` (Go, `worker/`)** talks to KyIdentity. It owns only
-  `worker_sync_cursors` and `worker_processed_events`, and changes vault state only by
-  calling the Rust replicas' private API.
+  `worker_sync_cursors`, `worker_processed_events` and `worker_known_orgs`, and changes vault
+  state only by calling the Rust replicas' private API.
 
 ## Isolation in the vault
 
@@ -23,10 +23,21 @@ Two processes share one PostgreSQL database:
 - Sign-in is SSO only. The tenant comes from the ID token's `org_id` claim. Platform staff
   principals, `export_only` principals and erased `(issuer, subject)` pairs are refused.
   No session kind short of full access exists: export-only sessions were removed.
-- A request is served only when the tenant is `active`, `app_enabled`, in this replica's
-  `HOME_REGION`, and its KyIdentity authority was refreshed within
-  `TENANCY_AUTHORITY_MAX_AGE_SECS` (at most 900 s). Otherwise the request fails closed:
-  `403`, or `503` when authority is stale.
+- **Cells (C1–C5):** The shared install scales by cells (`<geography>-<n>` slugs, e.g.
+  `eu-west-1`, read from KyIdentity's `/api/suite/orgs` `home_region`, never from a token).
+  One deployment serves 1–32 cells configured in `KY_CELLS` (shared tables keyed by
+  `tenant_id`, never a database or schema per org).
+  - **C4 (immutable placement):** Once an org's `home_region` is stored in `tenants`, it
+    never changes. If an incoming snapshot disagrees with stored `home_region`, the vault
+    refuses the move, fences the tenant (clears `authority_refreshed_at`, bumps
+    `access_epoch`, zeroes the storage grant, rotates stamps/refresh tokens, kicks sockets),
+    and reports it in `region_mismatch_tenant_ids` while the worker logs `CELL MISMATCH (C4)`.
+  - **C5 (fail-closed cell boundary):** A request is served only when the tenant is `active`,
+    `app_enabled`, its `home_region` is in this deployment's `KY_CELLS`, and its KyIdentity
+    authority was refreshed within `TENANCY_AUTHORITY_MAX_AGE_SECS` (at most 900 s). Every
+    other org is refused on every way in with `403` (or `503` when authority is stale).
+- Object storage keys are cell-scoped: `cells/<cell>/tenants/<tenant_id>/attachments/<cipher>/<id>`
+  and `cells/<cell>/tenants/<tenant_id>/sends/<send>/<id>`.
 - Sends are always off in multi-tenant mode. Emergency access is off unless
   `TENANCY_ALLOW_EMERGENCY_ACCESS=true`.
 - **Recovery Kit** (`/api/tenancy/recovery/personal`) stores only a client-wrapped user key.
@@ -36,12 +47,12 @@ Two processes share one PostgreSQL database:
 
 ### Startup refuses to run multi-tenant without
 
-`HOME_REGION`, `SSO_ENABLED=true` and `SSO_ONLY=true`, `SIGNUPS_ALLOWED=false`, an unset
-`ADMIN_TOKEN`, a PostgreSQL `DATABASE_URL`, an `s3://` `ATTACHMENTS_FOLDER`,
-`TENANCY_INTERNAL_API_SECRET` of at least 32 characters, `TENANCY_AUTHORITY_MAX_AGE_SECS`
-between 60 and 900, a `TENANCY_PG_NOTIFY_CHANNEL` of `[a-z0-9_]{1,63}`, and a
-pre-provisioned `rsa_key.pem`. Replicas must share that key. A replica never generates its
-own.
+`KY_CELLS` (1–32 unique valid cell slugs `[a-z][a-z0-9-]{0,30}[a-z0-9]`), `SSO_ENABLED=true`
+and `SSO_ONLY=true`, `SIGNUPS_ALLOWED=false`, an unset `ADMIN_TOKEN`, a PostgreSQL
+`DATABASE_URL`, an `s3://` `ATTACHMENTS_FOLDER`, `TENANCY_INTERNAL_API_SECRET` of at least
+32 characters, `TENANCY_AUTHORITY_MAX_AGE_SECS` between 60 and 900, a
+`TENANCY_PG_NOTIFY_CHANNEL` of `[a-z0-9_]{1,63}`, and a pre-provisioned `rsa_key.pem`.
+Replicas must share that key. A replica never generates its own.
 
 ### Cross-replica disconnects
 
@@ -55,20 +66,21 @@ NOTIFY only makes it immediate for open sockets.
 
 Mounted at a fixed path (not under `DOMAIN`'s base path). Each call needs
 `Authorization: Bearer $TENANCY_INTERNAL_API_SECRET`: a missing or wrong secret gets `401`,
-and an unset or short one gets `503`. **Never route this path through the public proxy.**
-Expose it only on the private network the worker uses.
+and an unset or short one gets `503`. Calls naming an org outside `KY_CELLS` get `403` (C5).
+**Never route this path through the public proxy.** Expose it only on the private network
+the worker uses.
 
 | Route | Does |
 | --- | --- |
-| `GET health` | `{status, multi_tenant, home_region}` |
-| `POST orgs/reconcile` | Applies KyIdentity org snapshots for this region. A newly non-active org is fenced: `access_epoch` +1, grant zeroed, every user's stamp and refresh tokens rotated, sockets kicked. `deleted` becomes `purge_pending`. Tombstoned tenants are never resurrected. |
-| `POST users/logout` | Rotates stamp and refresh tokens of the exact `{issuer}/{subject}` SSO link (optionally within one tenant) |
-| `POST users/sync` | `user.created/updated/deleted`: disable/re-enable, rename. Erased subjects answer `erased_tombstone`. |
-| `POST users/erase` | Records the permanent tombstone, queues the user's objects, deletes personal data. Organisation ciphers, collections and other members stay. |
-| `POST tenants/<id>/purge/begin` | Queues every tenant object plus a `tenants/<id>/` sweep, tombstones all subjects, deletes all tenant rows. Status `purge_pending`. |
+| `GET health` | `{status, multi_tenant, cells}` |
+| `POST orgs/reconcile` | Applies KyIdentity org snapshots for served cells (`KY_CELLS`). Refuses unserved-cell orgs with `403` (C5). A stored tenant whose incoming `home_region` changed is never mutated: it is fenced and returned in `region_mismatch_tenant_ids` (C4). A newly non-active org is fenced: `access_epoch` +1, grant zeroed, every user's stamp and refresh tokens rotated, sockets kicked. `deleted` becomes `purge_pending`. Tombstoned tenants are never resurrected. |
+| `POST users/logout` | Rotates stamp and refresh tokens of the exact `{issuer}/{subject}` SSO link (optionally within one tenant); refuses unserved-cell tenants with `403`. |
+| `POST users/sync` | `user.created/updated/deleted`: disable/re-enable, rename. Erased subjects answer `erased_tombstone`. Refuses unserved-cell tenants with `403`. |
+| `POST users/erase` | Records the permanent tombstone, queues the user's cell-scoped objects, deletes personal data. Organisation ciphers, collections and other members stay. Refuses unserved-cell tenants with `403`. |
+| `POST tenants/<id>/purge/begin` | Queues every tenant object plus a `cells/<cell>/tenants/<id>/` sweep, tombstones all subjects, deletes all tenant rows. Status `purge_pending`. Refuses unserved-cell tenants with `403`. |
 | `GET cleanup/pending`, `POST cleanup/complete` | The durable `tenant_pending_deletions` queue. Rows go only when the worker reports a verified deletion. Failures bump `attempts`. When a `purge_pending` tenant's queue is empty it is finalised to `deleted` with `erased_at`. |
 | `POST storage/prepare`, `POST storage/apply` | The storage-grant exchange (below) |
-| `POST storage/repair-seq` | Operator recovery for a `stale` sequence: sets the next report seq, which must exceed the current one |
+| `POST storage/repair-seq` | Operator recovery for a `stale` sequence: sets the next report seq, which must exceed the current one. Refuses unserved-cell tenants with `403`. |
 
 ## Storage grants
 
@@ -100,24 +112,29 @@ Built on `github.com/Busnes-app/ky-primitives`: `suitedir` (KyIdentity
 `/api/suite/{orgs,erased,storage}` with `client_secret_basic`), `syncauth` (signed webhooks)
 and `oidcverify` (RS256 back-channel logout).
 
-- **Startup** reconciles orgs and erased subjects before `/readyz` turns ready and webhooks
-  are accepted.
-- **Orgs** are polled from the saved cursor. Each page goes to `orgs/reconcile`, and
-  `purge_required` tenants go to `purge/begin`. The cursor is saved only after the vault
-  accepted the page.
-- **Erased subjects** are polled and sent to `users/erase`, using the same cursor rule.
+- **Startup** verifies the vault's `/internal/tenancy/v1/health` `cells` matches the worker's
+  `KY_CELLS`, then reconciles orgs and erased subjects before `/readyz` turns ready and
+  webhooks are accepted.
+- **Orgs** are polled from the saved cursor. Orgs outside `KY_CELLS` are skipped (C5),
+  except previously-served orgs whose `home_region` changed (forwarded so the vault executes
+  C4 fencing and logs `CELL MISMATCH (C4)`). Each served org's initial cell is recorded
+  immutably in `worker_known_orgs`. `purge_required` tenants go to `purge/begin`. The cursor
+  is saved only after the vault accepted the page.
+- **Erased subjects** are polled, filtered by `worker_known_orgs` (refreshing orgs once if
+  an org is unseen) so foreign-cell erasures do not stall the cursor, and sent to
+  `users/erase` using the same cursor rule.
 - **Storage**: every interval it runs prepare → KyIdentity → apply, never with two reports
   in flight for one org.
 - **Cleanup** drains `cleanup/pending` against the same storage roots the vault uses, then
   reports to `cleanup/complete`. Local roots go through `os.Root`. S3 roots delete every
   object version and abort multipart uploads. A missing root or S3 error leaves the item
-  pending. Keys outside `tenants/<id>/` are refused.
+  pending. Keys outside `cells/<served_cell>/tenants/<id>/` are refused.
 - **`POST /api/sync/events`** verifies `X-KySignOn-*` (`syncauth`), then forwards
   `user.created/updated/deleted/erased`. **`POST /api/oidc/backchannel-logout`** verifies the
   `logout+jwt` against the issuer's JWKS and calls `users/logout`. Both claim the event in
-  `worker_processed_events`, and mark it completed **only after the vault applied it**. A
-  failed attempt answers `502` and stays retryable; a completed one answers
-  `200 {"status":"duplicate"}`.
+  `worker_processed_events`, and mark it completed **only after the vault applied it**. An
+  unserved-cell refusal propagates `403` (C5); a transient failure answers `502` and stays
+  retryable; a completed one answers `200 {"status":"duplicate"}`.
 - **Restore**: after restoring the vault database from backup, start one worker with
   `TENANCY_RECONCILE_FROM_ZERO=true`. It replays orgs and erasures from revision 0 before it
   becomes ready. Storage seqs are untouched: a `stale` answer then goes through
@@ -130,7 +147,7 @@ and `oidcverify` (RS256 back-channel logout).
 | Variable | Default | |
 | --- | --- | --- |
 | `TENANCY_MODE` | `single` | `multi` enables everything above |
-| `HOME_REGION` | — | Region slug this install serves; orgs homed elsewhere are skipped |
+| `KY_CELLS` | — | Comma-separated list of 1–32 cell slugs this deployment serves (e.g. `eu-west-1,eu-west-2`); orgs homed elsewhere are refused with `403` (C5) |
 | `TENANCY_INTERNAL_API_SECRET` | — | ≥ 32 chars, shared with the worker |
 | `TENANCY_AUTHORITY_MAX_AGE_SECS` | `900` | 60–900 |
 | `TENANCY_PG_NOTIFY_ENABLED` | `true` | Cross-replica disconnects |
@@ -148,6 +165,7 @@ Plus the Vaultwarden SSO settings (`SSO_ENABLED`, `SSO_ONLY`, `SSO_AUTHORITY`,
 | Variable | Default | |
 | --- | --- | --- |
 | `DATABASE_URL` | required | The vault's PostgreSQL (worker tables only) |
+| `KY_CELLS` | required | Comma-separated list of 1–32 cell slugs; must match the vault replicas' `KY_CELLS` |
 | `VAULT_INTERNAL_API_URL` | required | A replica's private base URL. `https` anywhere, plain `http` only to loopback, private or single-label hosts. |
 | `TENANCY_INTERNAL_API_SECRET` | required | Same as the replicas |
 | `SSO_AUTHORITY` | required | OIDC issuer; also the KyIdentity base URL |

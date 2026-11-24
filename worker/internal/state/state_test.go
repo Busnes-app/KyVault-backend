@@ -32,12 +32,34 @@ func stores(t *testing.T) map[string]Store {
 		})
 	}
 	wg.Wait()
-	if _, err := pool.Exec(ctx, "TRUNCATE worker_sync_cursors, worker_processed_events"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE worker_sync_cursors, worker_known_orgs, worker_processed_events"); err != nil {
 		t.Fatal(err)
 	}
 	pg, _ := OpenPostgres(ctx, pool)
 	out["postgres"] = pg
 	return out
+}
+
+func TestKnownOrgCellIsImmutable(t *testing.T) {
+	for name, s := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			if _, ok, err := s.KnownOrgCell(ctx, "org-1"); err != nil || ok {
+				t.Fatalf("fresh org: ok=%v err=%v", ok, err)
+			}
+			if err := s.RememberOrgCell(ctx, "org-1", "eu-west-1"); err != nil {
+				t.Fatal(err)
+			}
+			// C4: subsequent writes for the same org must not overwrite home_region.
+			if err := s.RememberOrgCell(ctx, "org-1", "us-east-1"); err != nil {
+				t.Fatal(err)
+			}
+			cell, ok, err := s.KnownOrgCell(ctx, "org-1")
+			if err != nil || !ok || cell != "eu-west-1" {
+				t.Fatalf("known cell = %q, %v, %v; want eu-west-1", cell, ok, err)
+			}
+		})
+	}
 }
 
 func TestCursorIsMonotonic(t *testing.T) {

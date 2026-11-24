@@ -56,9 +56,9 @@ func New(baseURL, secret string, httpClient *http.Client) (*Client, error) {
 }
 
 type Health struct {
-	Status      string `json:"status"`
-	MultiTenant bool   `json:"multi_tenant"`
-	HomeRegion  string `json:"home_region"`
+	Status      string   `json:"status"`
+	MultiTenant bool     `json:"multi_tenant"`
+	Cells       []string `json:"cells"`
 }
 
 type Org struct {
@@ -76,9 +76,10 @@ type ReconcileRequest struct {
 }
 
 type ReconcileResult struct {
-	Applied                int      `json:"applied"`
-	FencedTenantIDs        []string `json:"fenced_tenant_ids"`
-	PurgeRequiredTenantIDs []string `json:"purge_required_tenant_ids"`
+	Applied                 int      `json:"applied"`
+	FencedTenantIDs         []string `json:"fenced_tenant_ids"`
+	PurgeRequiredTenantIDs  []string `json:"purge_required_tenant_ids"`
+	RegionMismatchTenantIDs []string `json:"region_mismatch_tenant_ids"`
 }
 
 type LogoutRequest struct {

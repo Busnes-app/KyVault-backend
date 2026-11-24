@@ -183,17 +183,17 @@ func testClient(srv *httptest.Server) *Client {
 
 func TestDeletePrefixRemovesVersionsMarkersAndUploads(t *testing.T) {
 	f, srv := newFakeS3(t)
-	f.put("data/attachments/tenants/org-a/attachments/c1/a1", "v1", "v2", "dm3")
-	f.put("data/attachments/tenants/org-a/attachments/c1/a2", "v1")
-	f.put("data/attachments/tenants/org-a/attachments/c2/a3", "dm1")
-	f.put("data/attachments/tenants/org-b/attachments/c9/a9", "v1")
-	f.uploads["u1"] = "data/attachments/tenants/org-a/attachments/c3/partial"
-	f.uploads["u2"] = "data/attachments/tenants/org-b/attachments/c3/partial"
+	f.put("data/attachments/cells/eu-west-1/tenants/org-a/attachments/c1/a1", "v1", "v2", "dm3")
+	f.put("data/attachments/cells/eu-west-1/tenants/org-a/attachments/c1/a2", "v1")
+	f.put("data/attachments/cells/eu-west-1/tenants/org-a/attachments/c2/a3", "dm1")
+	f.put("data/attachments/cells/eu-west-1/tenants/org-b/attachments/c9/a9", "v1")
+	f.uploads["u1"] = "data/attachments/cells/eu-west-1/tenants/org-a/attachments/c3/partial"
+	f.uploads["u2"] = "data/attachments/cells/eu-west-1/tenants/org-b/attachments/c3/partial"
 
-	if err := testClient(srv).DeletePrefix(context.Background(), "tenants/org-a/"); err != nil {
+	if err := testClient(srv).DeletePrefix(context.Background(), "cells/eu-west-1/tenants/org-a/"); err != nil {
 		t.Fatalf("DeletePrefix: %v", err)
 	}
-	if got := f.remaining(); len(got) != 1 || got[0] != "data/attachments/tenants/org-b/attachments/c9/a9" {
+	if got := f.remaining(); len(got) != 1 || got[0] != "data/attachments/cells/eu-west-1/tenants/org-b/attachments/c9/a9" {
 		t.Fatalf("remaining = %v, want only org-b", got)
 	}
 	if _, ok := f.uploads["u1"]; ok {
@@ -206,7 +206,7 @@ func TestDeletePrefixRemovesVersionsMarkersAndUploads(t *testing.T) {
 
 func TestDeleteObjectExactKeyOnly(t *testing.T) {
 	f, srv := newFakeS3(t)
-	key := "tenants/org-a/sends/s1"
+	key := "cells/eu-west-1/tenants/org-a/sends/s1"
 	f.put("data/attachments/"+key, "v1", "dm2")
 	f.put("data/attachments/"+key+"/file-1", "v1")
 	f.put("data/attachments/"+key+"0/file", "v1") // shares the string prefix, not the path
@@ -227,9 +227,9 @@ func TestDeleteFailuresAreErrors(t *testing.T) {
 	for name, setup := range cases {
 		t.Run(name, func(t *testing.T) {
 			f, srv := newFakeS3(t)
-			f.put("data/attachments/tenants/org-a/attachments/c/a", "v1")
+			f.put("data/attachments/cells/eu-west-1/tenants/org-a/attachments/c/a", "v1")
 			setup(f)
-			if err := testClient(srv).DeleteObject(context.Background(), "tenants/org-a/attachments/c/a"); err == nil {
+			if err := testClient(srv).DeleteObject(context.Background(), "cells/eu-west-1/tenants/org-a/attachments/c/a"); err == nil {
 				t.Fatal("expected an error")
 			}
 		})
@@ -241,7 +241,7 @@ func TestProviderErrorStatusIsAnError(t *testing.T) {
 		http.Error(w, "<Error><Code>NoSuchBucket</Code></Error>", http.StatusNotFound)
 	}))
 	defer srv.Close()
-	if err := testClient(srv).DeletePrefix(context.Background(), "tenants/org-a/"); err == nil {
+	if err := testClient(srv).DeletePrefix(context.Background(), "cells/eu-west-1/tenants/org-a/"); err == nil {
 		t.Fatal("a missing bucket must not count as an empty one")
 	}
 }
@@ -250,7 +250,12 @@ func TestUnsafeKeysRefused(t *testing.T) {
 	_, srv := newFakeS3(t)
 	c := testClient(srv)
 	l := &LocalFS{Root: t.TempDir()}
-	for _, bad := range []string{"", "/", "tenants/", "tenants", "/tenants/x/", "attachments/x", "tenants/../x/", "tenants/a/../../x", `tenants\..\x/`, "tenants//x/"} {
+	for _, bad := range []string{
+		"", "/", "tenants/", "tenants/org-a/", "cells/", "cells/eu-west-1/", "cells/eu-west-1/tenants/",
+		"cells/EU-WEST-1/tenants/org-a/", "cells/../tenants/org-a/", "/cells/eu-west-1/tenants/org-a/",
+		"attachments/x", "cells/eu-west-1/tenants/../x/", "cells/eu-west-1/tenants/a/../../x",
+		`cells\eu-west-1\tenants\x/`, "cells/eu-west-1/tenants//x/",
+	} {
 		if err := c.DeletePrefix(context.Background(), bad); err == nil {
 			t.Errorf("S3 DeletePrefix(%q) accepted", bad)
 		}
@@ -268,9 +273,9 @@ func TestLocalFSUsesRealRoots(t *testing.T) {
 	attachments := filepath.Join(data, "attachments")
 	sends := filepath.Join(data, "sends")
 	files := []string{
-		filepath.Join(attachments, "tenants/org-a/attachments/c1/a1"),
-		filepath.Join(attachments, "tenants/org-b/attachments/c1/a1"),
-		filepath.Join(sends, "tenants/org-a/sends/s1/f1"),
+		filepath.Join(attachments, "cells/eu-west-1/tenants/org-a/attachments/c1/a1"),
+		filepath.Join(attachments, "cells/eu-west-1/tenants/org-b/attachments/c1/a1"),
+		filepath.Join(sends, "cells/eu-west-1/tenants/org-a/sends/s1/f1"),
 		filepath.Join(data, "db.sqlite3"),
 	}
 	for _, f := range files {
@@ -280,13 +285,13 @@ func TestLocalFSUsesRealRoots(t *testing.T) {
 	ctx := context.Background()
 	att, snd := &LocalFS{Root: attachments}, &LocalFS{Root: sends}
 
-	if err := att.DeleteObject(ctx, "tenants/org-a/attachments/c1/a1"); err != nil {
+	if err := att.DeleteObject(ctx, "cells/eu-west-1/tenants/org-a/attachments/c1/a1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := snd.DeleteObject(ctx, "tenants/org-a/sends/s1"); err != nil {
+	if err := snd.DeleteObject(ctx, "cells/eu-west-1/tenants/org-a/sends/s1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := att.DeleteObject(ctx, "tenants/org-a/attachments/c1/a1"); err != nil {
+	if err := att.DeleteObject(ctx, "cells/eu-west-1/tenants/org-a/attachments/c1/a1"); err != nil {
 		t.Fatalf("an already deleted object must succeed: %v", err)
 	}
 	for i, want := range []bool{false, true, false, true} {
@@ -294,10 +299,10 @@ func TestLocalFSUsesRealRoots(t *testing.T) {
 			t.Errorf("%s exists=%v, want %v", files[i], err == nil, want)
 		}
 	}
-	if err := att.DeletePrefix(ctx, "tenants/org-b/"); err != nil {
+	if err := att.DeletePrefix(ctx, "cells/eu-west-1/tenants/org-b/"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(attachments, "tenants/org-b")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(attachments, "cells/eu-west-1/tenants/org-b")); !os.IsNotExist(err) {
 		t.Fatal("org-b prefix survived")
 	}
 }
@@ -306,17 +311,17 @@ func TestLocalFSSymlinkEscapeAndMissingRoot(t *testing.T) {
 	root, outside := t.TempDir(), t.TempDir()
 	victim := filepath.Join(outside, "victim")
 	_ = os.WriteFile(victim, []byte("x"), 0o600)
-	_ = os.MkdirAll(filepath.Join(root, "tenants"), 0o755)
-	if err := os.Symlink(outside, filepath.Join(root, "tenants", "org-a")); err != nil {
+	_ = os.MkdirAll(filepath.Join(root, "cells", "eu-west-1", "tenants"), 0o755)
+	if err := os.Symlink(outside, filepath.Join(root, "cells", "eu-west-1", "tenants", "org-a")); err != nil {
 		t.Fatal(err)
 	}
-	_ = (&LocalFS{Root: root}).DeleteObject(context.Background(), "tenants/org-a/victim")
+	_ = (&LocalFS{Root: root}).DeleteObject(context.Background(), "cells/eu-west-1/tenants/org-a/victim")
 	if _, err := os.Stat(victim); err != nil {
 		t.Fatal("a symlink let deletion escape the storage root")
 	}
 
 	missing := &LocalFS{Root: filepath.Join(root, "not-mounted")}
-	if err := missing.DeleteObject(context.Background(), "tenants/org-a/attachments/c/a"); err == nil {
+	if err := missing.DeleteObject(context.Background(), "cells/eu-west-1/tenants/org-a/attachments/c/a"); err == nil {
 		t.Fatal("a missing storage root must fail, not report the object deleted")
 	}
 }

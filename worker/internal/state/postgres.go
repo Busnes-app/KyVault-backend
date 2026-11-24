@@ -20,6 +20,11 @@ CREATE TABLE IF NOT EXISTS worker_sync_cursors (
 	revision   BIGINT NOT NULL CHECK (revision >= 0),
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS worker_known_orgs (
+	org_id      TEXT PRIMARY KEY,
+	home_region TEXT NOT NULL,
+	first_seen  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS worker_processed_events (
 	event_key   TEXT PRIMARY KEY,
 	kind        TEXT NOT NULL,
@@ -68,6 +73,29 @@ func (p *Postgres) SaveCursor(ctx context.Context, name string, rev int64) error
 		ON CONFLICT (name) DO UPDATE
 		SET revision = GREATEST(worker_sync_cursors.revision, EXCLUDED.revision), updated_at = now()`,
 		name, rev)
+	return err
+}
+
+func (p *Postgres) KnownOrgCell(ctx context.Context, orgID string) (string, bool, error) {
+	var cell string
+	err := p.pool.QueryRow(ctx, "SELECT home_region FROM worker_known_orgs WHERE org_id = $1", orgID).Scan(&cell)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return cell, true, nil
+}
+
+func (p *Postgres) RememberOrgCell(ctx context.Context, orgID, cell string) error {
+	if orgID == "" || cell == "" {
+		return nil
+	}
+	_, err := p.pool.Exec(ctx, `
+		INSERT INTO worker_known_orgs (org_id, home_region) VALUES ($1, $2)
+		ON CONFLICT (org_id) DO NOTHING`,
+		orgID, cell)
 	return err
 }
 

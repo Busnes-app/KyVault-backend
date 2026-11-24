@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/Busnes-app/ky-primitives/suitedir"
+	"github.com/Busnes-app/kyvault-worker/internal/config"
 	"github.com/Busnes-app/kyvault-worker/internal/s3clean"
 	"github.com/Busnes-app/kyvault-worker/internal/state"
 	"github.com/Busnes-app/kyvault-worker/internal/vaultapi"
@@ -29,6 +31,8 @@ type Syncer struct {
 	Directory *suitedir.Client
 	Vault     *vaultapi.Client
 	State     state.Store
+	// Cells is the set of home_region slugs this deployment serves (KY_CELLS).
+	Cells []string
 	// Issuer is the OIDC issuer; KyIdentity subjects are only unique within it.
 	Issuer string
 
@@ -62,16 +66,37 @@ func (s *Syncer) now() time.Time {
 	return time.Now()
 }
 
+func (s *Syncer) servesCell(cell string) bool {
+	return slices.Contains(s.Cells, cell)
+}
+
+func sameCellSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sa := slices.Clone(a)
+	sb := slices.Clone(b)
+	slices.Sort(sa)
+	slices.Sort(sb)
+	return slices.Equal(sa, sb)
+}
+
 // Reconcile brings the vault up to KyIdentity's org and erased-subject history; the
 // worker reports ready only after it succeeds. fromZero replays both from revision 0,
 // as a restored vault needs before serving. Storage sequences are never touched.
 func (s *Syncer) Reconcile(ctx context.Context, fromZero bool) error {
+	if err := config.ValidateCells(s.Cells); err != nil {
+		return fmt.Errorf("worker KY_CELLS invalid: %w", err)
+	}
 	h, err := s.Vault.Health(ctx)
 	if err != nil {
 		return err
 	}
-	if h.Status != "ok" || !h.MultiTenant {
-		return fmt.Errorf("vault is not a healthy multi-tenant server (status %q, multi_tenant %v)", h.Status, h.MultiTenant)
+	if h.Status != "ok" || !h.MultiTenant || len(h.Cells) == 0 {
+		return fmt.Errorf("vault is not a healthy multi-tenant server (status %q, multi_tenant %v, cells %v)", h.Status, h.MultiTenant, h.Cells)
+	}
+	if !sameCellSet(s.Cells, h.Cells) {
+		return fmt.Errorf("worker KY_CELLS %v does not match vault cells %v", s.Cells, h.Cells)
 	}
 	if err := s.SyncOrgs(ctx, fromZero); err != nil {
 		return fmt.Errorf("orgs: %w", err)
@@ -85,7 +110,13 @@ func (s *Syncer) Reconcile(ctx context.Context, fromZero bool) error {
 // SyncOrgs applies every org change after the saved cursor (or from zero) and saves
 // the cursor only after the vault accepted all of them. A complete pass, one that
 // reached KyIdentity's current revision, also refreshes every active tenant's authority.
+//
+// C5: orgs whose home_region is outside KY_CELLS are skipped unless the org was already
+// served here (C4: forwarded so the vault refuses the move and fences the tenant).
 func (s *Syncer) SyncOrgs(ctx context.Context, fromZero bool) error {
+	if err := config.ValidateCells(s.Cells); err != nil {
+		return fmt.Errorf("worker KY_CELLS invalid: %w", err)
+	}
 	since, err := s.since(ctx, CursorOrgs, fromZero)
 	if err != nil {
 		return err
@@ -97,11 +128,30 @@ func (s *Syncer) SyncOrgs(ctx context.Context, fromZero bool) error {
 		}
 		// suitedir.Orgs returns one below the last revision when it stopped at its page bound.
 		complete := len(orgs) == 0 || next >= orgs[len(orgs)-1].Revision
-		for i := 0; i == 0 || i < len(orgs); i += reconcileChunk {
-			chunk := orgs[i:min(i+reconcileChunk, len(orgs))]
-			last := i+reconcileChunk >= len(orgs)
+
+		// Filter to orgs served by this deployment plus previously-served orgs whose
+		// home_region mutated (so the vault executes C4 fencing without mutating home_region).
+		filtered := make([]suitedir.Org, 0, len(orgs))
+		for _, o := range orgs {
+			knownCell, known, err := s.State.KnownOrgCell(ctx, o.ID)
+			if err != nil {
+				return fmt.Errorf("read known org cell for %s: %w", o.ID, err)
+			}
+			if s.servesCell(o.HomeRegion) || (known && s.servesCell(knownCell)) {
+				filtered = append(filtered, o)
+			}
+		}
+
+		for i := 0; i == 0 || i < len(filtered); i += reconcileChunk {
+			chunk := filtered[i:min(i+reconcileChunk, len(filtered))]
+			last := i+reconcileChunk >= len(filtered)
 			if err := s.reconcile(ctx, chunk, complete && last); err != nil {
 				return err
+			}
+		}
+		for _, o := range orgs {
+			if err := s.State.RememberOrgCell(ctx, o.ID, o.HomeRegion); err != nil {
+				return fmt.Errorf("remember org cell for %s: %w", o.ID, err)
 			}
 		}
 		if err := s.State.SaveCursor(ctx, CursorOrgs, next); err != nil {
@@ -123,6 +173,10 @@ func (s *Syncer) reconcile(ctx context.Context, orgs []suitedir.Org, touchAll bo
 	if err != nil {
 		return err
 	}
+	if len(res.RegionMismatchTenantIDs) > 0 {
+		s.log().Error("CELL MISMATCH (C4): org home_region changed; tenant fenced and stored home_region left immutable",
+			"tenant_ids", res.RegionMismatchTenantIDs)
+	}
 	if len(res.FencedTenantIDs) > 0 {
 		s.log().Info("vault fenced tenants", "tenant_ids", res.FencedTenantIDs)
 	}
@@ -137,13 +191,18 @@ func (s *Syncer) reconcile(ctx context.Context, orgs []suitedir.Org, touchAll bo
 	return nil
 }
 
-// SyncErased erases every subject listed after the saved cursor (or from zero), reading
-// until KyIdentity lists nothing more. The cursor advances only past applied erasures.
+// SyncErased erases every subject listed after the saved cursor (or from zero) belonging
+// to one of this deployment's served cells, reading until KyIdentity lists nothing more.
+// The cursor advances only past applied erasures.
 func (s *Syncer) SyncErased(ctx context.Context, fromZero bool) error {
+	if err := config.ValidateCells(s.Cells); err != nil {
+		return fmt.Errorf("worker KY_CELLS invalid: %w", err)
+	}
 	since, err := s.since(ctx, CursorErased, fromZero)
 	if err != nil {
 		return err
 	}
+	refreshedOrgs := false
 	for {
 		subjects, next, err := s.Directory.Erased(ctx, since)
 		if err != nil {
@@ -153,6 +212,27 @@ func (s *Syncer) SyncErased(ctx context.Context, fromZero bool) error {
 			return nil
 		}
 		for _, sub := range subjects {
+			cell, known, err := s.State.KnownOrgCell(ctx, sub.OrgID)
+			if err != nil {
+				return fmt.Errorf("read known org cell for %s: %w", sub.OrgID, err)
+			}
+			if !known && !refreshedOrgs {
+				if err := s.SyncOrgs(ctx, false); err != nil {
+					return fmt.Errorf("refresh orgs before erase at revision %d: %w", sub.Revision, err)
+				}
+				refreshedOrgs = true
+				cell, known, err = s.State.KnownOrgCell(ctx, sub.OrgID)
+				if err != nil {
+					return fmt.Errorf("read known org cell for %s: %w", sub.OrgID, err)
+				}
+			}
+			if !known {
+				s.log().Warn("skipping erasure for org not present in suite directory", "org_id", sub.OrgID, "revision", sub.Revision)
+				continue
+			}
+			if !s.servesCell(cell) {
+				continue
+			}
 			res, err := s.Vault.EraseUser(ctx, vaultapi.EraseRequest{
 				Issuer: s.Issuer, Subject: sub.Sub, TenantID: &sub.OrgID, Revision: &sub.Revision,
 			})

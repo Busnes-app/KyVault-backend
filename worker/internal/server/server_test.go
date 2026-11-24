@@ -187,6 +187,20 @@ func TestWebhookUserErased(t *testing.T) {
 	}
 }
 
+func TestWebhookPropagatesForbidden403(t *testing.T) {
+	hs := newHarness(t)
+	hs.vault.Fail["users/sync"] = 1
+	hs.vault.FailStatus["users/sync"] = http.StatusForbidden
+	if code, body := hs.webhook(t, "user.updated", "evt-c5", scimUser(true)); code != http.StatusForbidden || body["error"] != "forbidden" {
+		t.Fatalf("unserved-cell webhook = %d %v, want 403 forbidden", code, body)
+	}
+	hs.vault.Fail["users/logout"] = 1
+	hs.vault.FailStatus["users/logout"] = http.StatusForbidden
+	if code, body := hs.logout(t, hs.logoutClaims("usr_foreign")); code != http.StatusForbidden || body["error"] != "forbidden" {
+		t.Fatalf("unserved-cell logout = %d %v, want 403 forbidden", code, body)
+	}
+}
+
 func TestWebhookRejections(t *testing.T) {
 	hs := newHarness(t)
 

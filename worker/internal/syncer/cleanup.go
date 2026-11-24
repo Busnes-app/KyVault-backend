@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
+	"github.com/Busnes-app/kyvault-worker/internal/config"
 	"github.com/Busnes-app/kyvault-worker/internal/vaultapi"
 )
 
@@ -62,7 +64,7 @@ func (s *Syncer) DrainCleanup(ctx context.Context) error {
 }
 
 func (s *Syncer) eraseItem(ctx context.Context, it vaultapi.CleanupItem) error {
-	if err := checkItem(it); err != nil {
+	if err := checkItem(it, s.Cells); err != nil {
 		return err
 	}
 	switch it.StorageKind {
@@ -84,12 +86,25 @@ func (s *Syncer) eraseItem(ctx context.Context, it vaultapi.CleanupItem) error {
 	}
 }
 
-// checkItem accepts only keys the vault writes for the item's own tenant:
-// tenants/<tid>/attachments/<cipher>/<id>, tenants/<tid>/sends/<send>[/<file>], or
-// tenants/<tid>/ for a whole-tenant sweep.
-func checkItem(it vaultapi.CleanupItem) error {
+// checkItem accepts only cell-scoped keys the vault writes for the item's own tenant inside
+// one of this deployment's served cells:
+// cells/<cell>/tenants/<tid>/attachments/<cipher>/<id>,
+// cells/<cell>/tenants/<tid>/sends/<send>[/<file>], or
+// cells/<cell>/tenants/<tid>/ for a whole-tenant sweep.
+func checkItem(it vaultapi.CleanupItem, servedCells []string) error {
 	if !safeTenant.MatchString(it.TenantID) {
 		return fmt.Errorf("unsafe tenant id %q", it.TenantID)
+	}
+	afterCells, ok := strings.CutPrefix(it.ObjectKey, "cells/")
+	if !ok {
+		return fmt.Errorf("%s key %q is outside cells/", it.StorageKind, it.ObjectKey)
+	}
+	cell, afterCell, ok := strings.Cut(afterCells, "/")
+	if !ok || !config.IsValidCellSlug(cell) {
+		return fmt.Errorf("%s key %q has invalid cell %q", it.StorageKind, it.ObjectKey, cell)
+	}
+	if len(servedCells) == 0 || !slices.Contains(servedCells, cell) {
+		return fmt.Errorf("%s key %q is in unserved cell %q", it.StorageKind, it.ObjectKey, cell)
 	}
 	base := "tenants/" + it.TenantID + "/"
 	var sub string
@@ -100,16 +115,16 @@ func checkItem(it vaultapi.CleanupItem) error {
 	case "send":
 		sub, segs = "sends/", []int{1, 2}
 	case "tenant_prefix":
-		if it.ObjectKey != base {
-			return fmt.Errorf("tenant_prefix key %q is not %q", it.ObjectKey, base)
+		if afterCell != base {
+			return fmt.Errorf("tenant_prefix key %q is not %q", it.ObjectKey, "cells/"+cell+"/"+base)
 		}
 		return nil
 	default:
 		return fmt.Errorf("unknown storage kind %q", it.StorageKind)
 	}
-	rest, ok := strings.CutPrefix(it.ObjectKey, base+sub)
+	rest, ok := strings.CutPrefix(afterCell, base+sub)
 	if !ok {
-		return fmt.Errorf("%s key %q is outside %q", it.StorageKind, it.ObjectKey, base+sub)
+		return fmt.Errorf("%s key %q is outside %q", it.StorageKind, it.ObjectKey, "cells/"+cell+"/"+base+sub)
 	}
 	parts := strings.Split(rest, "/")
 	for _, p := range parts {
@@ -122,5 +137,5 @@ func checkItem(it vaultapi.CleanupItem) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("%s key %q has %d segments after %q", it.StorageKind, it.ObjectKey, len(parts), base+sub)
+	return fmt.Errorf("%s key %q has %d segments after %q", it.StorageKind, it.ObjectKey, len(parts), "cells/"+cell+"/"+base+sub)
 }
