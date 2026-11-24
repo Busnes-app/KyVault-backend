@@ -168,8 +168,11 @@ type StorageReport struct {
 
 // StorageResult mirrors suitedir.StorageResult. Grant fields are nil for unknown_org.
 type StorageResult struct {
-	OrgID        string `json:"org_id"`
-	Result       string `json:"result"`
+	OrgID  string `json:"org_id"`
+	Result string `json:"result"`
+	// ReportSeq is the seq of the report this answers. A stale answer carries KyIdentity's
+	// seq and unknown_org none, so the vault needs this to drop answers to older reports.
+	ReportSeq    int64  `json:"report_seq"`
 	Seq          *int64 `json:"seq"`
 	CeilingBytes *int64 `json:"ceiling_bytes"`
 	TTLSeconds   *int64 `json:"ttl_seconds"`

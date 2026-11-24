@@ -68,9 +68,13 @@ func (s *Syncer) exchange(ctx context.Context, batch []suitedir.StorageReport) e
 	if err != nil {
 		return err
 	}
+	sent := make(map[string]int64, len(batch))
+	for _, r := range batch {
+		sent[r.OrgID] = r.Seq
+	}
 	req := vaultapi.ApplyRequest{SentAt: sentAt, Results: make([]vaultapi.StorageResult, len(results))}
 	for i, r := range results {
-		out := vaultapi.StorageResult{OrgID: r.OrgID, Result: r.Result}
+		out := vaultapi.StorageResult{OrgID: r.OrgID, Result: r.Result, ReportSeq: sent[r.OrgID]}
 		if r.Result != "unknown_org" {
 			out.Seq, out.CeilingBytes, out.TTLSeconds = &r.Seq, &r.CeilingBytes, &r.TTLSeconds
 			out.PoolBytes, out.OrgUsedBytes, out.OverSince = &r.PoolBytes, &r.OrgUsedBytes, r.OverSince

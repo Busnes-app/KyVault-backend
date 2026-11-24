@@ -360,6 +360,7 @@ impl Tenant {
         release: i64,
         expected_epoch: Option<i64>,
         clear_pending_id: Option<&str>,
+        now_ts: i64,
     ) -> EmptyResult {
         let release = release.max(0);
         conn.transaction::<(), crate::Error, _>(|conn| {
@@ -372,7 +373,9 @@ impl Tenant {
             {
                 err_code!("Tenant access was revoked during upload", 403);
             }
-            let object_key = att.get_file_path_in_cell(Some(&tenant.home_region))?;
+            if let Some(pid) = clear_pending_id {
+                take_upload_row(conn, tid, pid, now_ts)?;
+            }
             match conn {
                 #[cfg(mysql)]
                 DbConnInner::Mysql(c) => diesel::insert_into(attachments::table)
@@ -403,19 +406,6 @@ impl Tenant {
                 .execute(conn)
                 .map(|_| ())
                 .map_res("Error releasing storage reservation")?;
-            if let Some(pid) = clear_pending_id {
-                diesel::delete(
-                    tenant_pending_deletions::table.filter(
-                        tenant_pending_deletions::id.eq(pid).or(tenant_pending_deletions::tenant_id
-                            .eq(tid)
-                            .and(tenant_pending_deletions::storage_kind.eq("attachment"))
-                            .and(tenant_pending_deletions::object_key.eq(&object_key))),
-                    ),
-                )
-                .execute(conn)
-                .map(|_| ())
-                .map_res("Error clearing staged attachment cleanup")?;
-            }
             Ok(())
         })
     }
@@ -437,7 +427,15 @@ impl Tenant {
             if !is_postgresql(conn) {
                 err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
             }
-            Self::save_attachment_releasing_inner(conn, &tid, att, release, expected_epoch, pid.as_deref())
+            Self::save_attachment_releasing_inner(
+                conn,
+                &tid,
+                att,
+                release,
+                expected_epoch,
+                pid.as_deref(),
+                Utc::now().timestamp(),
+            )
         })
         .await
     }
@@ -445,7 +443,7 @@ impl Tenant {
     /// Transactionally begins a hosted v2 attachment upload under the tenant lock:
     /// 1. Validates active status, served cell, and authority freshness.
     /// 2. Serializes concurrent uploads for the same attachment across all replicas by rejecting
-    ///    when a non-expired `upload_in_flight` row already exists for its object key.
+    ///    while any cleanup row exists for its object key (in flight, or held by the worker).
     /// 3. Reads the locked current `attachments.file_size`, checks v2 leeway (1 MiB), computes
     ///    positive growth delta against that locked row, verifies and reserves storage bytes, and
     ///    stages the durable `upload_in_flight` cleanup row in the same transaction.
@@ -465,7 +463,6 @@ impl Tenant {
         }
         let now_dt =
             chrono::DateTime::from_timestamp(now_ts, 0).map_or_else(|| Utc::now().naive_utc(), |dt| dt.naive_utc());
-        let grace_cutoff = now_dt - chrono::Duration::seconds(crate::tenancy::ops::UPLOAD_STAGING_GRACE_SECS);
         conn.transaction::<V2UploadLease, crate::Error, _>(|conn| {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
                 err_code!("Tenant not found", 403);
@@ -477,14 +474,14 @@ impl Tenant {
                 tenant_pending_deletions::table
                     .filter(tenant_pending_deletions::tenant_id.eq(tid))
                     .filter(tenant_pending_deletions::storage_kind.eq("attachment"))
-                    .filter(tenant_pending_deletions::object_key.eq(&object_key))
-                    .filter(tenant_pending_deletions::last_error.eq(Some(crate::tenancy::ops::UPLOAD_IN_FLIGHT_MARKER)))
-                    .filter(tenant_pending_deletions::created_at.gt(grace_cutoff)),
+                    .filter(tenant_pending_deletions::object_key.eq(&object_key)),
             ))
             .get_result(conn)
             .map_res("Error checking in-flight attachment upload")?;
             if in_flight {
-                err_code!("An upload for this attachment is already in progress", 409);
+                // A pending row is an upload in flight or a delete the cleanup worker may hold;
+                // a new write to the same key could be removed by that delete.
+                err_code!("An upload or cleanup for this attachment is still pending", 409);
             }
 
             let Some(current_size): Option<i64> = attachments::table
@@ -593,6 +590,7 @@ impl Tenant {
     /// If the tenant was fenced, the attachment was deleted, or the attachment shrank concurrently
     /// so `release` no longer covers growth, the transaction rolls back and `clear_pending_id`
     /// stays queued.
+    #[allow(clippy::too_many_arguments)]
     pub fn finalize_v2_attachment_upload_inner(
         conn: &mut DbConnInner,
         tid: &str,
@@ -601,6 +599,7 @@ impl Tenant {
         release: i64,
         expected_epoch: Option<i64>,
         clear_pending_id: Option<&str>,
+        now_ts: i64,
     ) -> EmptyResult {
         let release = release.max(0);
         conn.transaction::<(), crate::Error, _>(|conn| {
@@ -613,7 +612,9 @@ impl Tenant {
             {
                 err_code!("Tenant access was revoked during upload", 403);
             }
-            let object_key = att.get_file_path_in_cell(Some(&tenant.home_region))?;
+            if let Some(pid) = clear_pending_id {
+                take_upload_row(conn, tid, pid, now_ts)?;
+            }
             let Some(current_size): Option<i64> = attachments::table
                 .filter(attachments::id.eq(&att.id))
                 .filter(attachments::cipher_uuid.eq(&att.cipher_uuid))
@@ -646,19 +647,6 @@ impl Tenant {
                 .execute(conn)
                 .map(|_| ())
                 .map_res("Error releasing storage reservation")?;
-            if let Some(pid) = clear_pending_id {
-                diesel::delete(
-                    tenant_pending_deletions::table.filter(
-                        tenant_pending_deletions::id.eq(pid).or(tenant_pending_deletions::tenant_id
-                            .eq(tid)
-                            .and(tenant_pending_deletions::storage_kind.eq("attachment"))
-                            .and(tenant_pending_deletions::object_key.eq(&object_key))),
-                    ),
-                )
-                .execute(conn)
-                .map(|_| ())
-                .map_res("Error clearing staged attachment cleanup")?;
-            }
             Ok(())
         })
     }
@@ -687,6 +675,7 @@ impl Tenant {
                 release,
                 expected_epoch,
                 pid.as_deref(),
+                Utc::now().timestamp(),
             )
         })
         .await
@@ -865,30 +854,63 @@ pub fn is_postgresql(conn: &DbConnInner) -> bool {
 
 /// Loads a tenant row, holding a `FOR UPDATE` row lock on PostgreSQL (the hosted backend).
 /// Call inside a transaction.
-/// Returns the bytes reserved by cleanup rows `ids` to their tenants and zeroes the rows, so a
-/// reclaimed or abandoned upload releases its reservation exactly once. Call inside a transaction.
-pub fn release_pending_reservations(conn: &mut DbConnInner, ids: &[&str]) -> QueryResult<()> {
-    let rows: Vec<(String, i64)> = tenant_pending_deletions::table
-        .filter(tenant_pending_deletions::id.eq_any(ids))
-        .filter(tenant_pending_deletions::reserved_bytes.gt(0))
-        .select((tenant_pending_deletions::tenant_id, tenant_pending_deletions::reserved_bytes))
-        .load(conn)?;
-    let mut per_tenant = std::collections::BTreeMap::<String, i64>::new();
-    for (tid, bytes) in rows {
-        let total = per_tenant.entry(tid).or_default();
-        *total = total.saturating_add(bytes);
+/// Deletes the upload's own cleanup row, which must still be in flight and inside the grace
+/// window. Past either, the cleanup worker may hold the row and delete the object, so the
+/// upload must not commit a row pointing at it.
+fn take_upload_row(conn: &mut DbConnInner, tid: &str, pid: &str, now_ts: i64) -> EmptyResult {
+    let cutoff = chrono::DateTime::from_timestamp(now_ts - crate::tenancy::ops::UPLOAD_STAGING_GRACE_SECS, 0)
+        .map_or_else(|| Utc::now().naive_utc(), |dt| dt.naive_utc());
+    let taken: usize = diesel::delete(
+        tenant_pending_deletions::table
+            .filter(tenant_pending_deletions::id.eq(pid))
+            .filter(tenant_pending_deletions::tenant_id.eq(tid))
+            .filter(tenant_pending_deletions::last_error.eq(Some(crate::tenancy::ops::UPLOAD_IN_FLIGHT_MARKER)))
+            .filter(tenant_pending_deletions::created_at.gt(cutoff)),
+    )
+    .execute(conn)
+    .map_res("Error claiming staged upload")?;
+    if taken == 0 {
+        err_code!("Upload took too long and was handed to cleanup; retry it", 409);
     }
-    // BTreeMap order gives a stable lock order across concurrent callers.
-    for (tid, bytes) in per_tenant {
-        if let Some(t) = lock_tenant(conn, &tid)? {
+    Ok(())
+}
+
+/// Returns the bytes reserved by cleanup rows `ids` to their tenants and zeroes the rows, so a
+/// reclaimed or abandoned upload releases its reservation exactly once. Tenants are locked
+/// before the rows are read, so concurrent callers cannot both release the same row.
+/// Call inside a transaction.
+pub fn release_pending_reservations(conn: &mut DbConnInner, ids: &[&str]) -> QueryResult<()> {
+    let mut tenant_ids: Vec<String> = tenant_pending_deletions::table
+        .filter(tenant_pending_deletions::id.eq_any(ids))
+        .select(tenant_pending_deletions::tenant_id)
+        .distinct()
+        .load(conn)?;
+    // Sorted for a stable lock order across concurrent callers.
+    tenant_ids.sort();
+    for tid in tenant_ids {
+        let Some(t) = lock_tenant(conn, &tid)? else {
+            continue;
+        };
+        let bytes: Vec<i64> = tenant_pending_deletions::table
+            .filter(tenant_pending_deletions::id.eq_any(ids))
+            .filter(tenant_pending_deletions::tenant_id.eq(&tid))
+            .filter(tenant_pending_deletions::reserved_bytes.gt(0))
+            .select(tenant_pending_deletions::reserved_bytes)
+            .load(conn)?;
+        let total = bytes.into_iter().fold(0i64, i64::saturating_add);
+        if total > 0 {
             diesel::update(tenants::table.find(&tid))
-                .set(tenants::storage_reserved_bytes.eq(t.storage_reserved_bytes.saturating_sub(bytes).max(0)))
+                .set(tenants::storage_reserved_bytes.eq(t.storage_reserved_bytes.saturating_sub(total).max(0)))
                 .execute(conn)?;
         }
-    }
-    diesel::update(tenant_pending_deletions::table.filter(tenant_pending_deletions::id.eq_any(ids)))
+        diesel::update(
+            tenant_pending_deletions::table
+                .filter(tenant_pending_deletions::id.eq_any(ids))
+                .filter(tenant_pending_deletions::tenant_id.eq(&tid)),
+        )
         .set(tenant_pending_deletions::reserved_bytes.eq(0))
         .execute(conn)?;
+    }
     Ok(())
 }
 

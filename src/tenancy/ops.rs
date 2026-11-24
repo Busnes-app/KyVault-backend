@@ -1215,6 +1215,9 @@ pub fn storage_prepare(
 pub struct ApplyItem {
     pub org_id: String,
     pub result: String,
+    /// Seq of the report this answers. Missing means 0, which is never current.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub report_seq: i64,
     #[serde(default, deserialize_with = "null_as_default")]
     pub seq: i64,
     #[serde(default, deserialize_with = "null_as_default")]
@@ -1280,16 +1283,23 @@ pub fn storage_apply(
             if is_tombstoned(&t.status) {
                 return Ok(false);
             }
+            // Drop answers to older reports before any variant touches state. An ok may
+            // replay the last applied report; stale and unknown_org must answer the pending one.
+            let current = if r.result == "ok" {
+                r.report_seq > 0
+                    && r.seq == r.report_seq
+                    && r.report_seq <= t.storage_report_seq
+                    && r.report_seq >= t.storage_last_applied_seq
+                    && t.storage_pending_seq.is_none_or(|p| r.report_seq >= p)
+            } else {
+                t.storage_pending_seq == Some(r.report_seq)
+            };
+            if !current {
+                return Ok(false);
+            }
             let row = tenants::table.find(&r.org_id);
             match r.result.as_str() {
                 "ok" => {
-                    let out_of_order = r.seq <= 0
-                        || r.seq > t.storage_report_seq
-                        || r.seq < t.storage_last_applied_seq
-                        || t.storage_pending_seq.is_some_and(|p| r.seq < p);
-                    if out_of_order {
-                        return Ok(false);
-                    }
                     // A report sent before a fence can be answered after it: keep the
                     // bookkeeping, never reinstall a grant on a non-active or C4-fenced tenant.
                     let (ceiling, expires) = if t.is_active() && t.authority_refreshed_at.is_some() {
@@ -1967,6 +1977,7 @@ mod tests {
                     results: vec![ApplyItem {
                         org_id: "t1".to_owned(),
                         result: result.to_owned(),
+                        report_seq: seq,
                         seq,
                         ceiling_bytes: 5000,
                         ttl_seconds: 3600,
@@ -2005,6 +2016,11 @@ mod tests {
         assert_eq!(apply(c, "ok", 1, NOW).applied, 0);
         assert_eq!(apply(c, "ok", 99, NOW).applied, 0);
         assert_eq!(tenant(c, "t1").storage_pending_seq, Some(2));
+        // Delayed stale or unknown_org answers to the applied report 1 change nothing.
+        assert_eq!(apply(c, "stale", 1, NOW).applied, 0);
+        assert_eq!(apply(c, "unknown_org", 1, NOW).applied, 0);
+        let t = tenant(c, "t1");
+        assert_eq!((t.storage_pending_seq, t.storage_ceiling_bytes, t.storage_seq_stale), (Some(2), 5000, false));
 
         // A report sent while active and answered after a fence installs no grant.
         reconcile(c, vec![snap("t1", "suspended", true, 5)], false, NOW);
@@ -2040,7 +2056,8 @@ mod tests {
         assert_eq!((r.storage_report_seq, r.storage_seq_stale), (41, false));
         assert_eq!(prep(c)[0].seq, 42);
 
-        assert_eq!(apply(c, "unknown_org", 0, NOW).applied, 1);
+        assert_eq!(apply(c, "unknown_org", 0, NOW).applied, 0, "an answer must name its report");
+        assert_eq!(apply(c, "unknown_org", 42, NOW).applied, 1);
         let t = tenant(c, "t1");
         assert_eq!((t.storage_ceiling_bytes, t.storage_grant_expires_at, t.storage_pending_seq), (0, None, None));
 
@@ -2176,6 +2193,7 @@ mod tests {
                     results: vec![ApplyItem {
                         org_id: "t1".into(),
                         result: "ok".into(),
+                        report_seq: rep.seq,
                         seq: rep.seq,
                         ceiling_bytes: 99_999,
                         ttl_seconds: 600,
@@ -2336,6 +2354,7 @@ mod tests {
                     results: vec![ApplyItem {
                         org_id: "foreign".to_owned(),
                         result: "ok".to_owned(),
+                        report_seq: 1,
                         seq: 1,
                         ceiling_bytes: 1000,
                         ttl_seconds: 600,
@@ -2528,7 +2547,9 @@ mod tests {
             None,
         )
         .with_tenant_id(Some("t1".to_owned()));
-        assert!(Tenant::save_attachment_releasing_inner(c, "t1", &att_fail, 128, Some(1), Some("pd-staged")).is_err());
+        assert!(
+            Tenant::save_attachment_releasing_inner(c, "t1", &att_fail, 128, Some(1), Some("pd-staged"), NOW).is_err()
+        );
 
         // Rollback preserves both the staged cleanup row and reserved bytes.
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 128);
@@ -2566,7 +2587,7 @@ mod tests {
             None,
         )
         .with_tenant_id(Some("t1".to_owned()));
-        Tenant::save_attachment_releasing_inner(c, "t1", &att_ok, 128, Some(1), Some("pd-ok")).unwrap();
+        Tenant::save_attachment_releasing_inner(c, "t1", &att_ok, 128, Some(1), Some("pd-ok"), NOW).unwrap();
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
         assert!(tenant_pending_deletions::table.find("pd-ok").first::<TenantPendingDeletion>(c).is_err());
     }
@@ -2755,8 +2776,17 @@ mod tests {
         // Finalizing the v2 upload MUST fail because the attachment row no longer exists,
         // and MUST leave the staged pending-deletion row intact for durable cleanup.
         assert!(
-            Tenant::finalize_v2_attachment_upload_inner(&mut setup, "t1", &att, 128, 28, Some(1), Some(pending_id))
-                .is_err()
+            Tenant::finalize_v2_attachment_upload_inner(
+                &mut setup,
+                "t1",
+                &att,
+                128,
+                28,
+                Some(1),
+                Some(pending_id),
+                NOW
+            )
+            .is_err()
         );
         assert!(tenant_pending_deletions::table.find(pending_id).first::<TenantPendingDeletion>(&mut setup).is_ok());
         assert_eq!(tenant(&mut setup, "t1").storage_reserved_bytes, 28);
@@ -2828,13 +2858,22 @@ mod tests {
 
         // Wrong epoch (fenced tenant) fails and preserves staged cleanup.
         assert!(
-            Tenant::finalize_v2_attachment_upload_inner(&mut setup, "t1", &att_ok, 128, 28, Some(99), Some("pd-v2-ok"))
-                .is_err()
+            Tenant::finalize_v2_attachment_upload_inner(
+                &mut setup,
+                "t1",
+                &att_ok,
+                128,
+                28,
+                Some(99),
+                Some("pd-v2-ok"),
+                NOW
+            )
+            .is_err()
         );
         assert!(tenant_pending_deletions::table.find("pd-v2-ok").first::<TenantPendingDeletion>(&mut setup).is_ok());
 
         // Matching epoch succeeds, updates file_size to 128, releases 28 reserved bytes, and clears pd-v2-ok.
-        Tenant::finalize_v2_attachment_upload_inner(&mut setup, "t1", &att_ok, 128, 28, Some(1), Some("pd-v2-ok"))
+        Tenant::finalize_v2_attachment_upload_inner(&mut setup, "t1", &att_ok, 128, 28, Some(1), Some("pd-v2-ok"), NOW)
             .unwrap();
         assert_eq!(attachments::table.find("att-ok").first::<Attachment>(&mut setup).unwrap().file_size, 128);
         assert_eq!(tenant(&mut setup, "t1").storage_reserved_bytes, 0);
@@ -2895,6 +2934,7 @@ mod tests {
             first.reserved_bytes,
             Some(first.access_epoch),
             Some(&first.pending_cleanup_id),
+            NOW,
         )
         .unwrap();
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
@@ -2934,6 +2974,7 @@ mod tests {
                 lease.reserved_bytes,
                 Some(lease.access_epoch),
                 Some(&lease.pending_cleanup_id),
+                NOW
             )
             .is_err()
         );
@@ -2969,5 +3010,46 @@ mod tests {
         };
         cleanup_complete(c, &done, &cells(), NOW).unwrap();
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 500);
+    }
+
+    #[test]
+    fn upload_handed_to_cleanup_cannot_commit_or_be_overwritten() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["att"], 5_000);
+        let late = NOW + UPLOAD_STAGING_GRACE_SECS + 1;
+
+        // The upload outlives its grace and the worker picks up its cleanup row.
+        let slow = begin(c, "att", 1_100).unwrap();
+        let job = cleanup_pending(c, None, &cells(), late).unwrap();
+        assert_eq!(job.items.len(), 1);
+
+        // A retry would write the same object key the worker is about to delete.
+        assert!(begin(c, "att", 1_100).is_err());
+        // The slow upload must not commit a row pointing at an object being deleted.
+        let fin = |c: &mut DbConnInner, lease: &V2UploadLease, now| {
+            Tenant::finalize_v2_attachment_upload_inner(
+                c,
+                "t1",
+                &v2_att("att"),
+                1_100,
+                lease.reserved_bytes,
+                Some(lease.access_epoch),
+                Some(&lease.pending_cleanup_id),
+                now,
+            )
+        };
+        assert!(fin(c, &slow, late).is_err());
+        assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 100);
+
+        // Once the worker reports the delete, uploads resume and commit normally.
+        let done = CompleteRequest {
+            completed_ids: vec![slow.pending_cleanup_id],
+            failed: vec![],
+        };
+        cleanup_complete(c, &done, &cells(), late).unwrap();
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
+        let retry = begin(c, "att", 1_100).unwrap();
+        fin(c, &retry, NOW).unwrap();
+        assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 1_100);
     }
 }

@@ -418,6 +418,10 @@ func TestReportStorageWireFormatAndSentAt(t *testing.T) {
 	if ok.Result != "ok" || *ok.Seq != 7 || *ok.CeilingBytes != 1024+256<<20 || *ok.TTLSeconds != 900 || *ok.PoolBytes != 1<<30 || *ok.OrgUsedBytes != 2048 || ok.OverSince != nil {
 		t.Fatalf("ok result = %+v", ok)
 	}
+	// Every answer names the report it answers, even unknown_org, which carries no seq.
+	if ok.ReportSeq != 7 || unknown.ReportSeq != 1 {
+		t.Fatalf("report_seq not forwarded: ok %d unknown %d", ok.ReportSeq, unknown.ReportSeq)
+	}
 	if unknown.Result != "unknown_org" || unknown.Seq != nil || unknown.CeilingBytes != nil {
 		t.Fatalf("unknown_org result carries a grant: %+v", unknown)
 	}
