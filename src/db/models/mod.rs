@@ -39,9 +39,10 @@ pub use self::organization::{
 };
 pub use self::send::{Send, SendFileId, SendId, SendType};
 pub use self::sso_auth::{OIDCAuthenticatedUser, OIDCCodeResponseError, SsoAuth};
-#[cfg(test)]
-pub use self::tenant::TENANT_STATUS_ACTIVE;
-pub use self::tenant::{Tenant, TenantErasedSubject, TenantRecoveryBundle};
+pub use self::tenant::{
+    TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion, TenantRecoveryBundle, committed_bytes,
+    lock_tenant,
+};
 pub use self::two_factor::{TwoFactor, TwoFactorType};
 pub use self::two_factor_duo_context::TwoFactorDuoContext;
 pub use self::two_factor_incomplete::TwoFactorIncomplete;

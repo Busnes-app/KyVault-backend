@@ -62,12 +62,12 @@ pub fn publish_user_logout(user_id: &UserId) {
     }
 }
 
+#[cfg_attr(not(postgresql), allow(dead_code, reason = "only the PostgreSQL listener and tests use it"))]
 pub(crate) fn is_safe_pg_ident(s: &str) -> bool {
     !s.is_empty() && s.len() <= 63 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Publishes an immediate tenant-wide disconnect across all replicas.
-#[allow(dead_code)]
 pub fn publish_tenant_kick(tenant_id: &str) {
     let Some(tx) = PUBLISH_TX.get() else {
         return;

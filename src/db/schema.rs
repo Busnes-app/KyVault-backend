@@ -468,6 +468,7 @@ allow_tables_to_appear_in_same_query!(
     ciphers_collections,
     collections,
     devices,
+    favorites,
     folders,
     folders_ciphers,
     invitations,
@@ -490,4 +491,5 @@ allow_tables_to_appear_in_same_query!(
     collections_groups,
     event,
     auth_requests,
+    twofactor_incomplete,
 );

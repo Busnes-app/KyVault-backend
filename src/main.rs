@@ -588,6 +588,8 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .mount([basepath, "/identity"].concat(), api::identity_routes())
         .mount([basepath, "/icons"].concat(), api::icons_routes())
         .mount([basepath, "/notifications"].concat(), api::notifications_routes())
+        // Private worker API: fixed path, not under DOMAIN's base path; 404 unless multi-tenant.
+        .mount("/internal/tenancy/v1", api::internal_tenancy_routes())
         .register([basepath, "/"].concat(), api::web_catchers())
         .register([basepath, "/api"].concat(), api::core_catchers());
 

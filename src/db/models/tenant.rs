@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::{
     api::EmptyResult,
     db::{
-        DbConn,
+        DbConn, DbConnInner,
         schema::{
             attachments, ciphers, sends, tenant_erased_subjects, tenant_pending_deletions, tenant_recovery_bundles,
             tenants,
@@ -229,80 +229,10 @@ impl Tenant {
         .await
     }
 
-    pub async fn attachment_bytes(tenant_id: &str, conn: &DbConn) -> i64 {
-        let tid = tenant_id.to_owned();
-        conn.run(move |conn| {
-            let sum: Option<BigDecimal> = attachments::table
-                .filter(attachments::tenant_id.eq(tid))
-                .select(diesel::dsl::sum(attachments::file_size))
-                .first(conn)
-                .unwrap_or(None);
-            sum_to_i64(sum)
-        })
-        .await
-    }
-
-    pub async fn send_file_bytes(tenant_id: &str, conn: &DbConn) -> i64 {
-        let tid = tenant_id.to_owned();
-        conn.run(move |conn| {
-            let rows: Vec<String> = sends::table
-                .filter(sends::tenant_id.eq(tid))
-                .filter(sends::atype.eq(1))
-                .select(sends::data)
-                .load::<String>(conn)
-                .unwrap_or_default();
-            let mut total: i64 = 0;
-            for data in rows {
-                if let Ok(val) = serde_json::from_str::<Value>(&data)
-                    && let Some(sz) = val.get("size").or_else(|| val.get("Size")).and_then(Value::as_i64)
-                {
-                    total = total.saturating_add(sz.max(0));
-                }
-            }
-            total
-        })
-        .await
-    }
-
-    /// Counts retained encrypted record bytes (personal + shared ciphers including trashed
-    /// revisions, plus active recovery kit envelopes) per Design §11 P3.
-    pub async fn record_payload_bytes(tenant_id: &str, conn: &DbConn) -> i64 {
-        let tid = tenant_id.to_owned();
-        conn.run(move |conn| {
-            let cipher_data: Vec<String> = ciphers::table
-                .filter(ciphers::tenant_id.eq(&tid))
-                .select(ciphers::data)
-                .load::<String>(conn)
-                .unwrap_or_default();
-            let mut total: i64 = 0;
-            for d in cipher_data {
-                total = total.saturating_add(len_i64(&d));
-            }
-
-            let bundles: Vec<(String, Option<String>)> = tenant_recovery_bundles::table
-                .filter(tenant_recovery_bundles::tenant_id.eq(&tid))
-                .filter(tenant_recovery_bundles::revoked_at.is_null())
-                .select((tenant_recovery_bundles::wrapped_user_key, tenant_recovery_bundles::wrapped_private_key))
-                .load(conn)
-                .unwrap_or_default();
-            for (wk, wpk) in bundles {
-                total = total.saturating_add(len_i64(&wk));
-                if let Some(pk) = wpk {
-                    total = total.saturating_add(len_i64(&pk));
-                }
-            }
-            total
-        })
-        .await
-    }
-
-    /// Total committed storage bytes retained for this tenant across attachments, sends,
-    /// encrypted ciphers (including trash), and key envelopes.
+    /// Total committed storage bytes retained for this tenant (see [`committed_bytes`]).
     pub async fn committed_storage_bytes(tenant_id: &str, conn: &DbConn) -> i64 {
-        let att = Self::attachment_bytes(tenant_id, conn).await;
-        let snd = Self::send_file_bytes(tenant_id, conn).await;
-        let rec = Self::record_payload_bytes(tenant_id, conn).await;
-        att.saturating_add(snd).saturating_add(rec)
+        let tid = tenant_id.to_owned();
+        conn.run(move |conn| committed_bytes(conn, &tid).unwrap_or(0)).await
     }
 
     /// Locks the tenant row, checks status, authority freshness and the storage grant against
@@ -318,51 +248,35 @@ impl Tenant {
         let tid = tenant_id.to_owned();
         let region = home_region.to_owned();
         let add = additional_bytes.max(0);
-        db_run! { conn:
-            postgresql {
-                conn.transaction::<i64, crate::Error, _>(|conn| {
-                    let now = Utc::now();
-                    let tenant: Tenant = tenants::table
-                        .filter(tenants::id.eq(&tid))
-                        .for_update()
-                        .first::<Tenant>(conn)
-                        .map_err(|_| crate::Error::new("Tenant not found", "Tenant not found").with_code(403))?;
-                    validate_tenant_growth_tx(&tenant, &region, now.timestamp(), max_authority_age_secs)?;
-                    if add > 0 {
-                        let att: Option<BigDecimal> = attachments::table
-                            .filter(attachments::tenant_id.eq(&tid))
-                            .select(diesel::dsl::sum(attachments::file_size))
-                            .first(conn)
-                            .map_res("Error summing tenant attachments")?;
-                        let records: Option<i64> = ciphers::table
-                            .filter(ciphers::tenant_id.eq(&tid))
-                            .select(diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>>(
-                                "SUM(OCTET_LENGTH(data))::BIGINT",
-                            ))
-                            .first(conn)
-                            .map_res("Error summing tenant records")?;
-                        let committed = sum_to_i64(att).saturating_add(records.unwrap_or(0).max(0));
-                        if !tenant.can_grow_storage(committed, add, now.timestamp()) {
-                            err_code!("Organization storage quota exceeded or grant expired", 403);
-                        }
-                        diesel::update(tenants::table.filter(tenants::id.eq(&tid)))
-                            .set((
-                                tenants::storage_reserved_bytes.eq(tenant.storage_reserved_bytes.max(0).saturating_add(add)),
-                                tenants::updated_at.eq(now.naive_utc()),
-                            ))
-                            .execute(conn)
-                            .map(drop)
-                            .map_res("Error reserving tenant storage bytes")?;
+        conn.run(move |conn| {
+            if !is_postgresql(conn) {
+                err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
+            }
+            conn.transaction::<i64, crate::Error, _>(|conn| {
+                let now = Utc::now();
+                let Some(tenant) = lock_tenant(conn, &tid)? else {
+                    err_code!("Tenant not found", 403);
+                };
+                validate_tenant_growth_tx(&tenant, &region, now.timestamp(), max_authority_age_secs)?;
+                if add > 0 {
+                    let committed = committed_bytes(conn, &tid)?;
+                    if !tenant.can_grow_storage(committed, add, now.timestamp()) {
+                        err_code!("Organization storage quota exceeded or grant expired", 403);
                     }
-                    Ok(tenant.access_epoch)
-                })
-            }
-            sqlite, mysql {
-                let _ = conn;
-                drop((tid, region, add, max_authority_age_secs));
-                err_code!("Hosted multi-tenant storage requires PostgreSQL", 503)
-            }
-        }
+                    diesel::update(tenants::table.filter(tenants::id.eq(&tid)))
+                        .set((
+                            tenants::storage_reserved_bytes
+                                .eq(tenant.storage_reserved_bytes.max(0).saturating_add(add)),
+                            tenants::updated_at.eq(now.naive_utc()),
+                        ))
+                        .execute(conn)
+                        .map(drop)
+                        .map_res("Error reserving tenant storage bytes")?;
+                }
+                Ok(tenant.access_epoch)
+            })
+        })
+        .await
     }
 
     /// Releases previously reserved bytes (clamped at 0).
@@ -413,10 +327,6 @@ impl Tenant {
     }
 }
 
-fn len_i64(s: &str) -> i64 {
-    i64::try_from(s.len()).unwrap_or(i64::MAX)
-}
-
 fn sum_to_i64(sum: Option<BigDecimal>) -> i64 {
     match sum.map(|v| v.to_i64()) {
         Some(Some(v)) => v.max(0),
@@ -425,7 +335,81 @@ fn sum_to_i64(sum: Option<BigDecimal>) -> i64 {
     }
 }
 
-#[cfg(postgresql)]
+pub fn is_postgresql(conn: &DbConnInner) -> bool {
+    match conn {
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(_) => true,
+        #[allow(unreachable_patterns, reason = "only reachable when another backend is compiled in")]
+        _ => false,
+    }
+}
+
+/// Loads a tenant row, holding a `FOR UPDATE` row lock on PostgreSQL (the hosted backend).
+/// Call inside a transaction.
+pub fn lock_tenant(conn: &mut DbConnInner, id: &str) -> QueryResult<Option<Tenant>> {
+    match conn {
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(pg) => tenants::table.find(id).for_update().first::<Tenant>(pg).optional(),
+        #[allow(unreachable_patterns, reason = "only reachable when another backend is compiled in")]
+        _ => tenants::table.find(id).first::<Tenant>(conn).optional(),
+    }
+}
+
+/// `SUM` of the byte lengths of `cols`, as a non-null BIGINT, in the active backend's dialect.
+fn octet_sum_sql(conn: &DbConnInner, cols: &[&str]) -> String {
+    let len = |col: &str| match conn {
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(_) => format!("COALESCE(OCTET_LENGTH({col}), 0)"),
+        #[cfg(mysql)]
+        DbConnInner::Mysql(_) => format!("COALESCE(LENGTH({col}), 0)"),
+        #[cfg(sqlite)]
+        DbConnInner::Sqlite(_) => format!("COALESCE(LENGTH(CAST({col} AS BLOB)), 0)"),
+    };
+    let sum = format!("COALESCE(SUM({}), 0)", cols.iter().map(|c| len(c)).collect::<Vec<_>>().join(" + "));
+    match conn {
+        #[cfg(mysql)]
+        DbConnInner::Mysql(_) => format!("CAST({sum} AS SIGNED)"),
+        #[allow(unreachable_patterns, reason = "only reachable when another backend is compiled in")]
+        _ => sum,
+    }
+}
+
+/// Committed tenant storage per Design §11 P3: attachment payloads, file Send payloads,
+/// encrypted cipher data (trash included) and active recovery-kit envelopes. Pending upload
+/// reservations live in `tenants.storage_reserved_bytes` and are added by callers.
+pub fn committed_bytes(conn: &mut DbConnInner, tenant_id: &str) -> QueryResult<i64> {
+    use diesel::{dsl::sql, sql_types::BigInt};
+
+    let att: Option<BigDecimal> = attachments::table
+        .filter(attachments::tenant_id.eq(tenant_id))
+        .select(diesel::dsl::sum(attachments::file_size))
+        .first(conn)?;
+
+    let cipher_sql = octet_sum_sql(conn, &["data"]);
+    let records: i64 =
+        ciphers::table.filter(ciphers::tenant_id.eq(tenant_id)).select(sql::<BigInt>(&cipher_sql)).first(conn)?;
+
+    let bundle_sql = octet_sum_sql(conn, &["wrapped_user_key", "wrapped_private_key"]);
+    let bundles: i64 = tenant_recovery_bundles::table
+        .filter(tenant_recovery_bundles::tenant_id.eq(tenant_id))
+        .filter(tenant_recovery_bundles::revoked_at.is_null())
+        .select(sql::<BigInt>(&bundle_sql))
+        .first(conn)?;
+
+    let send_data: Vec<String> = sends::table
+        .filter(sends::tenant_id.eq(tenant_id))
+        .filter(sends::atype.eq(1))
+        .select(sends::data)
+        .load(conn)?;
+    let send_bytes = send_data
+        .iter()
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|v| v.get("size").or_else(|| v.get("Size")).and_then(Value::as_i64))
+        .fold(0i64, |acc, sz| acc.saturating_add(sz.max(0)));
+
+    Ok(sum_to_i64(att).saturating_add(records.max(0)).saturating_add(bundles.max(0)).saturating_add(send_bytes))
+}
+
 fn validate_tenant_growth_tx(
     tenant: &Tenant,
     home_region: &str,
@@ -447,8 +431,8 @@ fn validate_tenant_growth_tx(
 impl TenantErasedSubject {
     pub async fn record(issuer: &str, subject: &str, tenant_id: &str, revision: i64, conn: &DbConn) -> EmptyResult {
         let row = Self {
-            issuer: issuer.to_owned(),
-            subject: subject.to_owned(),
+            issuer: crate::tenancy::canonical_issuer(issuer).to_owned(),
+            subject: subject.trim().to_owned(),
             tenant_id: tenant_id.to_owned(),
             revision,
             erased_at: Utc::now().naive_utc(),
@@ -472,8 +456,8 @@ impl TenantErasedSubject {
     }
 
     pub async fn is_erased(issuer: &str, subject: &str, conn: &DbConn) -> bool {
-        let iss = issuer.to_owned();
-        let sub = subject.to_owned();
+        let iss = crate::tenancy::canonical_issuer(issuer).to_owned();
+        let sub = subject.trim().to_owned();
         conn.run(move |conn| {
             tenant_erased_subjects::table
                 .filter(tenant_erased_subjects::issuer.eq(iss))

@@ -468,6 +468,16 @@ impl<'r> FromRequest<'r> for DbConn {
     }
 }
 
+/// In-memory SQLite connection with every migration applied and foreign keys enforced.
+#[cfg(all(test, sqlite))]
+pub fn test_sqlite_conn() -> DbConnInner {
+    use diesel_migrations::MigrationHarness;
+    let mut conn = diesel::sqlite::SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+    conn.run_pending_migrations(sqlite_migrations::MIGRATIONS).expect("run sqlite migrations");
+    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut conn).expect("enable foreign keys");
+    DbConnInner::Sqlite(conn)
+}
+
 // Embed the migrations from the migrations folder into the application
 // This way, the program automatically migrates the database to the latest version
 // https://docs.rs/diesel_migrations/*/diesel_migrations/macro.embed_migrations.html
