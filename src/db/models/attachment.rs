@@ -30,6 +30,7 @@ pub struct Attachment {
     pub file_name: String, // encrypted
     pub file_size: i64,
     pub akey: Option<String>,
+    pub tenant_id: Option<String>,
 }
 
 /// Local methods
@@ -47,11 +48,21 @@ impl Attachment {
             file_name,
             file_size,
             akey,
+            tenant_id: None,
         }
     }
 
+    pub fn with_tenant_id(mut self, tenant_id: Option<String>) -> Self {
+        self.tenant_id = tenant_id;
+        self
+    }
+
     pub fn get_file_path(&self) -> String {
-        format!("{}/{}", self.cipher_uuid, self.id)
+        if let Some(ref tid) = self.tenant_id {
+            format!("tenants/{tid}/attachments/{}/{}", self.cipher_uuid, self.id)
+        } else {
+            format!("{}/{}", self.cipher_uuid, self.id)
+        }
     }
 
     pub async fn get_url(&self, host: &str) -> Result<String, crate::Error> {

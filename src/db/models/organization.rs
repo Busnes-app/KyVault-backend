@@ -35,6 +35,7 @@ pub struct Organization {
     pub billing_email: String,
     pub private_key: Option<String>,
     pub public_key: Option<String>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -190,6 +191,7 @@ impl Organization {
             billing_email,
             private_key,
             public_key,
+            tenant_id: None,
         }
     }
     // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/Organizations/OrganizationResponseModel.cs

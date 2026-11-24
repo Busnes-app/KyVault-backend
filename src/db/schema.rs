@@ -5,6 +5,7 @@ table! {
         file_name -> Text,
         file_size -> BigInt,
         akey -> Nullable<Text>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -24,6 +25,7 @@ table! {
         password_history -> Nullable<Text>,
         deleted_at -> Nullable<Timestamp>,
         reprompt -> Nullable<Integer>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -127,6 +129,7 @@ table! {
         billing_email -> Text,
         private_key -> Nullable<Text>,
         public_key -> Nullable<Text>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -151,6 +154,7 @@ table! {
         deletion_date -> Timestamp,
         disabled -> Bool,
         hide_email -> Nullable<Bool>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -219,6 +223,7 @@ table! {
         avatar_color -> Nullable<Text>,
         external_id -> Nullable<Text>,
         key_id -> Nullable<Text>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -276,6 +281,61 @@ table! {
     sso_users (user_uuid) {
         user_uuid -> Text,
         identifier -> Text,
+        tenant_id -> Nullable<Text>,
+    }
+}
+
+table! {
+    tenants (id) {
+        id -> Text,
+        status -> Text,
+        home_region -> Text,
+        app_enabled -> Bool,
+        revision -> BigInt,
+        quotas_json -> Text,
+        storage_pool_bytes -> BigInt,
+        storage_over_since -> Nullable<BigInt>,
+        primary_org_uuid -> Nullable<Text>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+        deleted_at -> Nullable<Timestamp>,
+        erased_at -> Nullable<Timestamp>,
+    }
+}
+
+table! {
+    tenant_sync_cursors (name) {
+        name -> Text,
+        revision -> BigInt,
+        after_id -> Text,
+        updated_at -> Timestamp,
+    }
+}
+
+table! {
+    tenant_processed_events (event_id) {
+        event_id -> Text,
+        event_type -> Text,
+        expires_at -> BigInt,
+        processed_at -> Timestamp,
+    }
+}
+
+table! {
+    tenant_recovery_bundles (uuid) {
+        uuid -> Text,
+        tenant_id -> Text,
+        user_uuid -> Text,
+        bundle_type -> Text,
+        version -> Integer,
+        kdf_params_json -> Text,
+        wrapped_user_key -> Text,
+        wrapped_private_key -> Nullable<Text>,
+        recovery_key_hint -> Nullable<Text>,
+        escrow_org_uuid -> Nullable<Text>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+        revoked_at -> Nullable<Timestamp>,
     }
 }
 
@@ -384,6 +444,7 @@ joinable!(collections_groups -> groups (groups_uuid));
 joinable!(event -> users_organizations (uuid));
 joinable!(auth_requests -> users (user_uuid));
 joinable!(sso_users -> users (user_uuid));
+joinable!(tenant_recovery_bundles -> users (user_uuid));
 
 allow_tables_to_appear_in_same_query!(
     archives,
@@ -399,6 +460,10 @@ allow_tables_to_appear_in_same_query!(
     organizations,
     sends,
     sso_users,
+    tenants,
+    tenant_sync_cursors,
+    tenant_processed_events,
+    tenant_recovery_bundles,
     twofactor,
     users,
     users_collections,

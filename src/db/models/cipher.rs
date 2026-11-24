@@ -61,6 +61,7 @@ pub struct Cipher {
     pub password_history: Option<String>,
     pub deleted_at: Option<NaiveDateTime>,
     pub reprompt: Option<i32>,
+    pub tenant_id: Option<String>,
 }
 
 pub enum RepromptType {
@@ -93,6 +94,7 @@ impl Cipher {
             password_history: None,
             deleted_at: None,
             reprompt: None,
+            tenant_id: None,
         }
     }
 

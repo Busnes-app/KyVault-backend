@@ -49,6 +49,7 @@ pub struct Send {
 
     pub disabled: bool,
     pub hide_email: Option<bool>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, num_derive::FromPrimitive)]
@@ -96,7 +97,20 @@ impl Send {
 
             disabled: false,
             hide_email: None,
+            tenant_id: None,
         }
+    }
+
+    pub fn get_dir_path(&self) -> String {
+        if let Some(ref tid) = self.tenant_id {
+            format!("tenants/{tid}/sends/{}", self.uuid)
+        } else {
+            self.uuid.to_string()
+        }
+    }
+
+    pub fn get_file_path(&self, file_id: &str) -> String {
+        format!("{}/{file_id}", self.get_dir_path())
     }
 
     pub fn set_password(&mut self, password: Option<&str>) {
@@ -279,7 +293,8 @@ impl Send {
 
         if self.atype == SendType::File as i32 {
             let operator = CONFIG.opendal_operator_for_path_type(&PathType::Sends)?;
-            operator.delete_with(&self.uuid).recursive(true).await.ok();
+            let dir_path = self.get_dir_path();
+            operator.delete_with(&dir_path).recursive(true).await.ok();
         }
 
         conn.run(move |conn| {

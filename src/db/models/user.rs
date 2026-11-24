@@ -72,6 +72,7 @@ pub struct User {
     pub external_id: Option<String>, // Todo: Needs to be removed in the future, this is not used anymore.
 
     pub key_id: Option<KeyId>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Identifiable, Queryable, Insertable)]
@@ -87,6 +88,7 @@ pub struct Invitation {
 pub struct SsoUser {
     pub user_uuid: UserId,
     pub identifier: OIDCIdentifier,
+    pub tenant_id: Option<String>,
 }
 
 pub enum UserKdfType {
@@ -159,6 +161,7 @@ impl User {
             external_id: None, // Todo: Needs to be removed in the future, this is not used anymore.
 
             key_id: None,
+            tenant_id: None,
         }
     }
 

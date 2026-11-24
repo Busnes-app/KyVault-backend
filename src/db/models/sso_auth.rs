@@ -35,6 +35,10 @@ pub struct OIDCAuthenticatedUser {
     pub email: String,
     pub email_verified: Option<bool>,
     pub user_name: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
+    pub export_only: bool,
 }
 
 impl_FromToSqlText!(OIDCAuthenticatedUser);

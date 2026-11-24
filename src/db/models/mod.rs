@@ -13,6 +13,7 @@ mod org_policy;
 mod organization;
 mod send;
 mod sso_auth;
+mod tenant;
 mod two_factor;
 mod two_factor_duo_context;
 mod two_factor_incomplete;
@@ -38,6 +39,11 @@ pub use self::organization::{
 };
 pub use self::send::{Send, SendFileId, SendId, SendType};
 pub use self::sso_auth::{OIDCAuthenticatedUser, OIDCCodeResponseError, SsoAuth};
+#[allow(unused_imports)]
+pub use self::tenant::{
+    RECOVERY_BUNDLE_KIT, RECOVERY_BUNDLE_ORG_ESCROW, TENANT_STATUS_ACTIVE, TENANT_STATUS_DELETED,
+    TENANT_STATUS_ERASING, TENANT_STATUS_SUSPENDED, Tenant, TenantProcessedEvent, TenantRecoveryBundle,
+};
 pub use self::two_factor::{TwoFactor, TwoFactorType};
 pub use self::two_factor_duo_context::TwoFactorDuoContext;
 pub use self::two_factor_incomplete::TwoFactorIncomplete;
