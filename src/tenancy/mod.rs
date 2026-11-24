@@ -8,7 +8,7 @@ use crate::{
     api::EmptyResult,
     db::{
         DbConn,
-        models::{Tenant, User},
+        models::{Attachment, Tenant, User},
     },
 };
 
@@ -101,6 +101,15 @@ pub async fn reserve_storage_grant(
     )
     .await?;
     Ok(Some(epoch))
+}
+
+/// Saves an attachment row; in multi-tenant mode it also releases `reserved` upload bytes in
+/// the same transaction. On error nothing is released.
+pub async fn save_attachment_releasing(user: &User, att: &Attachment, reserved: i64, conn: &DbConn) -> EmptyResult {
+    if !CONFIG.is_multi_tenant() {
+        return att.save(conn).await;
+    }
+    Tenant::save_attachment_releasing(require_user_tenant(user)?, att, reserved, conn).await
 }
 
 /// Releases previously reserved upload bytes in multi-tenant mode.

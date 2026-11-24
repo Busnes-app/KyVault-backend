@@ -16,7 +16,7 @@ use crate::{
     util::get_uuid,
 };
 
-use super::{OrganizationId, UserId};
+use super::{Attachment, OrganizationId, UserId};
 
 pub const TENANT_STATUS_ACTIVE: &str = "active";
 
@@ -275,6 +275,41 @@ impl Tenant {
                 }
                 Ok(tenant.access_epoch)
             })
+        })
+        .await
+    }
+
+    /// Saves an attachment row and releases `release` reserved bytes in one transaction under
+    /// the tenant lock, so a concurrent admission never counts those bytes twice.
+    #[cfg_attr(not(postgresql), expect(unused_variables, reason = "hosted storage is PostgreSQL-only"))]
+    pub async fn save_attachment_releasing(
+        tenant_id: &str,
+        att: &Attachment,
+        release: i64,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let tid = tenant_id.to_owned();
+        let release = release.max(0);
+        conn.run(move |conn| match conn {
+            #[cfg(postgresql)]
+            DbConnInner::Postgresql(pg) => pg
+                .transaction::<_, diesel::result::Error, _>(|pg| {
+                    let reserved: i64 =
+                        tenants::table.find(&tid).select(tenants::storage_reserved_bytes).for_update().first(pg)?;
+                    diesel::insert_into(attachments::table)
+                        .values(att)
+                        .on_conflict(attachments::id)
+                        .do_update()
+                        .set(att)
+                        .execute(pg)?;
+                    diesel::update(tenants::table.find(&tid))
+                        .set(tenants::storage_reserved_bytes.eq(reserved.saturating_sub(release).max(0)))
+                        .execute(pg)?;
+                    Ok(())
+                })
+                .map_res("Error saving attachment"),
+            #[allow(unreachable_patterns, reason = "only reachable when another backend is compiled in")]
+            _ => err_code!("Hosted multi-tenant storage requires PostgreSQL", 503),
         })
         .await
     }

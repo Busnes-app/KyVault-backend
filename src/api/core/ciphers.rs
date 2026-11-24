@@ -1341,9 +1341,10 @@ async fn post_attachment_v2(
     let attachment =
         Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key))
             .with_tenant_id(headers.user.tenant_id.clone());
-    let save_res = attachment.save(&conn).await;
-    crate::tenancy::release_storage_reservation(&headers.user, file_size, &conn).await;
-    save_res.expect("Error saving attachment");
+    if let Err(e) = crate::tenancy::save_attachment_releasing(&headers.user, &attachment, file_size, &conn).await {
+        crate::tenancy::release_storage_reservation(&headers.user, file_size, &conn).await;
+        return Err(e);
+    }
     if let Err(e) = crate::tenancy::verify_access_epoch(&headers.user, upload_epoch, &conn).await {
         attachment.delete(&conn).await.ok();
         return Err(e);
@@ -1419,6 +1420,8 @@ async fn save_attachment(
 
     let delta_bytes = size.saturating_sub(size_adjust).max(0);
     let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, delta_bytes, &conn).await?;
+    // Reserved bytes not yet released into a saved attachment row.
+    let mut held = delta_bytes;
 
     let file_id = match &attachment {
         Some(attachment) => attachment.id.clone(), // v2 API
@@ -1433,11 +1436,11 @@ async fn save_attachment(
         // size, but it's not clear when or why this is needed.
         const LEEWAY: i64 = 1024 * 1024; // 1 MiB
         let Some(max_size) = attachment.file_size.checked_add(LEEWAY) else {
-            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             err!("Invalid attachment size max")
         };
         let Some(min_size) = attachment.file_size.checked_sub(LEEWAY) else {
-            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             err!("Invalid attachment size min")
         };
 
@@ -1445,10 +1448,15 @@ async fn save_attachment(
             if size != attachment.file_size {
                 // Update the attachment with the actual file size.
                 attachment.file_size = size;
-                attachment.save(&conn).await.expect("Error updating attachment");
+                if let Err(e) = crate::tenancy::save_attachment_releasing(&headers.user, attachment, held, &conn).await
+                {
+                    crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
+                    return Err(e);
+                }
+                held = 0;
             }
         } else {
-            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             attachment.delete(&conn).await.ok();
 
             err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
@@ -1463,11 +1471,11 @@ async fn save_attachment(
         let encrypted_filename = data.data.raw_name().map(|s| s.dangerous_unsafe_unsanitized_raw().to_string());
 
         if encrypted_filename.is_none() {
-            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             err!("No filename provided")
         }
         if data.key.is_none() {
-            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             err!("No attachment key provided")
         }
         let att = Attachment::new(file_id.clone(), cipher_id.clone(), encrypted_filename.unwrap(), size, data.key)
@@ -1478,7 +1486,7 @@ async fn save_attachment(
 
     let write_res = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await;
     if let Err(e) = write_res {
-        crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+        crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
         return Err(e);
     }
 
@@ -1491,14 +1499,19 @@ async fn save_attachment(
         if let Some(ref att) = attachment {
             att.delete(&conn).await.ok();
         }
-        crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+        crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
         return Err(e);
     }
 
-    if let Some(ref att) = created_attachment {
-        att.save(&conn).await.expect("Error saving attachment");
+    match created_attachment {
+        Some(ref att) => {
+            if let Err(e) = crate::tenancy::save_attachment_releasing(&headers.user, att, held, &conn).await {
+                crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
+                return Err(e);
+            }
+        }
+        None => crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await,
     }
-    crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
 
     // With the v2 API, post_attachment_v2() already did this when it created the attachment record
     if attachment.is_none() {
