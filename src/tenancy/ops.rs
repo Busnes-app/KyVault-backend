@@ -23,7 +23,10 @@ use crate::{
         },
     },
     error::Error,
-    tenancy::{canonical_issuer, format_oidc_identifier},
+    tenancy::{
+        attachment_object_key, canonical_issuer, format_oidc_identifier, is_cell_served, is_valid_cell_slug,
+        send_object_key, tenant_prefix_object_key,
+    },
     util::get_uuid,
 };
 
@@ -77,6 +80,28 @@ fn bad_request(msg: &str) -> Error {
     Error::new_msg(msg).with_code(400)
 }
 
+fn cell_not_served_err() -> Error {
+    Error::new_msg("Tenant belongs to a cell not served by this deployment").with_code(403)
+}
+
+fn ensure_served_cells_configured(served_cells: &[String]) -> OpResult<()> {
+    if served_cells.is_empty() {
+        return Err(cell_not_served_err());
+    }
+    Ok(())
+}
+
+fn ensure_tenant_cell_served(conn: &mut DbConnInner, tid: &str, served_cells: &[String]) -> OpResult<Tenant> {
+    ensure_served_cells_configured(served_cells)?;
+    let Some(t) = lock_tenant(conn, tid)? else {
+        return Err(cell_not_served_err());
+    };
+    if !is_cell_served(served_cells, &t.home_region) {
+        return Err(cell_not_served_err());
+    }
+    Ok(t)
+}
+
 fn check_id(field: &str, value: &str, max: usize) -> OpResult<()> {
     if value.trim().is_empty() || value.len() > max {
         return Err(bad_request(&format!("Invalid {field}")));
@@ -84,19 +109,19 @@ fn check_id(field: &str, value: &str, max: usize) -> OpResult<()> {
     Ok(())
 }
 
-/// Object key relative to the attachments root, identical to `Attachment::get_file_path`.
-fn attachment_key(tenant_id: Option<&str>, cipher_uuid: &str, att_id: &str) -> String {
-    match tenant_id {
-        Some(tid) => format!("tenants/{tid}/attachments/{cipher_uuid}/{att_id}"),
-        None => format!("{cipher_uuid}/{att_id}"),
+/// Cell-scoped object key relative to the attachments root, identical to `Attachment::get_file_path_in_cell`.
+fn attachment_key(cell: Option<&str>, tenant_id: Option<&str>, cipher_uuid: &str, att_id: &str) -> String {
+    match (cell, tenant_id) {
+        (Some(c), Some(tid)) => attachment_object_key(c, tid, cipher_uuid, att_id),
+        _ => format!("{cipher_uuid}/{att_id}"),
     }
 }
 
-/// Object key relative to the sends root, identical to `Send::get_file_path`.
-fn send_key(tenant_id: Option<&str>, send_uuid: &str, file_id: &str) -> String {
-    match tenant_id {
-        Some(tid) => format!("tenants/{tid}/sends/{send_uuid}/{file_id}"),
-        None => format!("{send_uuid}/{file_id}"),
+/// Cell-scoped object key relative to the sends root, identical to `Send::get_file_path_in_cell`.
+fn send_key(cell: Option<&str>, tenant_id: Option<&str>, send_uuid: &str, file_id: &str) -> String {
+    match (cell, tenant_id) {
+        (Some(c), Some(tid)) => send_object_key(c, tid, send_uuid, file_id),
+        _ => format!("{send_uuid}/{file_id}"),
     }
 }
 
@@ -254,6 +279,7 @@ pub struct ReconcileResponse {
     pub applied: usize,
     pub fenced_tenant_ids: Vec<String>,
     pub purge_required_tenant_ids: Vec<String>,
+    pub region_mismatch_tenant_ids: Vec<String>,
 }
 
 fn quotas_json(org: &OrgSnapshot) -> OpResult<String> {
@@ -271,9 +297,10 @@ fn quotas_json(org: &OrgSnapshot) -> OpResult<String> {
 pub fn reconcile_orgs(
     conn: &mut DbConnInner,
     req: &ReconcileRequest,
-    home_region: &str,
+    served_cells: &[String],
     now: i64,
 ) -> OpResult<(ReconcileResponse, Kicks)> {
+    ensure_served_cells_configured(served_cells)?;
     if req.orgs.len() > MAX_BATCH {
         return Err(bad_request("Too many orgs"));
     }
@@ -283,7 +310,7 @@ pub fn reconcile_orgs(
         if !ORG_STATUSES.contains(&org.status.as_str()) {
             return Err(bad_request("Invalid org status"));
         }
-        if org.home_region.len() > MAX_ID_LEN {
+        if !is_valid_cell_slug(&org.home_region) {
             return Err(bad_request("Invalid home_region"));
         }
         quotas.push(quotas_json(org)?);
@@ -299,10 +326,36 @@ pub fn reconcile_orgs(
         for i in order {
             let org = &req.orgs[i];
             let existing = lock_tenant(conn, &org.id)?;
-            let wrong_region = !home_region.is_empty() && !org.home_region.is_empty() && org.home_region != home_region;
-            if existing.is_none() && wrong_region {
+
+            // C4: orgs never move between cells or regions. If an existing tenant's stored
+            // home_region differs from the incoming snapshot, never mutate home_region or org
+            // metadata — fail closed by clearing authority freshness, fencing active sessions
+            // and storage grants, and reporting the mismatch to the caller.
+            if let Some(mut t) = existing.clone()
+                && t.home_region != org.home_region
+            {
+                error!(
+                    "C4 violation: org {} home_region changed from '{}' to '{}'; refusing move and fencing tenant",
+                    t.id, t.home_region, org.home_region
+                );
+                t.authority_refreshed_at = None;
+                t.access_epoch = t.access_epoch.saturating_add(1);
+                t.storage_ceiling_bytes = 0;
+                t.storage_grant_expires_at = None;
+                t.updated_at = now_dt;
+                fence_tenant_users(conn, &t.id, now_dt)?;
+                diesel::update(tenants::table.find(&t.id)).set(&t).execute(conn)?;
+                resp.fenced_tenant_ids.push(t.id.clone());
+                resp.region_mismatch_tenant_ids.push(t.id.clone());
+                kicks.tenants.push(t.id);
                 continue;
             }
+
+            // C5: refuse every org whose home_region is not one of this deployment's served cells.
+            if !is_cell_served(served_cells, &org.home_region) {
+                return Err(cell_not_served_err());
+            }
+
             if let Some(t) = &existing {
                 if is_tombstoned(&t.status) {
                     if t.status != STATUS_DELETED || t.erased_at.is_none() {
@@ -311,23 +364,16 @@ pub fn reconcile_orgs(
                     continue;
                 }
                 if org.revision > 0 && t.revision > 0 && org.revision < t.revision {
-                    if !wrong_region {
-                        diesel::update(tenants::table.find(&t.id))
-                            .set(tenants::authority_refreshed_at.eq(Some(now)))
-                            .execute(conn)?;
-                    }
+                    diesel::update(tenants::table.find(&t.id))
+                        .set(tenants::authority_refreshed_at.eq(Some(now)))
+                        .execute(conn)?;
                     continue;
                 }
             }
             let created = existing.is_none();
             let mut t = existing.unwrap_or_else(|| Tenant::new(org.id.clone(), org.home_region.clone()));
-            let was_locally_active = !created
-                && t.is_active()
-                && (home_region.is_empty() || t.home_region.is_empty() || t.home_region == home_region);
+            let was_locally_active = !created && t.is_active() && is_cell_served(served_cells, &t.home_region);
 
-            if !org.home_region.is_empty() {
-                t.home_region.clone_from(&org.home_region);
-            }
             if org.status == STATUS_DELETED {
                 STATUS_PURGE_PENDING.clone_into(&mut t.status);
                 resp.purge_required_tenant_ids.push(t.id.clone());
@@ -337,14 +383,10 @@ pub fn reconcile_orgs(
             t.app_enabled = org.enabled;
             t.revision = t.revision.max(org.revision);
             t.quotas_json.clone_from(&quotas[i]);
-            t.authority_refreshed_at = if wrong_region {
-                None
-            } else {
-                Some(now)
-            };
+            t.authority_refreshed_at = Some(now);
             t.updated_at = now_dt;
 
-            let non_active = wrong_region || !org.enabled || org.status != TENANT_STATUS_ACTIVE;
+            let non_active = !org.enabled || org.status != TENANT_STATUS_ACTIVE;
             if non_active && (was_locally_active || created) {
                 t.access_epoch = t.access_epoch.saturating_add(1);
                 t.storage_ceiling_bytes = 0;
@@ -364,15 +406,12 @@ pub fn reconcile_orgs(
         }
 
         if req.touch_all_active {
-            let live = tenants::table.filter(tenants::status.ne_all(TOMBSTONED));
-            let set = tenants::authority_refreshed_at.eq(Some(now));
-            if home_region.is_empty() {
-                diesel::update(live).set(set).execute(conn)?;
-            } else {
-                diesel::update(live.filter(tenants::home_region.eq(home_region).or(tenants::home_region.eq(""))))
-                    .set(set)
-                    .execute(conn)?;
-            }
+            let live = tenants::table
+                .filter(tenants::status.ne_all(TOMBSTONED))
+                .filter(tenants::home_region.eq_any(served_cells))
+                .filter(tenants::authority_refreshed_at.is_not_null())
+                .filter(tenants::id.ne_all(&resp.region_mismatch_tenant_ids));
+            diesel::update(live).set(tenants::authority_refreshed_at.eq(Some(now))).execute(conn)?;
         }
         Ok((resp, kicks))
     })
@@ -400,12 +439,27 @@ fn check_subject(issuer: &str, subject: &str) -> OpResult<()> {
     check_id("subject", subject, MAX_ID_LEN)
 }
 
-pub fn logout_user(conn: &mut DbConnInner, req: &LogoutRequest, now: i64) -> OpResult<(LogoutResponse, Kicks)> {
+pub fn logout_user(
+    conn: &mut DbConnInner,
+    req: &LogoutRequest,
+    served_cells: &[String],
+    now: i64,
+) -> OpResult<(LogoutResponse, Kicks)> {
+    ensure_served_cells_configured(served_cells)?;
     check_subject(&req.issuer, &req.subject)?;
+    let req_tid = req.tenant_id.as_deref().filter(|t| !t.is_empty());
+    if let Some(tid) = req_tid {
+        check_id("tenant_id", tid, MAX_ID_LEN)?;
+    }
     conn.transaction(|conn| {
+        if let Some(tid) = req_tid {
+            ensure_tenant_cell_served(conn, tid, served_cells)?;
+        }
         let mut kicks = Kicks::default();
-        let found = find_sso_user(conn, &req.issuer, &req.subject, req.tenant_id.as_deref())?;
-        if let Some((uid, _)) = &found {
+        let found = find_sso_user(conn, &req.issuer, &req.subject, req_tid)?;
+        if let Some((uid, utid)) = &found {
+            let tid = utid.as_deref().ok_or_else(cell_not_served_err)?;
+            ensure_tenant_cell_served(conn, tid, served_cells)?;
             fence_user(conn, uid, naive(now))?;
             kicks.users.push(UserId::from(uid.clone()));
         }
@@ -437,16 +491,29 @@ pub struct UserStatusResponse {
     pub user_uuid: Option<String>,
 }
 
-pub fn sync_user(conn: &mut DbConnInner, req: &SyncRequest, now: i64) -> OpResult<(UserStatusResponse, Kicks)> {
+pub fn sync_user(
+    conn: &mut DbConnInner,
+    req: &SyncRequest,
+    served_cells: &[String],
+    now: i64,
+) -> OpResult<(UserStatusResponse, Kicks)> {
+    ensure_served_cells_configured(served_cells)?;
     if !["user.created", "user.updated", "user.deleted"].contains(&req.event_type.as_str()) {
         return Err(bad_request("Invalid event_type"));
     }
     check_subject(&req.issuer, &req.subject)?;
+    let req_tid = req.tenant_id.as_deref().filter(|t| !t.is_empty());
+    if let Some(tid) = req_tid {
+        check_id("tenant_id", tid, MAX_ID_LEN)?;
+    }
     if req.display_name.as_ref().is_some_and(|n| n.chars().count() > MAX_NAME_LEN) {
         return Err(bad_request("display_name too long"));
     }
     let now_dt = naive(now);
     conn.transaction(|conn| {
+        if let Some(tid) = req_tid {
+            ensure_tenant_cell_served(conn, tid, served_cells)?;
+        }
         let mut kicks = Kicks::default();
         let erased = tenant_erased_subjects::table
             .find((canonical_issuer(&req.issuer), req.subject.trim()))
@@ -462,7 +529,7 @@ pub fn sync_user(conn: &mut DbConnInner, req: &SyncRequest, now: i64) -> OpResul
                 kicks,
             ));
         }
-        let Some((uid, user_tenant)) = find_sso_user(conn, &req.issuer, &req.subject, req.tenant_id.as_deref())? else {
+        let Some((uid, user_tenant)) = find_sso_user(conn, &req.issuer, &req.subject, req_tid)? else {
             return Ok((
                 UserStatusResponse {
                     status: "not_found",
@@ -471,6 +538,8 @@ pub fn sync_user(conn: &mut DbConnInner, req: &SyncRequest, now: i64) -> OpResul
                 kicks,
             ));
         };
+        let user_tenant_id = user_tenant.as_deref().ok_or_else(cell_not_served_err)?;
+        let tenant = ensure_tenant_cell_served(conn, user_tenant_id, served_cells)?;
 
         if req.event_type == "user.deleted" || !req.active {
             diesel::update(users::table.find(&uid)).set(users::enabled.eq(false)).execute(conn)?;
@@ -482,11 +551,7 @@ pub fn sync_user(conn: &mut DbConnInner, req: &SyncRequest, now: i64) -> OpResul
                     .set((users::name.eq(name), users::updated_at.eq(now_dt)))
                     .execute(conn)?;
             }
-            let tenant_active = match user_tenant.as_deref() {
-                Some(tid) => lock_tenant(conn, tid)?.is_some_and(|t| t.is_active()),
-                None => false,
-            };
-            if tenant_active {
+            if tenant.is_active() && tenant.authority_refreshed_at.is_some() {
                 diesel::update(users::table.find(&uid)).set(users::enabled.eq(true)).execute(conn)?;
             }
         }
@@ -518,23 +583,38 @@ pub struct EraseResponse {
     pub pending_deletions_queued: usize,
 }
 
-pub fn erase_user(conn: &mut DbConnInner, req: &EraseRequest, now: i64) -> OpResult<(EraseResponse, Kicks)> {
+pub fn erase_user(
+    conn: &mut DbConnInner,
+    req: &EraseRequest,
+    served_cells: &[String],
+    now: i64,
+) -> OpResult<(EraseResponse, Kicks)> {
+    ensure_served_cells_configured(served_cells)?;
     check_subject(&req.issuer, &req.subject)?;
-    if let Some(tid) = req.tenant_id.as_deref().filter(|t| !t.is_empty()) {
+    let req_tid = req.tenant_id.as_deref().filter(|t| !t.is_empty());
+    if let Some(tid) = req_tid {
         check_id("tenant_id", tid, MAX_ID_LEN)?;
     }
     let now_dt = naive(now);
     conn.transaction(|conn| {
         let mut kicks = Kicks::default();
-        let req_tid = req.tenant_id.as_deref().filter(|t| !t.is_empty());
+        let req_tenant = match req_tid {
+            Some(tid) => Some(ensure_tenant_cell_served(conn, tid, served_cells)?),
+            None => None,
+        };
         let found = find_sso_user(conn, &req.issuer, &req.subject, req_tid)?;
         let user_tid = found.as_ref().and_then(|(_, t)| t.clone());
-        let stone_tid = req_tid.map(str::to_owned).or_else(|| user_tid.clone()).unwrap_or_default();
+        let tenant = match (&found, &req_tenant) {
+            (Some((_, Some(utid))), _) => ensure_tenant_cell_served(conn, utid, served_cells)?,
+            (None, Some(t)) => t.clone(),
+            (Some((_, None)), _) | (None, None) => return Err(cell_not_served_err()),
+        };
+        let stone_tid = tenant.id.clone();
         record_tombstone(conn, &tombstone(&req.issuer, &req.subject, &stone_tid, req.revision, now_dt))?;
 
         let mut queued = 0;
         if let Some((uid, _)) = &found {
-            queued = erase_personal_data(conn, uid, user_tid.as_deref(), &stone_tid, now_dt)?;
+            queued = erase_personal_data(conn, uid, &tenant.home_region, user_tid.as_deref(), &stone_tid, now_dt)?;
             kicks.users.push(UserId::from(uid.clone()));
         }
         Ok((
@@ -554,6 +634,7 @@ pub fn erase_user(conn: &mut DbConnInner, req: &EraseRequest, now: i64) -> OpRes
 fn erase_personal_data(
     conn: &mut DbConnInner,
     uid: &str,
+    cell: &str,
     user_tid: Option<&str>,
     pending_tid: &str,
     now: NaiveDateTime,
@@ -581,12 +662,12 @@ fn erase_personal_data(
 
     let mut rows = Vec::new();
     for (id, cipher, tid) in atts {
-        let key = attachment_key(tid.as_deref().or(user_tid), &cipher, &id);
+        let key = attachment_key(Some(cell), tid.as_deref().or(user_tid), &cipher, &id);
         rows.push(pending(pending_tid, Some(uid), KIND_ATTACHMENT, key, now));
     }
     for (send, data, tid) in file_sends {
         if let Some(file_id) = send_file_id(&data) {
-            let key = send_key(tid.as_deref().or(user_tid), &send, &file_id);
+            let key = send_key(Some(cell), tid.as_deref().or(user_tid), &send, &file_id);
             rows.push(pending(pending_tid, Some(uid), KIND_SEND, key, now));
         }
     }
@@ -647,49 +728,19 @@ pub struct PurgeResponse {
     pub pending_deletions: i64,
 }
 
-fn has_tenant_rows(conn: &mut DbConnInner, tid: &str) -> QueryResult<bool> {
-    let n = users::table.filter(users::tenant_id.eq(tid)).count().get_result::<i64>(conn)?
-        + organizations::table.filter(organizations::tenant_id.eq(tid)).count().get_result::<i64>(conn)?
-        + ciphers::table.filter(ciphers::tenant_id.eq(tid)).count().get_result::<i64>(conn)?
-        + attachments::table.filter(attachments::tenant_id.eq(tid)).count().get_result::<i64>(conn)?
-        + sends::table.filter(sends::tenant_id.eq(tid)).count().get_result::<i64>(conn)?;
-    Ok(n > 0)
-}
-
 pub fn purge_begin(
     conn: &mut DbConnInner,
     tenant_id: &str,
     sso_authority: &str,
+    served_cells: &[String],
     now: i64,
 ) -> OpResult<(PurgeResponse, Kicks)> {
+    ensure_served_cells_configured(served_cells)?;
     check_id("tenant_id", tenant_id, MAX_ID_LEN)?;
     let now_dt = naive(now);
     conn.transaction(|conn| {
         let mut kicks = Kicks::default();
-        let existing = lock_tenant(conn, tenant_id)?;
-        let mut t = if let Some(t) = existing {
-            t
-        } else {
-            let mut t = Tenant::new(tenant_id.to_owned(), String::new());
-            t.created_at = now_dt;
-            t.updated_at = now_dt;
-            if !has_tenant_rows(conn, tenant_id)? {
-                STATUS_DELETED.clone_into(&mut t.status);
-                t.deleted_at = Some(now_dt);
-                t.erased_at = Some(now_dt);
-                diesel::insert_into(tenants::table).values(&t).execute(conn)?;
-                return Ok((
-                    PurgeResponse {
-                        status: STATUS_DELETED,
-                        pending_deletions: 0,
-                    },
-                    kicks,
-                ));
-            }
-            // Orphaned rows without a tenant record still get purged.
-            diesel::insert_into(tenants::table).values(&t).execute(conn)?;
-            t
-        };
+        let mut t = ensure_tenant_cell_served(conn, tenant_id, served_cells)?;
         if t.status == STATUS_DELETED && t.erased_at.is_some() && pending_count(conn, tenant_id)? == 0 {
             return Ok((
                 PurgeResponse {
@@ -700,6 +751,7 @@ pub fn purge_begin(
             ));
         }
 
+        let cell = t.home_region.clone();
         STATUS_PURGE_PENDING.clone_into(&mut t.status);
         t.app_enabled = false;
         t.access_epoch = t.access_epoch.saturating_add(1);
@@ -713,7 +765,7 @@ pub fn purge_begin(
         t.updated_at = now_dt;
         diesel::update(tenants::table.find(tenant_id)).set(&t).execute(conn)?;
 
-        purge_tenant_rows(conn, tenant_id, sso_authority, now_dt)?;
+        purge_tenant_rows(conn, tenant_id, &cell, sso_authority, now_dt)?;
         kicks.tenants.push(tenant_id.to_owned());
         Ok((
             PurgeResponse {
@@ -728,7 +780,13 @@ pub fn purge_begin(
 /// Queues every tenant object, records subject tombstones, then deletes all tenant-owned
 /// vault rows in foreign-key order. Rows are selected by `tenant_id` or by ownership through a
 /// tenant user/organization, so the FK chain is complete; nothing else is touched.
-fn purge_tenant_rows(conn: &mut DbConnInner, tid: &str, sso_authority: &str, now: NaiveDateTime) -> QueryResult<()> {
+fn purge_tenant_rows(
+    conn: &mut DbConnInner,
+    tid: &str,
+    cell: &str,
+    sso_authority: &str,
+    now: NaiveDateTime,
+) -> QueryResult<()> {
     let u = || users::table.filter(users::tenant_id.eq(tid)).select(users::uuid);
     let un = || users::table.filter(users::tenant_id.eq(tid)).select(users::uuid.nullable());
     let o = || organizations::table.filter(organizations::tenant_id.eq(tid)).select(organizations::uuid);
@@ -771,7 +829,7 @@ fn purge_tenant_rows(conn: &mut DbConnInner, tid: &str, sso_authority: &str, now
             tid,
             None,
             KIND_ATTACHMENT,
-            attachment_key(Some(att_tid.as_deref().unwrap_or(tid)), &cipher, &id),
+            attachment_key(Some(cell), Some(att_tid.as_deref().unwrap_or(tid)), &cipher, &id),
             now,
         ));
     }
@@ -781,7 +839,7 @@ fn purge_tenant_rows(conn: &mut DbConnInner, tid: &str, sso_authority: &str, now
                 tid,
                 None,
                 KIND_SEND,
-                send_key(Some(send_tid.as_deref().unwrap_or(tid)), &send, &file_id),
+                send_key(Some(cell), Some(send_tid.as_deref().unwrap_or(tid)), &send, &file_id),
                 now,
             ));
         }
@@ -793,7 +851,7 @@ fn purge_tenant_rows(conn: &mut DbConnInner, tid: &str, sso_authority: &str, now
         .get_result::<i64>(conn)?
         > 0;
     if !prefix_queued {
-        rows.push(pending(tid, None, KIND_TENANT_PREFIX, format!("tenants/{tid}/"), now));
+        rows.push(pending(tid, None, KIND_TENANT_PREFIX, tenant_prefix_object_key(cell, tid), now));
     }
     insert_pending(conn, &rows)?;
 
@@ -918,10 +976,18 @@ pub struct PendingResponse {
     pub items: Vec<PendingItem>,
 }
 
-pub fn cleanup_pending(conn: &mut DbConnInner, limit: Option<i64>, now: i64) -> OpResult<PendingResponse> {
+pub fn cleanup_pending(
+    conn: &mut DbConnInner,
+    limit: Option<i64>,
+    served_cells: &[String],
+    now: i64,
+) -> OpResult<PendingResponse> {
+    ensure_served_cells_configured(served_cells)?;
     let limit = limit.unwrap_or(100).clamp(1, MAX_BATCH_SQL);
     let staging_cutoff = naive(now.saturating_sub(UPLOAD_STAGING_GRACE_SECS));
+    let served_tenants = tenants::table.filter(tenants::home_region.eq_any(served_cells)).select(tenants::id);
     let items = tenant_pending_deletions::table
+        .filter(tenant_pending_deletions::tenant_id.eq_any(served_tenants))
         .filter(
             tenant_pending_deletions::last_error
                 .is_null()
@@ -966,7 +1032,13 @@ pub struct CompleteResponse {
     pub finalized_tenant_ids: Vec<String>,
 }
 
-pub fn cleanup_complete(conn: &mut DbConnInner, req: &CompleteRequest, now: i64) -> OpResult<CompleteResponse> {
+pub fn cleanup_complete(
+    conn: &mut DbConnInner,
+    req: &CompleteRequest,
+    served_cells: &[String],
+    now: i64,
+) -> OpResult<CompleteResponse> {
+    ensure_served_cells_configured(served_cells)?;
     if req.completed_ids.len() + req.failed.len() > MAX_BATCH {
         return Err(bad_request("Too many cleanup results"));
     }
@@ -975,6 +1047,18 @@ pub fn cleanup_complete(conn: &mut DbConnInner, req: &CompleteRequest, now: i64)
     }
     conn.transaction(|conn| {
         let mut resp = CompleteResponse::default();
+        let all_ids: Vec<&str> =
+            req.completed_ids.iter().map(String::as_str).chain(req.failed.iter().map(|f| f.id.as_str())).collect();
+        let mut all_tenants: Vec<String> = tenant_pending_deletions::table
+            .filter(tenant_pending_deletions::id.eq_any(&all_ids))
+            .select(tenant_pending_deletions::tenant_id)
+            .distinct()
+            .load(conn)?;
+        all_tenants.sort();
+        for tid in &all_tenants {
+            ensure_tenant_cell_served(conn, tid, served_cells)?;
+        }
+
         let mut affected: Vec<String> = tenant_pending_deletions::table
             .filter(tenant_pending_deletions::id.eq_any(&req.completed_ids))
             .select(tenant_pending_deletions::tenant_id)
@@ -1046,25 +1130,27 @@ pub struct PrepareResponse {
     pub reports: Vec<StorageReport>,
 }
 
-pub fn storage_prepare(conn: &mut DbConnInner, req: &PrepareRequest, home_region: &str) -> OpResult<PrepareResponse> {
+pub fn storage_prepare(
+    conn: &mut DbConnInner,
+    req: &PrepareRequest,
+    served_cells: &[String],
+) -> OpResult<PrepareResponse> {
+    ensure_served_cells_configured(served_cells)?;
     let limit = usize::try_from(req.limit).unwrap_or(1).clamp(1, MAX_BATCH);
     let want_default = req.want_bytes_default.max(0);
 
     // Soonest-expiring (or missing) grants first so a capped batch rotates through tenants.
-    let base = tenants::table
+    let ids: Vec<String> = tenants::table
         .filter(tenants::status.ne_all(TOMBSTONED))
         .filter(tenants::storage_seq_stale.eq(false))
+        .filter(tenants::home_region.eq_any(served_cells))
         .order((
             tenants::storage_grant_expires_at.is_not_null().asc(),
             tenants::storage_grant_expires_at.asc(),
             tenants::id.asc(),
         ))
-        .select(tenants::id);
-    let ids: Vec<String> = if home_region.is_empty() {
-        base.load(conn)?
-    } else {
-        base.filter(tenants::home_region.eq(home_region).or(tenants::home_region.eq(""))).load(conn)?
-    };
+        .select(tenants::id)
+        .load(conn)?;
 
     let mut reports = Vec::new();
     for id in ids {
@@ -1075,10 +1161,11 @@ pub fn storage_prepare(conn: &mut DbConnInner, req: &PrepareRequest, home_region
             let Some(t) = lock_tenant(conn, &id)? else {
                 return Ok(None);
             };
-            if is_tombstoned(&t.status) || t.storage_seq_stale {
+            if is_tombstoned(&t.status) || t.storage_seq_stale || !is_cell_served(served_cells, &t.home_region) {
                 return Ok(None);
             }
-            let want = if t.is_active() && t.storage_over_since.is_none() {
+            let live_and_authorized = t.is_active() && t.authority_refreshed_at.is_some();
+            let want = if live_and_authorized && t.storage_over_since.is_none() {
                 want_default
             } else {
                 0
@@ -1091,7 +1178,7 @@ pub fn storage_prepare(conn: &mut DbConnInner, req: &PrepareRequest, home_region
                     want_bytes: want,
                 }));
             }
-            let needs = t.is_active()
+            let needs = live_and_authorized
                 || t.storage_ceiling_bytes > 0
                 || t.storage_grant_expires_at.is_some()
                 || t.storage_last_applied_seq == 0;
@@ -1152,7 +1239,13 @@ pub struct ApplyResponse {
     pub stale_tenant_ids: Vec<String>,
 }
 
-pub fn storage_apply(conn: &mut DbConnInner, req: &ApplyRequest, now: i64) -> OpResult<ApplyResponse> {
+pub fn storage_apply(
+    conn: &mut DbConnInner,
+    req: &ApplyRequest,
+    served_cells: &[String],
+    now: i64,
+) -> OpResult<ApplyResponse> {
+    ensure_served_cells_configured(served_cells)?;
     if req.results.len() > MAX_BATCH {
         return Err(bad_request("Too many results"));
     }
@@ -1162,14 +1255,25 @@ pub fn storage_apply(conn: &mut DbConnInner, req: &ApplyRequest, now: i64) -> Op
             return Err(bad_request("Invalid result"));
         }
     }
+    // Atomic C5 pre-check: refuse the whole batch if any org is unknown or in an unserved cell.
+    let mut unique_ids: Vec<&str> = req.results.iter().map(|r| r.org_id.as_str()).collect();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+    if !unique_ids.is_empty() {
+        let rows: Vec<(String, String)> = tenants::table
+            .filter(tenants::id.eq_any(&unique_ids))
+            .select((tenants::id, tenants::home_region))
+            .load(conn)?;
+        if rows.len() != unique_ids.len() || rows.iter().any(|(_, hr)| !is_cell_served(served_cells, hr)) {
+            return Err(cell_not_served_err());
+        }
+    }
     // A skewed worker clock can never stretch a grant past now + TTL.
     let sent_at = req.sent_at.min(now);
     let mut resp = ApplyResponse::default();
     for r in &req.results {
         let applied = conn.transaction::<_, Error, _>(|conn| {
-            let Some(t) = lock_tenant(conn, &r.org_id)? else {
-                return Ok(false);
-            };
+            let t = ensure_tenant_cell_served(conn, &r.org_id, served_cells)?;
             if is_tombstoned(&t.status) {
                 return Ok(false);
             }
@@ -1184,8 +1288,8 @@ pub fn storage_apply(conn: &mut DbConnInner, req: &ApplyRequest, now: i64) -> Op
                         return Ok(false);
                     }
                     // A report sent before a fence can be answered after it: keep the
-                    // bookkeeping, never reinstall a grant on a non-active tenant.
-                    let (ceiling, expires) = if t.is_active() {
+                    // bookkeeping, never reinstall a grant on a non-active or C4-fenced tenant.
+                    let (ceiling, expires) = if t.is_active() && t.authority_refreshed_at.is_some() {
                         (
                             r.ceiling_bytes.max(0),
                             Some(sent_at.saturating_add(r.ttl_seconds.clamp(1, MAX_GRANT_TTL_SECS))),
@@ -1252,12 +1356,15 @@ pub struct RepairSeqResponse {
     pub storage_seq_stale: bool,
 }
 
-pub fn storage_repair_seq(conn: &mut DbConnInner, req: &RepairSeqRequest) -> OpResult<RepairSeqResponse> {
+pub fn storage_repair_seq(
+    conn: &mut DbConnInner,
+    req: &RepairSeqRequest,
+    served_cells: &[String],
+) -> OpResult<RepairSeqResponse> {
+    ensure_served_cells_configured(served_cells)?;
     check_id("org_id", &req.org_id, MAX_ID_LEN)?;
     conn.transaction(|conn| {
-        let Some(t) = lock_tenant(conn, &req.org_id)? else {
-            return Err(Error::new_msg("Tenant not found").with_code(404));
-        };
+        let t = ensure_tenant_cell_served(conn, &req.org_id, served_cells)?;
         if req.next_seq <= t.storage_report_seq {
             return Err(bad_request("next_seq must exceed the current storage_report_seq"));
         }
@@ -1290,6 +1397,10 @@ mod tests {
     const ISS: &str = "https://id.busnes.app";
     const REGION: &str = "us-east-1";
 
+    fn cells() -> Vec<String> {
+        vec![REGION.to_owned()]
+    }
+
     fn exec(c: &mut DbConnInner, sql: &str) {
         diesel::sql_query(sql).execute(c).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -1298,11 +1409,15 @@ mod tests {
         lock_tenant(c, id).unwrap().unwrap_or_else(|| panic!("tenant {id} missing"))
     }
 
-    fn active_tenant(c: &mut DbConnInner, id: &str) {
-        let mut t = Tenant::new(id.to_owned(), REGION.to_owned());
+    fn active_tenant_in(c: &mut DbConnInner, id: &str, cell: &str) {
+        let mut t = Tenant::new(id.to_owned(), cell.to_owned());
         t.app_enabled = true;
         t.authority_refreshed_at = Some(NOW);
         diesel::insert_into(tenants::table).values(&t).execute(c).unwrap();
+    }
+
+    fn active_tenant(c: &mut DbConnInner, id: &str) {
+        active_tenant_in(c, id, REGION);
     }
 
     fn user(c: &mut DbConnInner, uid: &str, tid: &str, subject: &str) {
@@ -1410,7 +1525,7 @@ mod tests {
                 orgs,
                 touch_all_active: touch,
             },
-            REGION,
+            &cells(),
             now,
         )
         .unwrap()
@@ -1422,8 +1537,15 @@ mod tests {
         let mut att =
             Attachment::new(AttachmentId("att".to_owned()), CipherId::from("c1".to_owned()), "f".to_owned(), 1, None);
         att.tenant_id = Some("t1".to_owned());
-        assert_eq!(attachment_key(Some("t1"), "c1", "att"), att.get_file_path());
-        assert_eq!(send_key(Some("t1"), "s1", "f1"), "tenants/t1/sends/s1/f1");
+        assert_eq!(
+            attachment_key(Some(REGION), Some("t1"), "c1", "att"),
+            att.get_file_path_in_cell(Some(REGION)).unwrap()
+        );
+        assert_eq!(
+            attachment_key(Some(REGION), Some("t1"), "c1", "att"),
+            "cells/us-east-1/tenants/t1/attachments/c1/att"
+        );
+        assert_eq!(send_key(Some(REGION), Some("t1"), "s1", "f1"), "cells/us-east-1/tenants/t1/sends/s1/f1");
     }
 
     #[test]
@@ -1473,13 +1595,27 @@ mod tests {
         let t = tenant(c, "t1");
         assert_eq!((t.status.as_str(), t.revision, t.authority_refreshed_at), ("suspended", 3, Some(NOW + 3)));
 
-        // Other region skipped; new non-active tenant fenced.
+        // Unserved cell refused with 403 and zero rows written (C5).
         let mut far = snap("t2", "active", true, 1);
         far.home_region = "eu-west-1".to_owned();
-        let r = reconcile(c, vec![far, snap("t3", "active", false, 1)], false, NOW);
+        let err = reconcile_orgs(
+            c,
+            &ReconcileRequest {
+                orgs: vec![far, snap("t3", "active", false, 1)],
+                touch_all_active: false,
+            },
+            &cells(),
+            NOW,
+        )
+        .unwrap_err();
+        assert_eq!(err.error_code(), 403);
+        assert!(lock_tenant(c, "t2").unwrap().is_none());
+        assert!(lock_tenant(c, "t3").unwrap().is_none());
+
+        // New non-active tenant in a served cell is created fenced.
+        let r = reconcile(c, vec![snap("t3", "active", false, 1)], false, NOW);
         assert_eq!(r.applied, 1);
         assert_eq!(r.fenced_tenant_ids, vec!["t3"]);
-        assert!(lock_tenant(c, "t2").unwrap().is_none());
 
         // Deleted: purge_pending, never back to active.
         let r = reconcile(c, vec![snap("t1", "deleted", false, 4)], false, NOW);
@@ -1491,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_touch_all_refreshes_live_home_tenants_only() {
+    fn reconcile_touch_all_refreshes_live_served_cell_tenants_only() {
         let c = &mut test_sqlite_conn();
         reconcile(c, vec![snap("live", "active", true, 1), snap("gone", "deleted", false, 1)], false, NOW);
         let mut foreign = Tenant::new("foreign".to_owned(), "eu-west-1".to_owned());
@@ -1509,17 +1645,20 @@ mod tests {
         let c = &mut test_sqlite_conn();
         let mut bad_quotas = snap("t", "active", true, 1);
         bad_quotas.quotas = Some(Value::from(5));
+        let mut bad_cell = snap("t", "active", true, 1);
+        bad_cell.home_region = "../escape".to_owned();
         for orgs in [
             vec![snap("t", "bogus", true, 1)],
             vec![snap("", "active", true, 1)],
             vec![bad_quotas],
+            vec![bad_cell],
             (0..=MAX_BATCH).map(|i| snap(&i.to_string(), "active", true, 1)).collect(),
         ] {
             let req = ReconcileRequest {
                 orgs,
                 touch_all_active: false,
             };
-            assert!(reconcile_orgs(c, &req, REGION, NOW).is_err());
+            assert!(reconcile_orgs(c, &req, &cells(), NOW).is_err());
         }
         assert_eq!(tenants::table.count().get_result::<i64>(c).unwrap(), 0);
     }
@@ -1539,6 +1678,7 @@ mod tests {
     fn logout_matches_exact_identifier_and_tenant() {
         let c = &mut test_sqlite_conn();
         active_tenant(c, "t1");
+        active_tenant(c, "t2");
         user(c, "u1", "t1", "sub1");
         let req = |subject: &str, tenant_id: Option<&str>| LogoutRequest {
             issuer: format!("{ISS}/"),
@@ -1546,13 +1686,13 @@ mod tests {
             tenant_id: tenant_id.map(str::to_owned),
         };
 
-        let (r, _) = logout_user(c, &req("sub1", Some("t2")), NOW).unwrap();
+        let (r, _) = logout_user(c, &req("sub1", Some("t2")), &cells(), NOW).unwrap();
         assert!(!r.found);
-        let (r, _) = logout_user(c, &req("sub", None), NOW).unwrap();
+        let (r, _) = logout_user(c, &req("sub", None), &cells(), NOW).unwrap();
         assert!(!r.found);
         assert_eq!(stamp(c, "u1"), "stamp-u1");
 
-        let (r, kicks) = logout_user(c, &req("sub1", Some("t1")), NOW).unwrap();
+        let (r, kicks) = logout_user(c, &req("sub1", Some("t1")), &cells(), NOW).unwrap();
         assert_eq!((r.found, r.user_uuid.as_deref()), (true, Some("u1")));
         assert_eq!(kicks.users.len(), 1);
         assert_ne!(stamp(c, "u1"), "stamp-u1");
@@ -1574,28 +1714,31 @@ mod tests {
         };
         let enabled = |c: &mut DbConnInner| users::table.find("u1").select(users::enabled).first::<bool>(c).unwrap();
 
-        assert!(sync_user(c, &req("user.bogus", "sub1", true), NOW).is_err());
-        assert_eq!(sync_user(c, &req("user.updated", "nobody", true), NOW).unwrap().0.status, "not_found");
+        assert!(sync_user(c, &req("user.bogus", "sub1", true), &cells(), NOW).is_err());
+        assert_eq!(sync_user(c, &req("user.updated", "nobody", true), &cells(), NOW).unwrap().0.status, "not_found");
 
-        let (r, kicks) = sync_user(c, &req("user.deleted", "sub1", true), NOW).unwrap();
+        let (r, kicks) = sync_user(c, &req("user.deleted", "sub1", true), &cells(), NOW).unwrap();
         assert_eq!(r.status, "ok");
         assert_eq!(kicks.users.len(), 1);
         assert!(!enabled(c));
         assert_ne!(stamp(c, "u1"), "stamp-u1");
 
-        sync_user(c, &req("user.updated", "sub1", true), NOW).unwrap();
+        sync_user(c, &req("user.updated", "sub1", true), &cells(), NOW).unwrap();
         assert!(enabled(c));
         let name: String = users::table.find("u1").select(users::name).first(c).unwrap();
         assert_eq!(name, "Alice");
 
         // Inactive tenant: never re-enabled.
-        sync_user(c, &req("user.updated", "sub1", false), NOW).unwrap();
+        sync_user(c, &req("user.updated", "sub1", false), &cells(), NOW).unwrap();
         diesel::update(tenants::table.find("t1")).set(tenants::status.eq("suspended")).execute(c).unwrap();
-        sync_user(c, &req("user.updated", "sub1", true), NOW).unwrap();
+        sync_user(c, &req("user.updated", "sub1", true), &cells(), NOW).unwrap();
         assert!(!enabled(c));
 
         record_tombstone(c, &tombstone(ISS, "sub1", "t1", 1, naive(NOW))).unwrap();
-        assert_eq!(sync_user(c, &req("user.created", "sub1", true), NOW).unwrap().0.status, "erased_tombstone");
+        assert_eq!(
+            sync_user(c, &req("user.created", "sub1", true), &cells(), NOW).unwrap().0.status,
+            "erased_tombstone"
+        );
         assert!(!enabled(c));
     }
 
@@ -1636,7 +1779,7 @@ mod tests {
             tenant_id: Some("t1".to_owned()),
             revision: 7,
         };
-        let (r, kicks) = erase_user(c, &req, NOW).unwrap();
+        let (r, kicks) = erase_user(c, &req, &cells(), NOW).unwrap();
         assert!(r.user_existed && r.tombstone_recorded);
         assert_eq!(r.pending_deletions_queued, 2);
         assert_eq!(kicks.users.len(), 1);
@@ -1644,7 +1787,10 @@ mod tests {
         let mut keys: Vec<String> =
             tenant_pending_deletions::table.select(tenant_pending_deletions::object_key).load(c).unwrap();
         keys.sort();
-        assert_eq!(keys, vec!["tenants/t1/attachments/pc/pa", "tenants/t1/sends/s1/file1"]);
+        assert_eq!(
+            keys,
+            vec!["cells/us-east-1/tenants/t1/attachments/pc/pa", "cells/us-east-1/tenants/t1/sends/s1/file1"]
+        );
 
         assert_eq!(users::table.filter(users::uuid.eq("u1")).count().get_result::<i64>(c).unwrap(), 0);
         assert_eq!(sso_users::table.filter(sso_users::user_uuid.eq("u1")).count().get_result::<i64>(c).unwrap(), 0);
@@ -1664,7 +1810,7 @@ mod tests {
         assert_eq!(stone, 7);
 
         // Replay: idempotent, tombstone kept.
-        let (r, _) = erase_user(c, &req, NOW).unwrap();
+        let (r, _) = erase_user(c, &req, &cells(), NOW).unwrap();
         assert!(!r.user_existed && r.tombstone_recorded);
         assert_eq!(r.pending_deletions_queued, 0);
     }
@@ -1685,7 +1831,7 @@ mod tests {
         // Cross-tenant member of ta's org is removed from that org only.
         member(c, "m-ub-oa", "ub", "oa");
 
-        let (r, kicks) = purge_begin(c, "ta", ISS, NOW).unwrap();
+        let (r, kicks) = purge_begin(c, "ta", ISS, &cells(), NOW).unwrap();
         assert_eq!((r.status, r.pending_deletions), (STATUS_PURGE_PENDING, 3));
         assert_eq!(kicks.tenants, vec!["ta"]);
         let t = tenant(c, "ta");
@@ -1700,9 +1846,9 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                ("attachment".to_owned(), "tenants/ta/attachments/oc-ua/att-ua".to_owned()),
-                ("send".to_owned(), "tenants/ta/sends/s-ua/file1".to_owned()),
-                ("tenant_prefix".to_owned(), "tenants/ta/".to_owned()),
+                ("attachment".to_owned(), "cells/us-east-1/tenants/ta/attachments/oc-ua/att-ua".to_owned()),
+                ("send".to_owned(), "cells/us-east-1/tenants/ta/sends/s-ua/file1".to_owned()),
+                ("tenant_prefix".to_owned(), "cells/us-east-1/tenants/ta/".to_owned()),
             ]
         );
         assert!(tenant_erased_subjects::table.find((ISS, "sub-ua")).first::<TenantErasedSubject>(c).is_ok());
@@ -1726,11 +1872,12 @@ mod tests {
         assert_eq!(stamp(c, "ub"), "stamp-ub");
 
         // Re-run is idempotent: no duplicate prefix sweep.
-        assert_eq!(purge_begin(c, "ta", ISS, NOW).unwrap().0.pending_deletions, 3);
+        assert_eq!(purge_begin(c, "ta", ISS, &cells(), NOW).unwrap().0.pending_deletions, 3);
 
-        let items = cleanup_pending(c, Some(2), NOW).unwrap().items;
+        let items = cleanup_pending(c, Some(2), &cells(), NOW).unwrap().items;
         assert_eq!(items.len(), 2);
-        let all: Vec<String> = cleanup_pending(c, None, NOW).unwrap().items.into_iter().map(|i| i.id).collect();
+        let all: Vec<String> =
+            cleanup_pending(c, None, &cells(), NOW).unwrap().items.into_iter().map(|i| i.id).collect();
         let r = cleanup_complete(
             c,
             &CompleteRequest {
@@ -1740,6 +1887,7 @@ mod tests {
                     error: "x".repeat(900),
                 }],
             },
+            &cells(),
             NOW,
         )
         .unwrap();
@@ -1758,6 +1906,7 @@ mod tests {
                 completed_ids: vec![all[2].clone()],
                 failed: vec![],
             },
+            &cells(),
             NOW + 5,
         )
         .unwrap();
@@ -1765,13 +1914,13 @@ mod tests {
         let t = tenant(c, "ta");
         assert_eq!((t.status.as_str(), t.erased_at), (STATUS_DELETED, Some(naive(NOW + 5))));
 
-        let r = purge_begin(c, "ta", ISS, NOW).unwrap().0;
+        let r = purge_begin(c, "ta", ISS, &cells(), NOW).unwrap().0;
         assert_eq!((r.status, r.pending_deletions), (STATUS_DELETED, 0));
 
-        // Unknown tenant: bare tombstone, nothing queued.
-        let r = purge_begin(c, "never-seen", ISS, NOW).unwrap().0;
-        assert_eq!((r.status, r.pending_deletions), (STATUS_DELETED, 0));
-        assert_eq!(tenant(c, "never-seen").status, STATUS_DELETED);
+        // Unknown tenant is refused with 403 under C5 (never creates a phantom empty-cell row).
+        let err = purge_begin(c, "never-seen", ISS, &cells(), NOW).unwrap_err();
+        assert_eq!(err.error_code(), 403);
+        assert!(lock_tenant(c, "never-seen").unwrap().is_none());
 
         assert!(
             cleanup_complete(
@@ -1780,6 +1929,7 @@ mod tests {
                     completed_ids: (0..=MAX_BATCH).map(|i| i.to_string()).collect(),
                     failed: vec![],
                 },
+                &cells(),
                 NOW
             )
             .is_err()
@@ -1801,7 +1951,7 @@ mod tests {
                     want_bytes_default: 1000,
                     limit: 500,
                 },
-                REGION,
+                &cells(),
             )
             .unwrap()
             .reports
@@ -1822,6 +1972,7 @@ mod tests {
                         over_since: None,
                     }],
                 },
+                &cells(),
                 NOW,
             )
             .unwrap()
@@ -1877,6 +2028,7 @@ mod tests {
                     org_id: "t1".to_owned(),
                     next_seq,
                 },
+                &cells(),
             )
         };
         assert!(repair(c, 2).is_err());
@@ -1897,15 +2049,18 @@ mod tests {
         assert_eq!(prep(c)[0].want_bytes, 0);
         diesel::update(tenants::table.find("t1")).set(tenants::status.eq(STATUS_PURGE_PENDING)).execute(c).unwrap();
         assert_eq!(prep(c), vec![]);
-        assert!(
+        assert_eq!(
             storage_repair_seq(
                 c,
                 &RepairSeqRequest {
                     org_id: "nope".to_owned(),
                     next_seq: 1,
-                }
+                },
+                &cells(),
             )
-            .is_err()
+            .unwrap_err()
+            .error_code(),
+            403
         );
     }
 
@@ -1934,9 +2089,19 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_home_region_change_fences_existing_tenant() {
+    fn c4_home_region_change_never_mutates_and_fences_tenant() {
         let c = &mut test_sqlite_conn();
-        reconcile(c, vec![snap("t1", "active", true, 1)], false, NOW);
+        let multi_cells = vec!["us-east-1".to_owned(), "us-east-2".to_owned()];
+        reconcile_orgs(
+            c,
+            &ReconcileRequest {
+                orgs: vec![snap("t1", "active", true, 1)],
+                touch_all_active: false,
+            },
+            &multi_cells,
+            NOW,
+        )
+        .unwrap();
         user(c, "u1", "t1", "sub1");
         diesel::update(tenants::table.find("t1"))
             .set((tenants::storage_ceiling_bytes.eq(5000), tenants::storage_grant_expires_at.eq(Some(NOW + 600))))
@@ -1944,32 +2109,29 @@ mod tests {
             .unwrap();
         assert_eq!(stamp(c, "u1"), "stamp-u1");
 
-        // Snapshot moves existing local tenant t1 to another region and also contains an unknown
-        // foreign tenant t2. With touch_all_active=true, t1 must be fenced and NOT refreshed,
-        // while t2 must not be created locally.
+        // C4: moving t1 even to ANOTHER served cell ("us-east-2") must NOT overwrite home_region,
+        // must fence the tenant, clear authority_refreshed_at (even with touch_all_active=true),
+        // and report t1 in region_mismatch_tenant_ids.
         let mut moved = snap("t1", "active", true, 2);
-        moved.home_region = "eu-west-1".to_owned();
-        let mut foreign = snap("t2", "active", true, 1);
-        foreign.home_region = "eu-west-1".to_owned();
-
+        moved.home_region = "us-east-2".to_owned();
         let (resp, kicks) = reconcile_orgs(
             c,
             &ReconcileRequest {
-                orgs: vec![moved, foreign],
+                orgs: vec![moved],
                 touch_all_active: true,
             },
-            "us-east-1",
+            &multi_cells,
             NOW + 60,
         )
         .unwrap();
 
-        assert_eq!(resp.applied, 1);
+        assert_eq!(resp.applied, 0);
         assert_eq!(resp.fenced_tenant_ids, vec!["t1"]);
+        assert_eq!(resp.region_mismatch_tenant_ids, vec!["t1"]);
         assert_eq!(kicks.tenants, vec!["t1"]);
-        assert!(tenants::table.find("t2").first::<Tenant>(c).is_err());
 
         let t = tenant(c, "t1");
-        assert_eq!(t.home_region, "eu-west-1");
+        assert_eq!(t.home_region, "us-east-1", "C4: stored home_region must remain immutable");
         assert_eq!(t.access_epoch, 2);
         assert_eq!(t.storage_ceiling_bytes, 0);
         assert_eq!(t.storage_grant_expires_at, None);
@@ -1977,6 +2139,272 @@ mod tests {
         assert_ne!(stamp(c, "u1"), "stamp-u1");
         let rt: String = devices::table.find(("dev-u1", "u1")).select(devices::refresh_token).first(c).unwrap();
         assert_ne!(rt, "rt-u1");
+
+        // A subsequent empty heartbeat poll (touch_all_active=true) must NOT revive the C4-fenced tenant.
+        let (hb, _) = reconcile_orgs(
+            c,
+            &ReconcileRequest {
+                orgs: vec![],
+                touch_all_active: true,
+            },
+            &multi_cells,
+            NOW + 120,
+        )
+        .unwrap();
+        assert_eq!(hb.applied, 0);
+        assert_eq!(tenant(c, "t1").authority_refreshed_at, None);
+
+        // Storage prepare/apply must also never grant storage to a C4-fenced tenant.
+        let prep = storage_prepare(
+            c,
+            &PrepareRequest {
+                want_bytes_default: 4096,
+                limit: 10,
+            },
+            &multi_cells,
+        )
+        .unwrap();
+        if let Some(rep) = prep.reports.iter().find(|r| r.org_id == "t1") {
+            assert_eq!(rep.want_bytes, 0);
+            storage_apply(
+                c,
+                &ApplyRequest {
+                    sent_at: NOW + 125,
+                    results: vec![ApplyItem {
+                        org_id: "t1".into(),
+                        result: "ok".into(),
+                        seq: rep.seq,
+                        ceiling_bytes: 99_999,
+                        ttl_seconds: 600,
+                        pool_bytes: 999_999,
+                        org_used_bytes: 0,
+                        over_since: None,
+                    }],
+                },
+                &multi_cells,
+                NOW + 125,
+            )
+            .unwrap();
+        }
+        let after = tenant(c, "t1");
+        assert_eq!(after.storage_ceiling_bytes, 0);
+        assert_eq!(after.storage_grant_expires_at, None);
+    }
+
+    #[test]
+    fn c5_every_internal_op_refuses_unserved_cell_with_403() {
+        let c = &mut test_sqlite_conn();
+        active_tenant_in(c, "local", "us-east-1");
+        active_tenant_in(c, "foreign", "eu-west-1");
+        user(c, "u-foreign", "foreign", "sub-foreign");
+        exec(
+            c,
+            "INSERT INTO tenant_pending_deletions (id, tenant_id, storage_kind, object_key, attempts, created_at) \
+             VALUES ('pd-foreign', 'foreign', 'attachment', 'cells/eu-west-1/tenants/foreign/attachments/c/a', 0, '2025-01-01 00:00:00')",
+        );
+
+        let served = cells();
+
+        // 1. reconcile_orgs rejects unknown foreign org with 403.
+        let mut new_foreign = snap("new-foreign", "active", true, 1);
+        new_foreign.home_region = "eu-west-1".to_owned();
+        assert_eq!(
+            reconcile_orgs(
+                c,
+                &ReconcileRequest {
+                    orgs: vec![new_foreign],
+                    touch_all_active: false,
+                },
+                &served,
+                NOW,
+            )
+            .unwrap_err()
+            .error_code(),
+            403
+        );
+
+        // 2. logout_user rejects foreign tenant (by explicit tenant_id AND by subject lookup).
+        assert_eq!(
+            logout_user(
+                c,
+                &LogoutRequest {
+                    issuer: ISS.to_owned(),
+                    subject: "sub-foreign".to_owned(),
+                    tenant_id: Some("foreign".to_owned()),
+                },
+                &served,
+                NOW,
+            )
+            .unwrap_err()
+            .error_code(),
+            403
+        );
+        assert_eq!(
+            logout_user(
+                c,
+                &LogoutRequest {
+                    issuer: ISS.to_owned(),
+                    subject: "sub-foreign".to_owned(),
+                    tenant_id: None,
+                },
+                &served,
+                NOW,
+            )
+            .unwrap_err()
+            .error_code(),
+            403
+        );
+
+        // 3. sync_user rejects foreign tenant.
+        assert_eq!(
+            sync_user(
+                c,
+                &SyncRequest {
+                    event_type: "user.updated".to_owned(),
+                    issuer: ISS.to_owned(),
+                    subject: "sub-foreign".to_owned(),
+                    tenant_id: Some("foreign".to_owned()),
+                    display_name: Some("Bob".to_owned()),
+                    active: true,
+                },
+                &served,
+                NOW,
+            )
+            .unwrap_err()
+            .error_code(),
+            403
+        );
+
+        // 4. erase_user rejects foreign tenant.
+        assert_eq!(
+            erase_user(
+                c,
+                &EraseRequest {
+                    issuer: ISS.to_owned(),
+                    subject: "sub-foreign".to_owned(),
+                    tenant_id: Some("foreign".to_owned()),
+                    revision: 1,
+                },
+                &served,
+                NOW,
+            )
+            .unwrap_err()
+            .error_code(),
+            403
+        );
+
+        // 5. purge_begin rejects foreign tenant.
+        assert_eq!(purge_begin(c, "foreign", ISS, &served, NOW).unwrap_err().error_code(), 403);
+
+        // 6. cleanup_pending hides foreign items; cleanup_complete rejects foreign item with 403.
+        assert!(cleanup_pending(c, None, &served, NOW).unwrap().items.is_empty());
+        assert_eq!(
+            cleanup_complete(
+                c,
+                &CompleteRequest {
+                    completed_ids: vec!["pd-foreign".to_owned()],
+                    failed: vec![],
+                },
+                &served,
+                NOW,
+            )
+            .unwrap_err()
+            .error_code(),
+            403
+        );
+
+        // 7. storage_prepare omits foreign tenant; storage_apply and storage_repair_seq reject with 403.
+        let prep = storage_prepare(
+            c,
+            &PrepareRequest {
+                want_bytes_default: 1000,
+                limit: 500,
+            },
+            &served,
+        )
+        .unwrap();
+        assert_eq!(prep.reports.iter().map(|r| r.org_id.as_str()).collect::<Vec<_>>(), vec!["local"]);
+
+        assert_eq!(
+            storage_apply(
+                c,
+                &ApplyRequest {
+                    sent_at: NOW,
+                    results: vec![ApplyItem {
+                        org_id: "foreign".to_owned(),
+                        result: "ok".to_owned(),
+                        seq: 1,
+                        ceiling_bytes: 1000,
+                        ttl_seconds: 600,
+                        pool_bytes: 1000,
+                        org_used_bytes: 0,
+                        over_since: None,
+                    }],
+                },
+                &served,
+                NOW,
+            )
+            .unwrap_err()
+            .error_code(),
+            403
+        );
+
+        assert_eq!(
+            storage_repair_seq(
+                c,
+                &RepairSeqRequest {
+                    org_id: "foreign".to_owned(),
+                    next_seq: 10,
+                },
+                &served,
+            )
+            .unwrap_err()
+            .error_code(),
+            403
+        );
+    }
+
+    #[test]
+    fn multi_cell_deployment_serves_multiple_cells_with_isolated_object_keys() {
+        let c = &mut test_sqlite_conn();
+        let multi = vec!["us-east-1".to_owned(), "us-east-2".to_owned()];
+
+        let mut s2 = snap("t2", "active", true, 1);
+        s2.home_region = "us-east-2".to_owned();
+        let (r, _) = reconcile_orgs(
+            c,
+            &ReconcileRequest {
+                orgs: vec![snap("t1", "active", true, 1), s2],
+                touch_all_active: false,
+            },
+            &multi,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(r.applied, 2);
+
+        user(c, "u1", "t1", "sub1");
+        user(c, "u2", "t2", "sub2");
+        cipher(c, "c1", Some("u1"), None, "t1");
+        cipher(c, "c2", Some("u2"), None, "t2");
+        attachment(c, "a1", "c1", "t1");
+        attachment(c, "a2", "c2", "t2");
+
+        purge_begin(c, "t1", ISS, &multi, NOW).unwrap();
+        purge_begin(c, "t2", ISS, &multi, NOW).unwrap();
+
+        let mut keys: Vec<String> =
+            cleanup_pending(c, None, &multi, NOW).unwrap().items.into_iter().map(|i| i.object_key).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "cells/us-east-1/tenants/t1/",
+                "cells/us-east-1/tenants/t1/attachments/c1/a1",
+                "cells/us-east-2/tenants/t2/",
+                "cells/us-east-2/tenants/t2/attachments/c2/a2",
+            ]
+        );
     }
 
     #[test]
@@ -1984,6 +2412,7 @@ mod tests {
         use crate::db::models::{TenantRecoveryBundle, UserId, committed_bytes};
 
         let c = &mut test_sqlite_conn();
+        let served = cells();
         active_tenant(c, "t1");
         user(c, "u1", "t1", "sub1");
         diesel::update(tenants::table.find("t1"))
@@ -2004,7 +2433,7 @@ mod tests {
             None,
             None,
         );
-        TenantRecoveryBundle::upsert_personal_kit_inner(c, &k1, Some(("us-east-1", 900)), NOW).unwrap();
+        TenantRecoveryBundle::upsert_personal_kit_inner(c, &k1, Some((&served, 900)), NOW).unwrap();
         assert_eq!(tenant_recovery_bundles::table.count().get_result::<i64>(c).unwrap(), 1);
         assert_eq!(committed_bytes(c, "t1").unwrap(), 10);
 
@@ -2018,7 +2447,7 @@ mod tests {
             None,
             None,
         );
-        TenantRecoveryBundle::upsert_personal_kit_inner(c, &k2, Some(("us-east-1", 900)), NOW).unwrap();
+        TenantRecoveryBundle::upsert_personal_kit_inner(c, &k2, Some((&served, 900)), NOW).unwrap();
         assert_eq!(tenant_recovery_bundles::table.count().get_result::<i64>(c).unwrap(), 1);
         assert_eq!(committed_bytes(c, "t1").unwrap(), 20);
 
@@ -2032,7 +2461,7 @@ mod tests {
             None,
             None,
         );
-        assert!(TenantRecoveryBundle::upsert_personal_kit_inner(c, &k_too_big, Some(("us-east-1", 900)), NOW).is_err());
+        assert!(TenantRecoveryBundle::upsert_personal_kit_inner(c, &k_too_big, Some((&served, 900)), NOW).is_err());
 
         // Expired grant rejects larger upload without inserting or revoking rows.
         diesel::update(tenants::table.find("t1"))
@@ -2048,7 +2477,7 @@ mod tests {
             None,
             None,
         );
-        assert!(TenantRecoveryBundle::upsert_personal_kit_inner(c, &k3, Some(("us-east-1", 900)), NOW).is_err());
+        assert!(TenantRecoveryBundle::upsert_personal_kit_inner(c, &k3, Some((&served, 900)), NOW).is_err());
 
         let remaining: Vec<TenantRecoveryBundle> = tenant_recovery_bundles::table.load(c).unwrap();
         assert_eq!(remaining.len(), 1);
@@ -2062,6 +2491,7 @@ mod tests {
         use diesel::connection::SimpleConnection;
 
         let c = &mut test_sqlite_conn();
+        let served = cells();
         #[allow(irrefutable_let_patterns)]
         if let DbConnInner::Sqlite(s) = c {
             s.batch_execute("PRAGMA foreign_keys = ON;").unwrap();
@@ -2075,7 +2505,7 @@ mod tests {
             tenant_id: "t1".to_owned(),
             user_uuid: Some(UserId::from("u1".to_owned())),
             storage_kind: "attachment".to_owned(),
-            object_key: "tenants/t1/attachments/missing-cipher/att1".to_owned(),
+            object_key: "cells/us-east-1/tenants/t1/attachments/missing-cipher/att1".to_owned(),
             attempts: 0,
             last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
             created_at: naive(NOW),
@@ -2083,7 +2513,7 @@ mod tests {
         diesel::insert_into(tenant_pending_deletions::table).values(&staged).execute(c).unwrap();
 
         // While upload is actively in flight, worker does not see it.
-        assert!(cleanup_pending(c, None, NOW).unwrap().items.is_empty());
+        assert!(cleanup_pending(c, None, &served, NOW).unwrap().items.is_empty());
 
         // Simulating a mid-upload cipher deletion causes attachment insert to fail its FK constraint.
         let att_fail = Attachment::new(
@@ -2101,14 +2531,14 @@ mod tests {
         assert!(tenant_pending_deletions::table.find("pd-staged").first::<TenantPendingDeletion>(c).is_ok());
 
         // After the staging grace expires (e.g. process crash), cleanup_pending exposes it automatically.
-        assert_eq!(cleanup_pending(c, None, NOW + UPLOAD_STAGING_GRACE_SECS + 1).unwrap().items.len(), 1);
+        assert_eq!(cleanup_pending(c, None, &served, NOW + UPLOAD_STAGING_GRACE_SECS + 1).unwrap().items.len(), 1);
 
         // Activating the row on failure exposes it immediately at NOW.
         diesel::update(tenant_pending_deletions::table.find("pd-staged"))
             .set(tenant_pending_deletions::last_error.eq(None::<String>))
             .execute(c)
             .unwrap();
-        assert_eq!(cleanup_pending(c, None, NOW).unwrap().items.len(), 1);
+        assert_eq!(cleanup_pending(c, None, &served, NOW).unwrap().items.len(), 1);
 
         // Happy path: with a real cipher, saving the attachment atomically clears the staged row.
         cipher(c, "c1", Some("u1"), None, "t1");
@@ -2117,7 +2547,7 @@ mod tests {
             tenant_id: "t1".to_owned(),
             user_uuid: Some(UserId::from("u1".to_owned())),
             storage_kind: "attachment".to_owned(),
-            object_key: "tenants/t1/attachments/c1/att2".to_owned(),
+            object_key: "cells/us-east-1/tenants/t1/attachments/c1/att2".to_owned(),
             attempts: 0,
             last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
             created_at: naive(NOW),
@@ -2141,6 +2571,7 @@ mod tests {
         use crate::db::models::{Cipher, committed_bytes};
 
         let c = &mut test_sqlite_conn();
+        let served = cells();
         active_tenant(c, "t1");
         user(c, "u1", "t1", "sub1");
 
@@ -2154,7 +2585,7 @@ mod tests {
             .set((tenants::storage_ceiling_bytes.eq(1000), tenants::storage_grant_expires_at.eq(Some(NOW - 1))))
             .execute(c)
             .unwrap();
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, REGION, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, &served, 10, NOW).is_err());
         assert_eq!(ciphers::table.filter(ciphers::tenant_id.eq("t1")).count().get_result::<i64>(c).unwrap(), 0);
         assert_eq!(committed_bytes(c, "t1").unwrap(), 0);
 
@@ -2163,25 +2594,25 @@ mod tests {
             .set((tenants::storage_ceiling_bytes.eq(10), tenants::storage_grant_expires_at.eq(Some(NOW + 300))))
             .execute(c)
             .unwrap();
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, REGION, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, &served, 10, NOW).is_err());
         assert_eq!(ciphers::table.filter(ciphers::tenant_id.eq("t1")).count().get_result::<i64>(c).unwrap(), 0);
 
         // 3. Sufficient active grant allows creating the cipher and counts all encrypted fields.
         diesel::update(tenants::table.find("t1")).set(tenants::storage_ceiling_bytes.eq(20)).execute(c).unwrap();
-        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, REGION, 10, NOW).unwrap();
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, &served, 10, NOW).unwrap();
         assert_eq!(committed_bytes(c, "t1").unwrap(), 14);
 
         // 4. Exhausted grant rejects enlarging data or notes without modifying stored data.
         let mut enlarged = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         enlarged.data = "01234567890123456789".to_owned(); // 4 + 20 = 24 > ceiling 20
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &enlarged, 900, REGION, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &enlarged, 900, &served, 10, NOW).is_err());
         let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         assert_eq!(stored.data, "0123456789");
         assert_eq!(committed_bytes(c, "t1").unwrap(), 14);
 
         let mut big_notes = stored;
         big_notes.notes = Some("1234567".to_owned()); // 14 + 7 = 21 > ceiling 20
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &big_notes, 900, REGION, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &big_notes, 900, &served, 10, NOW).is_err());
         let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         assert_eq!(stored.notes, None);
 
@@ -2192,7 +2623,7 @@ mod tests {
             .unwrap();
         let mut small_grow = stored;
         small_grow.data = "0123456789X".to_owned(); // +1 byte
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &small_grow, 900, REGION, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &small_grow, 900, &served, 10, NOW).is_err());
         let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         assert_eq!(stored.data, "0123456789");
 
@@ -2200,7 +2631,7 @@ mod tests {
         let mut shrunk = stored;
         shrunk.data = "01234".to_owned();
         shrunk.deleted_at = Some(naive(NOW));
-        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &shrunk, 900, REGION, 10, NOW).unwrap();
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &shrunk, 900, &served, 10, NOW).unwrap();
         let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         assert_eq!(stored.data, "01234");
         assert!(stored.deleted_at.is_some());
@@ -2215,12 +2646,12 @@ mod tests {
         second.user_uuid = Some(UserId::from("u1".to_owned()));
         second.tenant_id = Some("t1".to_owned());
         second.data = "abc".to_owned();
-        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &second, 900, REGION, 1, NOW).unwrap();
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &second, 900, &served, 1, NOW).unwrap();
 
         // Restoring the trashed first cipher would exceed max_ciphers = 1 -> rejected without mutating it.
         let mut restore = stored;
         restore.deleted_at = None;
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &restore, 900, REGION, 1, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &restore, 900, &served, 1, NOW).is_err());
         assert!(ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap().deleted_at.is_some());
     }
 
@@ -2244,6 +2675,7 @@ mod tests {
         let store_root = dir.0.join("objects");
         std::fs::create_dir_all(&store_root).unwrap();
 
+        let served = cells();
         let mut setup = test_sqlite_conn_at(&db_url);
         active_tenant(&mut setup, "t1");
         user(&mut setup, "u1", "t1", "sub1");
@@ -2263,7 +2695,7 @@ mod tests {
             None,
         )
         .with_tenant_id(Some("t1".to_owned()));
-        let object_key = att.get_file_path();
+        let object_key = att.get_file_path_in_cell(Some(REGION)).unwrap();
         let object_path = store_root.join(&object_key);
         let pending_id = "pd-v2-race";
 
@@ -2279,7 +2711,7 @@ mod tests {
             created_at: naive(NOW),
         };
         diesel::insert_into(tenant_pending_deletions::table).values(&staged).execute(&mut setup).unwrap();
-        assert!(cleanup_pending(&mut setup, None, NOW).unwrap().items.is_empty());
+        assert!(cleanup_pending(&mut setup, None, &served, NOW).unwrap().items.is_empty());
 
         // Run the v2 object write and concurrent attachment deletion across two threads synchronized
         // with barriers so deletion deterministically occurs mid-write.
@@ -2334,7 +2766,7 @@ mod tests {
             .execute(&mut setup)
             .unwrap();
 
-        let pending = cleanup_pending(&mut setup, None, NOW).unwrap().items;
+        let pending = cleanup_pending(&mut setup, None, &served, NOW).unwrap().items;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, pending_id);
         assert_eq!(pending[0].object_key, object_key);
@@ -2347,14 +2779,15 @@ mod tests {
                 completed_ids: vec![pending[0].id.clone()],
                 failed: vec![],
             },
+            &served,
             NOW,
         )
         .unwrap();
         assert_eq!(done.deleted, 1);
-
-        // No untracked object remains, no pending deletions remain, and accounting matches only cipher c1 (11 bytes).
         assert!(!object_path.exists());
-        assert!(cleanup_pending(&mut setup, None, NOW + UPLOAD_STAGING_GRACE_SECS + 1).unwrap().items.is_empty());
+        assert!(
+            cleanup_pending(&mut setup, None, &served, NOW + UPLOAD_STAGING_GRACE_SECS + 1).unwrap().items.is_empty()
+        );
         assert_eq!(attachments::table.count().get_result::<i64>(&mut setup).unwrap(), 0);
         assert_eq!(tenant(&mut setup, "t1").storage_reserved_bytes, 0);
         assert_eq!(committed_bytes(&mut setup, "t1").unwrap(), 11);
@@ -2379,7 +2812,7 @@ mod tests {
             tenant_id: "t1".to_owned(),
             user_uuid: Some(UserId::from("u1".to_owned())),
             storage_kind: "attachment".to_owned(),
-            object_key: att_ok.get_file_path(),
+            object_key: att_ok.get_file_path_in_cell(Some(REGION)).unwrap(),
             attempts: 0,
             last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
             created_at: naive(NOW),

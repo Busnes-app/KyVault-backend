@@ -1999,6 +1999,16 @@ async fn list_policies_token(org_id: OrganizationId, token: &str, conn: DbConn) 
         err!("Token doesn't match request organization");
     }
 
+    if CONFIG.is_multi_tenant() {
+        let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
+            err_code!("Organization not found", 403);
+        };
+        let Some(tid) = org.tenant_id.as_deref().filter(|s| !s.trim().is_empty()) else {
+            err_code!("Organization is not bound to a tenant", 403);
+        };
+        crate::tenancy::check_tenant_active(tid, &conn).await?;
+    }
+
     // exit early when we have been invited via /admin panel
     if org_id.as_ref() == FAKE_ADMIN_UUID {
         return Ok(Json(json!({})));

@@ -173,6 +173,11 @@ impl Error {
         &self.message
     }
 
+    #[cfg(test)]
+    pub const fn error_code(&self) -> u16 {
+        self.code
+    }
+
     #[must_use]
     pub fn silent(mut self) -> Self {
         self.silent = true;

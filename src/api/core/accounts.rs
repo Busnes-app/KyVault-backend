@@ -1270,6 +1270,9 @@ async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn)
     if claims.sub != *user.uuid {
         err!("Invalid claim");
     }
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::require_user_tenant_active(&user, &conn).await?;
+    }
     user.verified_at = Some(Utc::now().naive_utc());
     user.last_verifying_at = None;
     user.login_verify_count = 0;
@@ -1329,6 +1332,9 @@ async fn post_delete_recover_token(data: Json<DeleteRecoverTokenData>, conn: DbC
 
     if claims.sub != *user.uuid {
         err!("Invalid claim");
+    }
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::require_user_tenant_active(&user, &conn).await?;
     }
 
     // The devices are deleted together with the user, so check for push devices beforehand
@@ -1717,6 +1723,9 @@ async fn post_auth_request(
     let Some(user) = User::find_by_mail(&data.email, &conn).await else {
         err!("AuthRequest doesn't exist", "User not found")
     };
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::require_user_tenant_active(&user, &conn).await?;
+    }
 
     // Validate device uuid and type
     let device = match Device::find_by_uuid_and_user(&data.device_identifier, &user.uuid, &conn).await {
@@ -1884,6 +1893,12 @@ async fn get_auth_request_response(
         || !auth_request.check_access_code(code)
     {
         err!("AuthRequest doesn't exist", "Invalid device, IP or code")
+    }
+    if CONFIG.is_multi_tenant() {
+        let Some(user) = User::find_by_uuid(&auth_request.user_uuid, &conn).await else {
+            err_code!("AuthRequest user not found", 403);
+        };
+        crate::tenancy::require_user_tenant_active(&user, &conn).await?;
     }
 
     let response_date_utc = auth_request.response_date.map(|response_date| format_date(&response_date));

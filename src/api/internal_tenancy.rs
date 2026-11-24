@@ -90,7 +90,7 @@ fn health(_auth: InternalTenancyAuth) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "multi_tenant": CONFIG.is_multi_tenant(),
-        "home_region": CONFIG.home_region(),
+        "cells": CONFIG.served_cells(),
     }))
 }
 
@@ -100,8 +100,8 @@ async fn reconcile_orgs(
     conn: DbConn,
     data: Json<ops::ReconcileRequest>,
 ) -> ApiResult<Json<ops::ReconcileResponse>> {
-    let region = CONFIG.home_region();
-    let (resp, kicks) = conn.run(move |c| ops::reconcile_orgs(c, &data, &region, now())).await?;
+    let cells = CONFIG.served_cells();
+    let (resp, kicks) = conn.run(move |c| ops::reconcile_orgs(c, &data, &cells, now())).await?;
     deliver(kicks);
     Ok(Json(resp))
 }
@@ -112,7 +112,8 @@ async fn logout_user(
     conn: DbConn,
     data: Json<ops::LogoutRequest>,
 ) -> ApiResult<Json<ops::LogoutResponse>> {
-    let (resp, kicks) = conn.run(move |c| ops::logout_user(c, &data, now())).await?;
+    let cells = CONFIG.served_cells();
+    let (resp, kicks) = conn.run(move |c| ops::logout_user(c, &data, &cells, now())).await?;
     deliver(kicks);
     Ok(Json(resp))
 }
@@ -123,7 +124,8 @@ async fn sync_user(
     conn: DbConn,
     data: Json<ops::SyncRequest>,
 ) -> ApiResult<Json<ops::UserStatusResponse>> {
-    let (resp, kicks) = conn.run(move |c| ops::sync_user(c, &data, now())).await?;
+    let cells = CONFIG.served_cells();
+    let (resp, kicks) = conn.run(move |c| ops::sync_user(c, &data, &cells, now())).await?;
     deliver(kicks);
     Ok(Json(resp))
 }
@@ -134,7 +136,8 @@ async fn erase_user(
     conn: DbConn,
     data: Json<ops::EraseRequest>,
 ) -> ApiResult<Json<ops::EraseResponse>> {
-    let (resp, kicks) = conn.run(move |c| ops::erase_user(c, &data, now())).await?;
+    let cells = CONFIG.served_cells();
+    let (resp, kicks) = conn.run(move |c| ops::erase_user(c, &data, &cells, now())).await?;
     deliver(kicks);
     Ok(Json(resp))
 }
@@ -143,7 +146,8 @@ async fn erase_user(
 async fn purge_begin(_auth: InternalTenancyAuth, conn: DbConn, tenant_id: &str) -> ApiResult<Json<ops::PurgeResponse>> {
     let tid = tenant_id.to_owned();
     let authority = CONFIG.sso_authority();
-    let (resp, kicks) = conn.run(move |c| ops::purge_begin(c, &tid, &authority, now())).await?;
+    let cells = CONFIG.served_cells();
+    let (resp, kicks) = conn.run(move |c| ops::purge_begin(c, &tid, &authority, &cells, now())).await?;
     deliver(kicks);
     Ok(Json(resp))
 }
@@ -154,7 +158,8 @@ async fn cleanup_pending(
     conn: DbConn,
     limit: Option<i64>,
 ) -> ApiResult<Json<ops::PendingResponse>> {
-    Ok(Json(conn.run(move |c| ops::cleanup_pending(c, limit, now())).await?))
+    let cells = CONFIG.served_cells();
+    Ok(Json(conn.run(move |c| ops::cleanup_pending(c, limit, &cells, now())).await?))
 }
 
 #[post("/cleanup/complete", data = "<data>")]
@@ -163,7 +168,8 @@ async fn cleanup_complete(
     conn: DbConn,
     data: Json<ops::CompleteRequest>,
 ) -> ApiResult<Json<ops::CompleteResponse>> {
-    Ok(Json(conn.run(move |c| ops::cleanup_complete(c, &data, now())).await?))
+    let cells = CONFIG.served_cells();
+    Ok(Json(conn.run(move |c| ops::cleanup_complete(c, &data, &cells, now())).await?))
 }
 
 #[post("/storage/prepare", data = "<data>")]
@@ -172,8 +178,8 @@ async fn storage_prepare(
     conn: DbConn,
     data: Json<ops::PrepareRequest>,
 ) -> ApiResult<Json<ops::PrepareResponse>> {
-    let region = CONFIG.home_region();
-    Ok(Json(conn.run(move |c| ops::storage_prepare(c, &data, &region)).await?))
+    let cells = CONFIG.served_cells();
+    Ok(Json(conn.run(move |c| ops::storage_prepare(c, &data, &cells)).await?))
 }
 
 #[post("/storage/apply", data = "<data>")]
@@ -182,7 +188,8 @@ async fn storage_apply(
     conn: DbConn,
     data: Json<ops::ApplyRequest>,
 ) -> ApiResult<Json<ops::ApplyResponse>> {
-    Ok(Json(conn.run(move |c| ops::storage_apply(c, &data, now())).await?))
+    let cells = CONFIG.served_cells();
+    Ok(Json(conn.run(move |c| ops::storage_apply(c, &data, &cells, now())).await?))
 }
 
 #[post("/storage/repair-seq", data = "<data>")]
@@ -191,7 +198,8 @@ async fn storage_repair_seq(
     conn: DbConn,
     data: Json<ops::RepairSeqRequest>,
 ) -> ApiResult<Json<ops::RepairSeqResponse>> {
-    Ok(Json(conn.run(move |c| ops::storage_repair_seq(c, &data)).await?))
+    let cells = CONFIG.served_cells();
+    Ok(Json(conn.run(move |c| ops::storage_repair_seq(c, &data, &cells)).await?))
 }
 
 #[cfg(test)]

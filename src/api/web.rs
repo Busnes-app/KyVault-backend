@@ -244,7 +244,7 @@ async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String, 
     }
 
     let rel_path = match crate::db::models::Attachment::find_by_id(&file_id, &conn).await {
-        Some(att) => att.get_file_path(),
+        Some(att) => att.resolve_file_path(&conn).await.ok()?,
         None => format!("{cipher_id}/{file_id}"),
     };
 

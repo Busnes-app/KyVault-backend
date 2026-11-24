@@ -363,7 +363,7 @@ async fn post_send_file_v2_data(
         err!("Send file size does not match.", format!("Expected a file size of {} got {size}", send_data.size));
     }
 
-    let file_path = send.get_file_path(&file_id);
+    let file_path = send.resolve_file_path(&file_id, &conn).await?;
 
     save_temp_file(&PathType::Sends, &file_path, data.data, false).await?;
 
@@ -387,6 +387,12 @@ async fn post_access(headers: SendHeaders, conn: DbConn, nt: Notify<'_>) -> Json
     let Some(mut send) = Send::find_by_uuid(&headers.send_id, &conn).await else {
         err_code!(SEND_INACCESSIBLE_MSG, 404)
     };
+    if CONFIG.is_multi_tenant() {
+        let Some(tid) = send.tenant_id.as_deref().filter(|s| !s.is_empty()) else {
+            err_code!("Send has no tenant binding", 403);
+        };
+        crate::tenancy::check_tenant_active(tid, &conn).await?;
+    }
     if !send.is_accessible() {
         err_code!(SEND_INACCESSIBLE_MSG, 404)
     }
@@ -424,6 +430,12 @@ async fn post_access_file(
     let Some(mut send) = Send::find_by_uuid(&headers.send_id, &conn).await else {
         err_code!(SEND_INACCESSIBLE_MSG, 404)
     };
+    if CONFIG.is_multi_tenant() {
+        let Some(tid) = send.tenant_id.as_deref().filter(|s| !s.is_empty()) else {
+            err_code!("Send has no tenant binding", 403);
+        };
+        crate::tenancy::check_tenant_active(tid, &conn).await?;
+    }
     if !send.is_accessible() {
         err_code!(SEND_INACCESSIBLE_MSG, 404)
     }
@@ -457,11 +469,11 @@ async fn process_access_file(send: Send, file_id: SendFileId, host: Host, conn: 
     Ok(Json(json!({
         "object": "send-fileDownload",
         "id": file_id,
-        "url": download_url(&host, &send, &file_id).await?,
+        "url": download_url(&host, &send, &file_id, &conn).await?,
     })))
 }
 
-async fn download_url(host: &Host, send: &Send, file_id: &SendFileId) -> Result<String, crate::Error> {
+async fn download_url(host: &Host, send: &Send, file_id: &SendFileId, conn: &DbConn) -> Result<String, crate::Error> {
     let operator = CONFIG.opendal_operator_for_path_type(&PathType::Sends)?;
 
     if crate::storage::is_fs_operator(&operator) {
@@ -470,7 +482,8 @@ async fn download_url(host: &Host, send: &Send, file_id: &SendFileId) -> Result<
 
         Ok(format!("{}/api/sends/{}/{file_id}?t={token}", host.host, send.uuid))
     } else {
-        Ok(operator.presign_read(&send.get_file_path(file_id), Duration::from_mins(5)).await?.uri().to_string())
+        let path = send.resolve_file_path(file_id, conn).await?;
+        Ok(operator.presign_read(&path, Duration::from_mins(5)).await?.uri().to_string())
     }
 }
 
@@ -483,7 +496,14 @@ async fn download_send(send_id: SendId, file_id: SendFileId, t: &str, conn: DbCo
         && claims.sub == format!("{send_id}/{file_id}")
     {
         let rel_path = match Send::find_by_uuid(&send_id, &conn).await {
-            Some(send) => send.get_file_path(&file_id),
+            Some(send) => {
+                if CONFIG.is_multi_tenant() {
+                    let tid = send.tenant_id.as_deref().filter(|s| !s.is_empty())?;
+                    crate::tenancy::check_tenant_active(tid, &conn).await.ok()?;
+                }
+                send.resolve_file_path(&file_id, &conn).await.ok()?
+            }
+            None if CONFIG.is_multi_tenant() => return None,
             None => format!("{send_id}/{file_id}"),
         };
         return NamedFile::open(Path::new(&CONFIG.sends_folder()).join(rel_path)).await.ok();

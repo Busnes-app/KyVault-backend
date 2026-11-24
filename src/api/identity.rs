@@ -66,6 +66,9 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             check_is_some(data.refresh_token.as_ref(), "refresh_token cannot be blank")?;
             refresh_login(data, &conn, &client_header.ip).await
         }
+        "password" if CONFIG.is_multi_tenant() => {
+            err_code!("Password sign-in is disabled in hosted multi-tenant mode; use SSO", 403)
+        }
         "password" if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO sign-in is required"),
         "password" => {
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;

@@ -178,7 +178,7 @@ impl Cipher {
             {
                 let mut attachments_json_vec = vec![];
                 for attachment in attachments {
-                    attachments_json_vec.push(attachment.to_json(host).await?);
+                    attachments_json_vec.push(attachment.to_json(host, conn).await?);
                 }
                 attachments_json = Value::Array(attachments_json_vec);
             }
@@ -187,7 +187,7 @@ impl Cipher {
             if !attachments.is_empty() {
                 let mut attachments_json_vec = vec![];
                 for attachment in attachments {
-                    attachments_json_vec.push(attachment.to_json(host).await?);
+                    attachments_json_vec.push(attachment.to_json(host, conn).await?);
                 }
                 attachments_json = Value::Array(attachments_json_vec);
             }
@@ -459,11 +459,12 @@ impl Cipher {
             let Some(tenant_id) = self.tenant_id.as_deref() else {
                 err_code!("Cipher is missing tenant ownership", 403);
             };
+            let served_cells = CONFIG.served_cells();
             super::Tenant::save_cipher_enforcing_grant(
                 tenant_id,
                 self,
                 CONFIG.tenancy_authority_max_age_secs(),
-                &CONFIG.home_region(),
+                &served_cells,
                 CONFIG.tenancy_max_ciphers_per_tenant(),
                 conn,
             )

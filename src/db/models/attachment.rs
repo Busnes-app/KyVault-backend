@@ -57,29 +57,49 @@ impl Attachment {
         self
     }
 
-    pub fn get_file_path(&self) -> String {
+    /// Computes the attachment's object key relative to the attachments root.
+    /// Multi-tenant attachments (`tenant_id.is_some()`) require a valid cell slug and are
+    /// scoped under `cells/<cell>/tenants/<tid>/attachments/<cipher>/<id>`.
+    pub fn get_file_path_in_cell(&self, cell: Option<&str>) -> Result<String, crate::Error> {
         if let Some(ref tid) = self.tenant_id {
-            format!("tenants/{tid}/attachments/{}/{}", self.cipher_uuid, self.id)
+            let Some(cell) = cell.filter(|c| crate::tenancy::is_valid_cell_slug(c)) else {
+                err_code!("Tenant cell is missing or invalid", 500);
+            };
+            Ok(crate::tenancy::attachment_object_key(cell, tid, &self.cipher_uuid, &self.id))
         } else {
-            format!("{}/{}", self.cipher_uuid, self.id)
+            Ok(format!("{}/{}", self.cipher_uuid, self.id))
         }
     }
 
-    pub async fn get_url(&self, host: &str) -> Result<String, crate::Error> {
+    /// Resolves the attachment's object key by looking up its tenant's immutable cell slug when
+    /// `tenant_id` is set, or returning the single-tenant relative key otherwise.
+    pub async fn resolve_file_path(&self, conn: &DbConn) -> Result<String, crate::Error> {
+        if let Some(ref tid) = self.tenant_id {
+            let Some(tenant) = super::Tenant::find_by_id(tid, conn).await else {
+                err_code!("Tenant not found for attachment path", 403);
+            };
+            self.get_file_path_in_cell(Some(&tenant.home_region))
+        } else {
+            self.get_file_path_in_cell(None)
+        }
+    }
+
+    pub async fn get_url(&self, host: &str, conn: &DbConn) -> Result<String, crate::Error> {
         let operator = CONFIG.opendal_operator_for_path_type(&PathType::Attachments)?;
 
         if crate::storage::is_fs_operator(&operator) {
             let token = encode_jwt(&generate_file_download_claims(self.cipher_uuid.clone(), self.id.clone()));
             Ok(format!("{host}/attachments/{}/{}?token={token}", self.cipher_uuid, self.id))
         } else {
-            Ok(operator.presign_read(&self.get_file_path(), Duration::from_mins(1)).await?.uri().to_string())
+            let path = self.resolve_file_path(conn).await?;
+            Ok(operator.presign_read(&path, Duration::from_mins(1)).await?.uri().to_string())
         }
     }
 
-    pub async fn to_json(&self, host: &str) -> Result<Value, crate::Error> {
+    pub async fn to_json(&self, host: &str, conn: &DbConn) -> Result<Value, crate::Error> {
         Ok(json!({
             "id": self.id,
-            "url": self.get_url(host).await?,
+            "url": self.get_url(host, conn).await?,
             "fileName": self.file_name,
             "size": self.file_size.to_string(),
             "sizeName": crate::util::get_display_size(self.file_size),
@@ -135,6 +155,8 @@ impl Attachment {
     }
 
     pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
+        let file_path = self.resolve_file_path(conn).await?;
+
         conn.run(move |conn| {
             crate::util::retry(
                 || diesel::delete(attachments::table.filter(attachments::id.eq(&self.id))).execute(conn),
@@ -146,7 +168,6 @@ impl Attachment {
         .await?;
 
         let operator = CONFIG.opendal_operator_for_path_type(&PathType::Attachments)?;
-        let file_path = self.get_file_path();
 
         if let Err(e) = operator.delete(&file_path).await {
             if e.kind() == opendal::ErrorKind::NotFound {

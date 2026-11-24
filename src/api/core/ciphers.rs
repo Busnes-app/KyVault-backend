@@ -1259,7 +1259,9 @@ async fn get_attachment(
     }
 
     match Attachment::find_by_id(&attachment_id, &conn).await {
-        Some(attachment) if cipher_id == attachment.cipher_uuid => Ok(Json(attachment.to_json(&headers.host).await?)),
+        Some(attachment) if cipher_id == attachment.cipher_uuid => {
+            Ok(Json(attachment.to_json(&headers.host, &conn).await?))
+        }
         Some(_) => err!("Attachment doesn't belong to cipher"),
         None => err!("Attachment doesn't exist"),
     }
@@ -1471,7 +1473,8 @@ async fn save_attachment(
             attachment.delete(&conn).await.ok();
             err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
         }
-        (attachment.get_file_path(), None)
+        let path = attachment.resolve_file_path(&conn).await?;
+        (path, None)
     } else {
         // Legacy API
 
@@ -1489,7 +1492,7 @@ async fn save_attachment(
         let file_id = crypto::generate_attachment_id();
         let att = Attachment::new(file_id, cipher_id.clone(), encrypted_filename.unwrap(), size, data.key)
             .with_tenant_id(headers.user.tenant_id.clone());
-        let path = att.get_file_path();
+        let path = att.resolve_file_path(&conn).await?;
         (path, Some(att))
     };
 

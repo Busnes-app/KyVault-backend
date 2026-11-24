@@ -101,16 +101,48 @@ impl Send {
         }
     }
 
-    pub fn get_dir_path(&self) -> String {
+    pub fn get_dir_path_in_cell(&self, cell: Option<&str>) -> Result<String, crate::Error> {
         if let Some(ref tid) = self.tenant_id {
-            format!("tenants/{tid}/sends/{}", self.uuid)
+            let Some(cell) = cell.filter(|c| crate::tenancy::is_valid_cell_slug(c)) else {
+                err_code!("Tenant cell is missing or invalid", 500);
+            };
+            Ok(format!("cells/{cell}/tenants/{tid}/sends/{}", self.uuid))
         } else {
-            self.uuid.to_string()
+            Ok(self.uuid.to_string())
         }
     }
 
-    pub fn get_file_path(&self, file_id: &str) -> String {
-        format!("{}/{file_id}", self.get_dir_path())
+    pub fn get_file_path_in_cell(&self, file_id: &str, cell: Option<&str>) -> Result<String, crate::Error> {
+        if let Some(ref tid) = self.tenant_id {
+            let Some(cell) = cell.filter(|c| crate::tenancy::is_valid_cell_slug(c)) else {
+                err_code!("Tenant cell is missing or invalid", 500);
+            };
+            Ok(crate::tenancy::send_object_key(cell, tid, &self.uuid, file_id))
+        } else {
+            Ok(format!("{}/{file_id}", self.uuid))
+        }
+    }
+
+    pub async fn resolve_dir_path(&self, conn: &DbConn) -> Result<String, crate::Error> {
+        if let Some(ref tid) = self.tenant_id {
+            let Some(tenant) = super::Tenant::find_by_id(tid, conn).await else {
+                err_code!("Tenant not found for send path", 403);
+            };
+            self.get_dir_path_in_cell(Some(&tenant.home_region))
+        } else {
+            self.get_dir_path_in_cell(None)
+        }
+    }
+
+    pub async fn resolve_file_path(&self, file_id: &str, conn: &DbConn) -> Result<String, crate::Error> {
+        if let Some(ref tid) = self.tenant_id {
+            let Some(tenant) = super::Tenant::find_by_id(tid, conn).await else {
+                err_code!("Tenant not found for send path", 403);
+            };
+            self.get_file_path_in_cell(file_id, Some(&tenant.home_region))
+        } else {
+            self.get_file_path_in_cell(file_id, None)
+        }
     }
 
     pub fn set_password(&mut self, password: Option<&str>) {
@@ -293,7 +325,7 @@ impl Send {
 
         if self.atype == SendType::File as i32 {
             let operator = CONFIG.opendal_operator_for_path_type(&PathType::Sends)?;
-            let dir_path = self.get_dir_path();
+            let dir_path = self.resolve_dir_path(conn).await?;
             operator.delete_with(&dir_path).recursive(true).await.ok();
         }
 

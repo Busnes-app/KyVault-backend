@@ -242,11 +242,11 @@ impl Tenant {
         tenant_id: &str,
         additional_bytes: i64,
         max_authority_age_secs: i64,
-        home_region: &str,
+        served_cells: &[String],
         conn: &DbConn,
     ) -> Result<i64, crate::Error> {
         let tid = tenant_id.to_owned();
-        let region = home_region.to_owned();
+        let cells = served_cells.to_vec();
         let add = additional_bytes.max(0);
         conn.run(move |conn| {
             if !is_postgresql(conn) {
@@ -257,7 +257,7 @@ impl Tenant {
                 let Some(tenant) = lock_tenant(conn, &tid)? else {
                     err_code!("Tenant not found", 403);
                 };
-                validate_tenant_growth_tx(&tenant, &region, now.timestamp(), max_authority_age_secs)?;
+                validate_tenant_growth_tx(&tenant, &cells, now.timestamp(), max_authority_age_secs)?;
                 if add > 0 {
                     let committed = committed_bytes(conn, &tid)?;
                     if !tenant.can_grow_storage(committed, add, now.timestamp()) {
@@ -340,7 +340,6 @@ impl Tenant {
         clear_pending_id: Option<&str>,
     ) -> EmptyResult {
         let release = release.max(0);
-        let object_key = att.get_file_path();
         conn.transaction::<(), crate::Error, _>(|conn| {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
                 err_code!("Tenant not found", 403);
@@ -348,6 +347,7 @@ impl Tenant {
             if !tenant.is_active() || expected_epoch.is_some_and(|ep| tenant.access_epoch != ep) {
                 err_code!("Tenant access was revoked during upload", 403);
             }
+            let object_key = att.get_file_path_in_cell(Some(&tenant.home_region))?;
             match conn {
                 #[cfg(mysql)]
                 DbConnInner::Mysql(c) => diesel::insert_into(attachments::table)
@@ -433,7 +433,6 @@ impl Tenant {
         clear_pending_id: Option<&str>,
     ) -> EmptyResult {
         let release = release.max(0);
-        let object_key = att.get_file_path();
         conn.transaction::<(), crate::Error, _>(|conn| {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
                 err_code!("Tenant not found", 403);
@@ -441,6 +440,7 @@ impl Tenant {
             if !tenant.is_active() || expected_epoch.is_some_and(|ep| tenant.access_epoch != ep) {
                 err_code!("Tenant access was revoked during upload", 403);
             }
+            let object_key = att.get_file_path_in_cell(Some(&tenant.home_region))?;
             let updated: usize = diesel::update(
                 attachments::table
                     .filter(attachments::id.eq(&att.id))
@@ -513,7 +513,7 @@ impl Tenant {
         tid: &str,
         cipher: &Cipher,
         max_authority_age_secs: i64,
-        home_region: &str,
+        served_cells: &[String],
         default_max_ciphers: i64,
         now_ts: i64,
     ) -> EmptyResult {
@@ -524,7 +524,7 @@ impl Tenant {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
                 err_code!("Tenant not found", 403);
             };
-            validate_tenant_growth_tx(&tenant, home_region, now_ts, max_authority_age_secs)?;
+            validate_tenant_growth_tx(&tenant, served_cells, now_ts, max_authority_age_secs)?;
 
             let existing: Option<Cipher> = ciphers::table
                 .find(&cipher.uuid)
@@ -598,12 +598,12 @@ impl Tenant {
         tenant_id: &str,
         cipher: &Cipher,
         max_authority_age_secs: i64,
-        home_region: &str,
+        served_cells: &[String],
         default_max_ciphers: i64,
         conn: &DbConn,
     ) -> EmptyResult {
         let tid = tenant_id.to_owned();
-        let region = home_region.to_owned();
+        let cells = served_cells.to_vec();
         conn.run(move |conn| {
             if !is_postgresql(conn) {
                 err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
@@ -613,7 +613,7 @@ impl Tenant {
                 &tid,
                 cipher,
                 max_authority_age_secs,
-                &region,
+                &cells,
                 default_max_ciphers,
                 Utc::now().timestamp(),
             )
@@ -742,20 +742,11 @@ pub fn committed_bytes(conn: &mut DbConnInner, tenant_id: &str) -> QueryResult<i
 
 fn validate_tenant_growth_tx(
     tenant: &Tenant,
-    home_region: &str,
+    served_cells: &[String],
     now_ts: i64,
     max_authority_age_secs: i64,
 ) -> EmptyResult {
-    if !home_region.trim().is_empty() && !tenant.home_region.trim().is_empty() && tenant.home_region != home_region {
-        err_code!("Tenant belongs to a different region", 403);
-    }
-    if !tenant.is_active() {
-        err_code!(format!("Tenant is not active (status: {})", tenant.status), 403);
-    }
-    if !tenant.has_fresh_authority(now_ts, max_authority_age_secs) {
-        err_code!("Tenant authority cache is stale; failing closed", 503);
-    }
-    Ok(())
+    crate::tenancy::check_tenant_active_for_cells(tenant, served_cells, now_ts, max_authority_age_secs)
 }
 
 impl TenantErasedSubject {
@@ -855,17 +846,17 @@ impl TenantRecoveryBundle {
     pub fn upsert_personal_kit_inner(
         conn: &mut DbConnInner,
         row: &Self,
-        check_grant: Option<(&str, i64)>,
+        check_grant: Option<(&[String], i64)>,
         now: i64,
     ) -> EmptyResult {
         use diesel::{dsl::sql, sql_types::BigInt};
 
         conn.transaction::<_, crate::Error, _>(|conn| {
-            if let Some((home_region, max_authority_age_secs)) = check_grant {
+            if let Some((served_cells, max_authority_age_secs)) = check_grant {
                 let Some(tenant) = lock_tenant(conn, &row.tenant_id)? else {
                     err_code!("Tenant not found", 403);
                 };
-                validate_tenant_growth_tx(&tenant, home_region, now, max_authority_age_secs)?;
+                validate_tenant_growth_tx(&tenant, served_cells, now, max_authority_age_secs)?;
 
                 let bundle_sql = octet_sum_sql(conn, &["wrapped_user_key", "wrapped_private_key"]);
                 let existing_bytes: i64 = tenant_recovery_bundles::table
@@ -915,17 +906,17 @@ impl TenantRecoveryBundle {
     /// prior personal kit for this user (hosted multi-tenant mode).
     pub async fn upsert_personal_kit_enforcing_grant(
         &self,
-        home_region: &str,
+        served_cells: &[String],
         max_authority_age_secs: i64,
         conn: &DbConn,
     ) -> EmptyResult {
         let row = self.clone();
-        let region = home_region.to_owned();
+        let cells = served_cells.to_vec();
         conn.run(move |conn| {
             if !is_postgresql(conn) {
                 err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
             }
-            Self::upsert_personal_kit_inner(conn, &row, Some((&region, max_authority_age_secs)), Utc::now().timestamp())
+            Self::upsert_personal_kit_inner(conn, &row, Some((&cells, max_authority_age_secs)), Utc::now().timestamp())
         })
         .await
     }

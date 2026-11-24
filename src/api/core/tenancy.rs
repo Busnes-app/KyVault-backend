@@ -115,7 +115,8 @@ async fn get_tenancy_status(headers: Headers, conn: DbConn) -> JsonResult {
     Ok(Json(json!({
         "multiTenant": CONFIG.is_multi_tenant(),
         "tenantId": tid,
-        "homeRegion": CONFIG.home_region(),
+        "homeRegion": tenant.as_ref().map_or("", |t| t.home_region.as_str()),
+        "cells": CONFIG.served_cells(),
         "status": tenant.as_ref().map_or("active", |t| t.status.as_str()),
         "appEnabled": tenant.as_ref().is_none_or(|t| t.app_enabled),
         "storagePoolBytes": tenant.as_ref().map(|t| t.storage_pool_bytes),
@@ -171,7 +172,7 @@ async fn put_personal_recovery(data: Json<PersonalRecoveryPayload>, headers: Hea
     );
     if CONFIG.is_multi_tenant() {
         bundle
-            .upsert_personal_kit_enforcing_grant(&CONFIG.home_region(), CONFIG.tenancy_authority_max_age_secs(), &conn)
+            .upsert_personal_kit_enforcing_grant(&CONFIG.served_cells(), CONFIG.tenancy_authority_max_age_secs(), &conn)
             .await?;
     } else {
         bundle.upsert_personal_kit(&conn).await?;

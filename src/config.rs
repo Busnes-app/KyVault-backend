@@ -875,8 +875,8 @@ make_config! {
     tenancy {
         /// Tenancy mode |> ("single" or "multi") Enables strict multi-tenant isolation for hosted KyVault deployments
         tenancy_mode:                   String, false,  def,    "single".to_owned();
-        /// Home region |> Region slug owned by this KyVault instance (required when TENANCY_MODE=multi)
-        home_region:                    String, false,  def,    String::new();
+        /// Served cells |> Comma-separated cell slugs served by this KyVault deployment (1..=32 slugs matching ^[a-z][a-z0-9-]{1,31}$, required when TENANCY_MODE=multi)
+        ky_cells:                       String, false,  def,    String::new();
         /// Internal management API secret |> Pre-provisioned shared secret (>= 32 chars) authenticating kyvault-worker calls to /internal/tenancy/v1/* (required when TENANCY_MODE=multi)
         tenancy_internal_api_secret:    Pass,   false,  option;
         /// Authority freshness cap in seconds |> Bounded between 60 and 900 seconds (15 min cap)
@@ -1186,8 +1186,8 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     match cfg.tenancy_mode.to_ascii_lowercase().as_str() {
         "single" => {}
         "multi" => {
-            if cfg.home_region.trim().is_empty() {
-                err!("`HOME_REGION` must be set when `TENANCY_MODE=multi`");
+            if let Err(msg) = crate::tenancy::parse_ky_cells(&cfg.ky_cells) {
+                err!(msg);
             }
             if !cfg.sso_enabled || !cfg.sso_only {
                 err!("`SSO_ENABLED=true` and `SSO_ONLY=true` are required when `TENANCY_MODE=multi`");
@@ -1778,6 +1778,12 @@ impl Config {
     /// Tests whether multi-tenant KyVault mode is active.
     pub fn is_multi_tenant(&self) -> bool {
         self.tenancy_mode().eq_ignore_ascii_case("multi")
+    }
+
+    /// Returns the sorted, validated list of cell slugs served by this deployment.
+    /// Returns an empty Vec if `KY_CELLS` is unset or invalid (callers fail closed).
+    pub fn served_cells(&self) -> Vec<String> {
+        crate::tenancy::parse_ky_cells(&self.ky_cells()).unwrap_or_default()
     }
 
     /// Tests whether Bitwarden Send is allowed. Unconditionally disabled in hosted multi-tenant mode (v1 policy).

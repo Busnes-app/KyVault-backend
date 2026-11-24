@@ -1,6 +1,8 @@
 pub mod ops;
 pub mod pubsub;
 
+use std::collections::BTreeSet;
+
 use chrono::Utc;
 
 use crate::{
@@ -11,6 +13,70 @@ use crate::{
         models::{Attachment, Tenant, User},
     },
 };
+
+/// Maximum number of cells one app deployment may serve (tenancy design C2 / 32-cell cap).
+pub const MAX_SERVED_CELLS: usize = 32;
+
+/// Validates a cell / home_region slug (`^[a-z][a-z0-9-]{1,31}$`).
+pub fn is_valid_cell_slug(slug: &str) -> bool {
+    let bytes = slug.as_bytes();
+    if !(2..=32).contains(&bytes.len()) {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    bytes[1..].iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Parses and validates a comma-separated `KY_CELLS` configuration value.
+/// Returns a sorted, deduplicated list of 1..=32 valid cell slugs.
+pub fn parse_ky_cells(raw: &str) -> Result<Vec<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("`KY_CELLS` must list at least one cell slug when `TENANCY_MODE=multi`".to_owned());
+    }
+    let mut seen = BTreeSet::new();
+    for part in trimmed.split(',') {
+        let slug = part.trim();
+        if slug.is_empty() {
+            return Err("`KY_CELLS` contains an empty entry".to_owned());
+        }
+        if !is_valid_cell_slug(slug) {
+            return Err(format!(
+                "`KY_CELLS` contains invalid cell slug '{slug}' (must match ^[a-z][a-z0-9-]{{1,31}}$)"
+            ));
+        }
+        if !seen.insert(slug.to_owned()) {
+            return Err(format!("`KY_CELLS` contains duplicate cell slug '{slug}'"));
+        }
+        if seen.len() > MAX_SERVED_CELLS {
+            return Err(format!("`KY_CELLS` exceeds maximum of {MAX_SERVED_CELLS} cells"));
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Returns true iff `cell` is a valid slug present in `served_cells`.
+/// Always returns false when `cell` or `served_cells` is empty (fail closed).
+pub fn is_cell_served(served_cells: &[String], cell: &str) -> bool {
+    !cell.is_empty() && is_valid_cell_slug(cell) && served_cells.iter().any(|c| c == cell)
+}
+
+/// Cell-scoped attachment object key relative to the attachments root.
+pub fn attachment_object_key(cell: &str, tenant_id: &str, cipher_uuid: &str, att_id: &str) -> String {
+    format!("cells/{cell}/tenants/{tenant_id}/attachments/{cipher_uuid}/{att_id}")
+}
+
+/// Cell-scoped send object key relative to the sends root.
+pub fn send_object_key(cell: &str, tenant_id: &str, send_uuid: &str, file_id: &str) -> String {
+    format!("cells/{cell}/tenants/{tenant_id}/sends/{send_uuid}/{file_id}")
+}
+
+/// Cell-scoped tenant prefix used for whole-tenant sweeps.
+pub fn tenant_prefix_object_key(cell: &str, tenant_id: &str) -> String {
+    format!("cells/{cell}/tenants/{tenant_id}/")
+}
 
 /// Canonicalizes an OIDC issuer URL by trimming any trailing slash so
 /// `TenantErasedSubject` and `SsoUser` lookups stay consistent across Rust and worker calls.
@@ -46,19 +112,20 @@ pub fn ensure_same_tenant(a: Option<&str>, b: Option<&str>, context: &str) -> Em
     }
 }
 
-/// Verifies that a tenant exists, belongs to this deployment's HOME_REGION,
-/// is active and app-enabled, and has fresh KyIdentity authority (<= 15 min cap).
-///
-/// Ordinary vault access never accepts `export_only` sessions (Design §4.1 & §11 P3).
-pub async fn check_tenant_active(tenant_id: &str, conn: &DbConn) -> Result<Tenant, crate::Error> {
-    let Some(tenant) = Tenant::find_by_id(tenant_id, conn).await else {
-        err_code!("Tenant not found or not provisioned in this region", 403);
-    };
-
-    let home_region = CONFIG.home_region();
-    if !home_region.trim().is_empty() && !tenant.home_region.trim().is_empty() && tenant.home_region != home_region {
-        warn!("Tenant {tenant_id} belongs to region '{}', rejected by region '{home_region}'", tenant.home_region);
-        err_code!("Tenant belongs to a different region", 403);
+/// Pure C5 + active + authority-freshness check for a loaded tenant against a deployment's
+/// configured `served_cells`. Always fails closed on empty/unknown/unserved `home_region`.
+pub fn check_tenant_active_for_cells(
+    tenant: &Tenant,
+    served_cells: &[String],
+    now_ts: i64,
+    max_authority_age_secs: i64,
+) -> EmptyResult {
+    if !is_cell_served(served_cells, &tenant.home_region) {
+        warn!(
+            "Tenant {} belongs to cell '{}', refused by deployment serving {:?}",
+            tenant.id, tenant.home_region, served_cells
+        );
+        err_code!("Tenant belongs to a cell not served by this deployment", 403);
     }
 
     if !tenant.app_enabled {
@@ -69,13 +136,37 @@ pub async fn check_tenant_active(tenant_id: &str, conn: &DbConn) -> Result<Tenan
         err_code!(format!("Tenant is not active (status: {})", tenant.status), 403);
     }
 
-    let now_ts = Utc::now().timestamp();
-    if !tenant.has_fresh_authority(now_ts, CONFIG.tenancy_authority_max_age_secs()) {
-        warn!("Tenant {tenant_id} authority cache is stale or missing; failing closed");
+    if !tenant.has_fresh_authority(now_ts, max_authority_age_secs) {
+        warn!("Tenant {} authority cache is stale or missing; failing closed", tenant.id);
         err_code!("Tenant authority cache is stale", 503);
     }
 
+    Ok(())
+}
+
+/// Verifies that a tenant exists, belongs to one of this deployment's `KY_CELLS`,
+/// is active and app-enabled, and has fresh KyIdentity authority (<= 15 min cap).
+///
+/// Ordinary vault access never accepts `export_only` sessions (Design §4.1 & §11 P3).
+pub async fn check_tenant_active(tenant_id: &str, conn: &DbConn) -> Result<Tenant, crate::Error> {
+    let Some(tenant) = Tenant::find_by_id(tenant_id, conn).await else {
+        err_code!("Tenant not found or not provisioned in this cell", 403);
+    };
+
+    let served_cells = CONFIG.served_cells();
+    check_tenant_active_for_cells(
+        &tenant,
+        &served_cells,
+        Utc::now().timestamp(),
+        CONFIG.tenancy_authority_max_age_secs(),
+    )?;
     Ok(tenant)
+}
+
+/// Convenience wrapper verifying a user is tenant-bound and their tenant is active in a served cell.
+pub async fn require_user_tenant_active(user: &User, conn: &DbConn) -> Result<Tenant, crate::Error> {
+    let tid = require_user_tenant(user)?;
+    check_tenant_active(tid, conn).await
 }
 
 /// Transactionally checks tenant active status, authority freshness, and reserved storage growth
@@ -92,11 +183,12 @@ pub async fn reserve_storage_grant(
         return Ok(None);
     }
     let tenant_id = require_user_tenant(user)?;
+    let served_cells = CONFIG.served_cells();
     let epoch = Tenant::reserve_storage_grant(
         tenant_id,
         additional_bytes,
         CONFIG.tenancy_authority_max_age_secs(),
-        &CONFIG.home_region(),
+        &served_cells,
         conn,
     )
     .await?;
@@ -284,16 +376,21 @@ mod tests {
     }
 
     #[test]
-    fn tenant_prefixed_attachment_and_send_paths() {
+    fn cell_and_tenant_prefixed_attachment_and_send_paths() {
         let cipher_id = CipherId::from("11111111-2222-3333-4444-555555555555".to_owned());
         let mut att = Attachment::new(AttachmentId("att-id-1".to_owned()), cipher_id, "doc.pdf".to_owned(), 1024, None);
-        let legacy_path = att.get_file_path();
+        let legacy_path = att.get_file_path_in_cell(None).unwrap();
         assert!(!legacy_path.contains("tenants/"));
+        assert!(!legacy_path.contains("cells/"));
 
         att.tenant_id = Some("org-alpha".to_owned());
-        let tenant_path = att.get_file_path();
+        assert!(att.get_file_path_in_cell(None).is_err(), "multi-tenant key must require a valid cell");
+        assert!(att.get_file_path_in_cell(Some("../bad")).is_err());
+        let tenant_path = att.get_file_path_in_cell(Some("us-east-2")).unwrap();
         assert!(
-            tenant_path.ends_with("tenants/org-alpha/attachments/11111111-2222-3333-4444-555555555555/att-id-1"),
+            tenant_path.ends_with(
+                "cells/us-east-2/tenants/org-alpha/attachments/11111111-2222-3333-4444-555555555555/att-id-1"
+            ),
             "unexpected tenant attachment path: {tenant_path}"
         );
 
@@ -305,8 +402,39 @@ mod tests {
             Utc::now().naive_utc(),
         );
         send.tenant_id = Some("org-alpha".to_owned());
-        let send_path = send.get_file_path("file-1");
-        assert!(send_path.contains("tenants/org-alpha/sends/"), "unexpected tenant send path: {send_path}");
+        assert!(send.get_file_path_in_cell("file-1", None).is_err());
+        let send_path = send.get_file_path_in_cell("file-1", Some("us-east-2")).unwrap();
+        assert!(
+            send_path.contains("cells/us-east-2/tenants/org-alpha/sends/"),
+            "unexpected tenant send path: {send_path}"
+        );
+    }
+
+    #[test]
+    fn parse_ky_cells_validates_slug_format_duplicates_and_bounds() {
+        assert_eq!(parse_ky_cells("us-east-1").unwrap(), vec!["us-east-1"]);
+        assert_eq!(parse_ky_cells(" us-east-1 , us-east-2 ").unwrap(), vec!["us-east-1", "us-east-2"]);
+        assert!(parse_ky_cells("").is_err());
+        assert!(parse_ky_cells("   ").is_err());
+        assert!(parse_ky_cells("us-east-1,").is_err());
+        assert!(parse_ky_cells("us-east-1,us-east-1").is_err());
+        assert!(parse_ky_cells("US-EAST-1").is_err());
+        assert!(parse_ky_cells("a").is_err());
+        assert!(parse_ky_cells("1us-east").is_err());
+        assert!(parse_ky_cells("us_east_1").is_err());
+        assert!(parse_ky_cells(&"a".repeat(33)).is_err());
+        assert!(parse_ky_cells(&"a".repeat(32)).is_ok());
+
+        let max_cells = (1..=MAX_SERVED_CELLS).map(|i| format!("us-east-{i}")).collect::<Vec<_>>().join(",");
+        assert_eq!(parse_ky_cells(&max_cells).unwrap().len(), MAX_SERVED_CELLS);
+        let too_many = (1..=MAX_SERVED_CELLS + 1).map(|i| format!("us-east-{i}")).collect::<Vec<_>>().join(",");
+        assert!(parse_ky_cells(&too_many).is_err());
+
+        let served = parse_ky_cells("us-east-1,us-east-2").unwrap();
+        assert!(is_cell_served(&served, "us-east-1"));
+        assert!(is_cell_served(&served, "us-east-2"));
+        assert!(!is_cell_served(&served, "eu-west-1"));
+        assert!(!is_cell_served(&served, ""));
     }
 
     #[test]
