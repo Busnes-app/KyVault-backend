@@ -1,0 +1,97 @@
+package config
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func setBase(t *testing.T) {
+	for k, v := range map[string]string{
+		"DATABASE_URL":                "postgres://w@db/worker",
+		"VAULT_INTERNAL_API_URL":      "http://vault:8000",
+		"TENANCY_INTERNAL_API_SECRET": strings.Repeat("s", 32),
+		"SSO_AUTHORITY":               "https://id.example/",
+		"SSO_CLIENT_ID":               "kyvault",
+		"SSO_CLIENT_SECRET":           "secret",
+		"SYNC_WEBHOOK_SECRET":         strings.Repeat("w", 32),
+		"DATA_FOLDER":                 "/data",
+	} {
+		t.Setenv(k, v)
+	}
+}
+
+func TestDefaults(t *testing.T) {
+	setBase(t)
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OIDCIssuer != "https://id.example" || cfg.KyIdentityURL != cfg.OIDCIssuer || cfg.OIDCJWKSURL != "https://id.example/.well-known/jwks.json" {
+		t.Fatalf("issuer defaults: %+v", cfg)
+	}
+	if cfg.AttachmentsRoot != "/data/attachments" || cfg.SendsRoot != "/data/sends" {
+		t.Fatalf("roots: %q %q", cfg.AttachmentsRoot, cfg.SendsRoot)
+	}
+	if cfg.OrgPollInterval != 30*time.Second || cfg.ReconcileFromZero {
+		t.Fatalf("intervals: %+v", cfg)
+	}
+}
+
+func TestS3RootsAndClamp(t *testing.T) {
+	setBase(t)
+	t.Setenv("DATA_FOLDER", "s3://bucket/data/")
+	t.Setenv("S3_ACCESS_KEY_ID", "k")
+	t.Setenv("S3_SECRET_ACCESS_KEY", "s")
+	t.Setenv("ORG_POLL_INTERVAL", "5m")
+	t.Setenv("TENANCY_RECONCILE_FROM_ZERO", "true")
+	cfg, err := LoadFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AttachmentsRoot != "s3://bucket/data/attachments" || cfg.SendsRoot != "s3://bucket/data/sends" {
+		t.Fatalf("roots: %q %q", cfg.AttachmentsRoot, cfg.SendsRoot)
+	}
+	if cfg.OrgPollInterval != MaxPollInterval || len(cfg.Warnings) != 1 || !cfg.ReconcileFromZero {
+		t.Fatalf("clamp: %v %v", cfg.OrgPollInterval, cfg.Warnings)
+	}
+}
+
+func TestRefusals(t *testing.T) {
+	cases := map[string]string{
+		"TENANCY_INTERNAL_API_SECRET": "short",
+		"VAULT_INTERNAL_API_URL":      "http://vault.example.com",
+		"SYNC_WEBHOOK_SECRET":         "",
+		"SSO_CLIENT_SECRET":           "",
+		"ORG_POLL_INTERVAL":           "soon",
+		"TENANCY_RECONCILE_FROM_ZERO": "yes please",
+		"DATABASE_URL":                "mysql://x",
+	}
+	for k, v := range cases {
+		t.Run(k, func(t *testing.T) {
+			setBase(t)
+			t.Setenv(k, v)
+			if _, err := LoadFromEnv(); err == nil {
+				t.Fatalf("%s=%q accepted", k, v)
+			}
+		})
+	}
+	setBase(t)
+	t.Setenv("ATTACHMENTS_FOLDER", "s3://b/a")
+	if _, err := LoadFromEnv(); err == nil {
+		t.Fatal("s3 root without credentials accepted")
+	}
+}
+
+func TestValidateInternalURL(t *testing.T) {
+	for _, ok := range []string{"http://127.0.0.1:8000", "http://localhost:8000", "http://vault:8000", "http://10.0.0.5", "https://vault.example.com"} {
+		if err := ValidateInternalURL(ok); err != nil {
+			t.Errorf("%s refused: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"http://vault.example.com", "ftp://vault", "http://u:p@vault", "vault:8000", "http://vault?x=1"} {
+		if ValidateInternalURL(bad) == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+}

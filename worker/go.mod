@@ -3,8 +3,7 @@ module github.com/Busnes-app/kyvault-worker
 go 1.26.6
 
 require (
-	github.com/Busnes-app/ky-primitives v0.10.0
-	github.com/google/uuid v1.6.0
+	github.com/Busnes-app/ky-primitives v0.10.2-0.20261124022836-b5f5853be771
 	github.com/jackc/pgx/v5 v5.11.0
 )
 

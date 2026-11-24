@@ -1,152 +1,260 @@
+// Package config loads the worker's environment. Every value is validated here; an
+// unparsable or missing setting refuses startup instead of falling back silently.
 package config
 
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Config holds runtime configuration for the kyvault-worker sidecar.
+// MaxPollInterval is the suite's observation bound (design §7): KyIdentity state is
+// polled at most this far apart.
+const MaxPollInterval = 60 * time.Second
+
+// MinInternalSecretLen is the minimum TENANCY_INTERNAL_API_SECRET length.
+const MinInternalSecretLen = 32
+
 type Config struct {
-	ListenAddr   string
-	DatabaseURL  string
-	HomeRegion   string
-	NotifyChan   string
-	WorkerOrigin string
+	ListenAddr  string
+	DatabaseURL string
 
-	// KyIdentity control plane & OIDC verification.
-	KyIdentityBaseURL   string
-	KyIdentityToken     string
-	OIDCIssuer          string
-	OIDCAudience        string
-	OIDCJWKSURL         string
-	SyncWebhookSecret   string
-	SyncAllowInsecureHTTP bool
+	// Rust vault private management API.
+	VaultAPIURL    string
+	InternalSecret string
 
-	// Polling intervals.
-	OrgPollInterval       time.Duration
-	ErasedPollInterval    time.Duration
-	StorageReportInterval time.Duration
-	PruneInterval         time.Duration
+	// KyIdentity: suite directory (client_secret_basic), OIDC logout, signed webhooks.
+	KyIdentityURL     string
+	OIDCIssuer        string
+	ClientID          string
+	ClientSecret      string
+	OIDCJWKSURL       string
+	SyncWebhookSecret string
 
-	// Object storage erasure configuration (S3-compatible and/or local filesystem).
+	OrgPollInterval    time.Duration
+	ErasedPollInterval time.Duration
+	StorageInterval    time.Duration
+	CleanupInterval    time.Duration
+	PruneInterval      time.Duration
+	ReconcileFromZero  bool
+
+	StorageWantBytes   int64
+	StorageRenewBefore time.Duration
+
+	// Storage roots, exactly as the Rust server resolves them: a local directory or
+	// s3://bucket/prefix. Object keys (tenants/<tid>/...) are relative to these.
+	AttachmentsRoot string
+	SendsRoot       string
+
 	S3Endpoint        string
-	S3Bucket          string
 	S3Region          string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 	S3ForcePathStyle  bool
-	S3Prefix          string
-	LocalDataFolder   string
+
+	// Warnings lists settings LoadFromEnv adjusted, for the caller to log.
+	Warnings []string
 }
 
-// LoadFromEnv loads worker configuration from environment variables and validates
-// fail-closed multi-tenant invariants.
+// LoadFromEnv reads and validates the configuration.
 func LoadFromEnv() (Config, error) {
-	cfg := Config{
-		ListenAddr:            envOr("WORKER_LISTEN_ADDR", "127.0.0.1:8085"),
-		DatabaseURL:           strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		HomeRegion:            strings.TrimSpace(envOr("HOME_REGION", "us")),
-		NotifyChan:            strings.TrimSpace(envOr("TENANCY_PG_NOTIFY_CHANNEL", "kyvault_notify")),
-		WorkerOrigin:          strings.TrimSpace(envOr("WORKER_ORIGIN", "kyvault-worker")),
-		KyIdentityBaseURL:     strings.TrimRight(strings.TrimSpace(os.Getenv("KYIDENTITY_BASE_URL")), "/"),
-		KyIdentityToken:       strings.TrimSpace(os.Getenv("KYIDENTITY_SUITE_TOKEN")),
-		OIDCIssuer:            strings.TrimRight(strings.TrimSpace(os.Getenv("SSO_AUTHORITY")), "/"),
-		OIDCAudience:          strings.TrimSpace(os.Getenv("SSO_CLIENT_ID")),
-		OIDCJWKSURL:           strings.TrimSpace(os.Getenv("OIDC_JWKS_URL")),
-		SyncWebhookSecret:     strings.TrimSpace(os.Getenv("SYNC_WEBHOOK_SECRET")),
-		SyncAllowInsecureHTTP: envBool("SYNC_ALLOW_INSECURE_HTTP", false),
-		OrgPollInterval:       envDuration("ORG_POLL_INTERVAL", 60*time.Second),
-		ErasedPollInterval:    envDuration("ERASED_POLL_INTERVAL", 60*time.Second),
-		StorageReportInterval: envDuration("STORAGE_REPORT_INTERVAL", 60*time.Second),
-		PruneInterval:         envDuration("PRUNE_INTERVAL", time.Hour),
-		S3Endpoint:            strings.TrimRight(strings.TrimSpace(os.Getenv("S3_ENDPOINT")), "/"),
-		S3Bucket:              strings.TrimSpace(os.Getenv("S3_BUCKET")),
-		S3Region:              strings.TrimSpace(envOr("S3_REGION", "us-east-1")),
-		S3AccessKeyID:         strings.TrimSpace(os.Getenv("S3_ACCESS_KEY_ID")),
-		S3SecretAccessKey:     strings.TrimSpace(os.Getenv("S3_SECRET_ACCESS_KEY")),
-		S3ForcePathStyle:      envBool("S3_FORCE_PATH_STYLE", true),
-		S3Prefix:              strings.Trim(strings.TrimSpace(os.Getenv("S3_KEY_PREFIX")), "/"),
-		LocalDataFolder:       strings.TrimSpace(os.Getenv("DATA_FOLDER")),
+	var errs []error
+	durationVar := func(key string, def time.Duration) time.Duration {
+		d, err := envDuration(key, def)
+		errs = append(errs, err)
+		return d
+	}
+	boolVar := func(key string, def bool) bool {
+		b, err := envBool(key, def)
+		errs = append(errs, err)
+		return b
 	}
 
-	if cfg.OIDCIssuer == "" && cfg.KyIdentityBaseURL != "" {
-		cfg.OIDCIssuer = cfg.KyIdentityBaseURL
+	issuer := strings.TrimRight(env("SSO_AUTHORITY"), "/")
+	dataFolder := env("DATA_FOLDER")
+	cfg := Config{
+		ListenAddr:         envOr("WORKER_LISTEN_ADDR", "127.0.0.1:8085"),
+		DatabaseURL:        env("DATABASE_URL"),
+		VaultAPIURL:        strings.TrimRight(env("VAULT_INTERNAL_API_URL"), "/"),
+		InternalSecret:     env("TENANCY_INTERNAL_API_SECRET"),
+		KyIdentityURL:      strings.TrimRight(envOr("KYIDENTITY_BASE_URL", issuer), "/"),
+		OIDCIssuer:         issuer,
+		ClientID:           env("SSO_CLIENT_ID"),
+		ClientSecret:       env("SSO_CLIENT_SECRET"),
+		OIDCJWKSURL:        env("OIDC_JWKS_URL"),
+		SyncWebhookSecret:  env("SYNC_WEBHOOK_SECRET"),
+		OrgPollInterval:    durationVar("ORG_POLL_INTERVAL", 30*time.Second),
+		ErasedPollInterval: durationVar("ERASED_POLL_INTERVAL", 30*time.Second),
+		StorageInterval:    durationVar("STORAGE_REPORT_INTERVAL", 30*time.Second),
+		CleanupInterval:    durationVar("CLEANUP_INTERVAL", 60*time.Second),
+		PruneInterval:      durationVar("PRUNE_INTERVAL", time.Hour),
+		ReconcileFromZero:  boolVar("TENANCY_RECONCILE_FROM_ZERO", false),
+		StorageRenewBefore: durationVar("STORAGE_RENEW_BEFORE", 180*time.Second),
+		AttachmentsRoot:    envOr("ATTACHMENTS_FOLDER", joinRoot(dataFolder, "attachments")),
+		SendsRoot:          envOr("SENDS_FOLDER", joinRoot(dataFolder, "sends")),
+		S3Endpoint:         strings.TrimRight(env("S3_ENDPOINT"), "/"),
+		S3Region:           envOr("S3_REGION", "us-east-1"),
+		S3AccessKeyID:      env("S3_ACCESS_KEY_ID"),
+		S3SecretAccessKey:  env("S3_SECRET_ACCESS_KEY"),
+		S3ForcePathStyle:   boolVar("S3_FORCE_PATH_STYLE", true),
+	}
+	want, err := envInt("STORAGE_WANT_BYTES", 256<<20)
+	errs = append(errs, err)
+	cfg.StorageWantBytes = want
+
+	if err := errors.Join(errs...); err != nil {
+		return Config{}, err
+	}
+	for _, d := range []struct {
+		name string
+		v    *time.Duration
+	}{
+		{"ORG_POLL_INTERVAL", &cfg.OrgPollInterval},
+		{"ERASED_POLL_INTERVAL", &cfg.ErasedPollInterval},
+		{"STORAGE_REPORT_INTERVAL", &cfg.StorageInterval},
+		{"CLEANUP_INTERVAL", &cfg.CleanupInterval},
+	} {
+		if *d.v > MaxPollInterval {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf("%s %s clamped to %s", d.name, *d.v, MaxPollInterval))
+			*d.v = MaxPollInterval
+		}
 	}
 	if cfg.OIDCJWKSURL == "" && cfg.OIDCIssuer != "" {
 		cfg.OIDCJWKSURL = cfg.OIDCIssuer + "/.well-known/jwks.json"
 	}
-
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
-// Validate checks required settings and safe identifier constraints.
+// Validate checks required settings.
 func (c Config) Validate() error {
-	if c.DatabaseURL == "" {
-		return errors.New("DATABASE_URL is required")
-	}
-	if !strings.HasPrefix(c.DatabaseURL, "postgres://") && !strings.HasPrefix(c.DatabaseURL, "postgresql://") {
-		return errors.New("DATABASE_URL must be a PostgreSQL connection string")
-	}
-	if c.HomeRegion == "" {
-		return errors.New("HOME_REGION is required")
-	}
-	if !isSafeIdentifier(c.NotifyChan) {
-		return fmt.Errorf("TENANCY_PG_NOTIFY_CHANNEL %q must contain only [a-zA-Z0-9_]", c.NotifyChan)
-	}
-	if c.S3Bucket != "" && (c.S3AccessKeyID == "" || c.S3SecretAccessKey == "") {
-		return errors.New("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are required when S3_BUCKET is set")
-	}
-	return nil
-}
-
-func isSafeIdentifier(s string) bool {
-	if s == "" || len(s) > 63 {
-		return false
-	}
-	for _, r := range s {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_') {
-			return false
+	var errs []error
+	req := func(name, v string) {
+		if v == "" {
+			errs = append(errs, fmt.Errorf("%s is required", name))
 		}
 	}
-	return true
+	req("DATABASE_URL", c.DatabaseURL)
+	req("VAULT_INTERNAL_API_URL", c.VaultAPIURL)
+	req("SSO_AUTHORITY", c.OIDCIssuer)
+	req("SSO_CLIENT_ID", c.ClientID)
+	req("SSO_CLIENT_SECRET", c.ClientSecret)
+	req("SYNC_WEBHOOK_SECRET", c.SyncWebhookSecret)
+
+	if c.DatabaseURL != "" && !strings.HasPrefix(c.DatabaseURL, "postgres://") && !strings.HasPrefix(c.DatabaseURL, "postgresql://") {
+		errs = append(errs, errors.New("DATABASE_URL must be a PostgreSQL connection string"))
+	}
+	if len(c.InternalSecret) < MinInternalSecretLen {
+		errs = append(errs, fmt.Errorf("TENANCY_INTERNAL_API_SECRET must be at least %d characters", MinInternalSecretLen))
+	}
+	if c.VaultAPIURL != "" {
+		if err := ValidateInternalURL(c.VaultAPIURL); err != nil {
+			errs = append(errs, fmt.Errorf("VAULT_INTERNAL_API_URL: %w", err))
+		}
+	}
+	if len(c.SyncWebhookSecret) > 0 && len(c.SyncWebhookSecret) < 32 {
+		errs = append(errs, errors.New("SYNC_WEBHOOK_SECRET must be at least 32 characters"))
+	}
+	if c.StorageWantBytes < 0 || c.StorageWantBytes > 1<<53 {
+		errs = append(errs, errors.New("STORAGE_WANT_BYTES must be 0 to 2^53"))
+	}
+	if c.StorageRenewBefore >= 900*time.Second {
+		errs = append(errs, errors.New("STORAGE_RENEW_BEFORE must be under 900s, the longest grant"))
+	}
+	usesS3 := strings.HasPrefix(c.AttachmentsRoot, "s3://") || strings.HasPrefix(c.SendsRoot, "s3://")
+	if usesS3 && (c.S3AccessKeyID == "" || c.S3SecretAccessKey == "") {
+		errs = append(errs, errors.New("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are required for s3:// storage roots"))
+	}
+	return errors.Join(errs...)
 }
 
+// ValidateInternalURL accepts https anywhere, and plain http only to a loopback, private
+// or single-label (container network) host: the bearer secret never crosses the internet
+// in clear.
+func ValidateInternalURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("must be an absolute URL without credentials, query or fragment")
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsPrivate()) {
+			return nil
+		}
+		if host == "localhost" || !strings.Contains(host, ".") {
+			return nil
+		}
+		return errors.New("plain http is allowed only to a loopback, private or single-label host")
+	default:
+		return errors.New("scheme must be http or https")
+	}
+}
+
+func joinRoot(base, child string) string {
+	if base == "" {
+		return ""
+	}
+	if strings.HasPrefix(base, "s3://") {
+		return strings.TrimRight(base, "/") + "/" + child
+	}
+	return path.Join(base, child)
+}
+
+func env(key string) string { return strings.TrimSpace(os.Getenv(key)) }
+
 func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
+	if v := env(key); v != "" {
 		return v
 	}
 	return fallback
 }
 
-func envBool(key string, fallback bool) bool {
-	v := strings.TrimSpace(os.Getenv(key))
+func envBool(key string, fallback bool) (bool, error) {
+	v := env(key)
 	if v == "" {
-		return fallback
+		return fallback, nil
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
-		return fallback
+		return fallback, fmt.Errorf("%s: not a boolean: %q", key, v)
 	}
-	return b
+	return b, nil
 }
 
-func envDuration(key string, fallback time.Duration) time.Duration {
-	v := strings.TrimSpace(os.Getenv(key))
+func envInt(key string, fallback int64) (int64, error) {
+	v := env(key)
 	if v == "" {
-		return fallback
+		return fallback, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return fallback, fmt.Errorf("%s: not an integer: %q", key, v)
+	}
+	return n, nil
+}
+
+// envDuration accepts a Go duration ("30s") or whole seconds ("30").
+func envDuration(key string, fallback time.Duration) (time.Duration, error) {
+	v := env(key)
+	if v == "" {
+		return fallback, nil
 	}
 	if d, err := time.ParseDuration(v); err == nil && d > 0 {
-		return d
+		return d, nil
 	}
 	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-		return time.Duration(secs) * time.Second
+		return time.Duration(secs) * time.Second, nil
 	}
-	return fallback
+	return fallback, fmt.Errorf("%s: not a positive duration: %q", key, v)
 }
