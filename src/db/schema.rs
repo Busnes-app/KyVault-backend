@@ -334,6 +334,7 @@ table! {
         attempts -> Integer,
         last_error -> Nullable<Text>,
         created_at -> Timestamp,
+        reserved_bytes -> BigInt,
     }
 }
 

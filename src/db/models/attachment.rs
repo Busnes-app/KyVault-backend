@@ -176,7 +176,7 @@ impl Attachment {
                 if CONFIG.is_multi_tenant()
                     && let Some(ref tid) = self.tenant_id
                     && let Err(queue_err) =
-                        super::Tenant::stage_attachment_cleanup(tid, None, &file_path, false, conn).await
+                        super::Tenant::stage_attachment_cleanup(tid, None, &file_path, false, 0, conn).await
                 {
                     error!("Failed to queue durable cleanup for deleted attachment {file_path}: {queue_err}");
                 }

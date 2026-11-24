@@ -202,17 +202,26 @@ pub async fn stage_attachment_cleanup(
     user: &User,
     object_key: &str,
     in_flight: bool,
+    reserved_bytes: i64,
     conn: &DbConn,
 ) -> Result<Option<String>, crate::Error> {
     if !CONFIG.is_multi_tenant() {
         return Ok(None);
     }
     let tenant_id = require_user_tenant(user)?;
-    let id = Tenant::stage_attachment_cleanup(tenant_id, Some(user.uuid.clone()), object_key, in_flight, conn).await?;
+    let id = Tenant::stage_attachment_cleanup(
+        tenant_id,
+        Some(user.uuid.clone()),
+        object_key,
+        in_flight,
+        reserved_bytes,
+        conn,
+    )
+    .await?;
     Ok(Some(id))
 }
 
-/// Immediately makes a staged upload cleanup row visible to the cleanup worker.
+/// Returns a staged upload's reserved bytes and makes its cleanup row visible to the worker now.
 pub async fn activate_pending_deletion(pending_id: Option<&str>, conn: &DbConn) {
     if !CONFIG.is_multi_tenant() {
         return;
@@ -240,10 +249,37 @@ pub async fn save_attachment_releasing(
         .await
 }
 
+/// Begins a hosted v2 attachment upload atomically under the tenant lock: enforces per-attachment
+/// cross-replica upload serialization, computes growth delta from the locked current attachment
+/// row, reserves storage, and stages the durable `upload_in_flight` cleanup row.
+/// Returns `Ok(None)` in single-tenant mode.
+pub async fn begin_v2_attachment_upload(
+    user: &User,
+    att: &Attachment,
+    file_size: i64,
+    conn: &DbConn,
+) -> Result<Option<crate::db::models::V2UploadLease>, crate::Error> {
+    if !CONFIG.is_multi_tenant() {
+        return Ok(None);
+    }
+    let tid = require_user_tenant(user)?;
+    let lease = Tenant::begin_v2_attachment_upload(
+        tid,
+        Some(user.uuid.clone()),
+        att,
+        file_size,
+        CONFIG.tenancy_authority_max_age_secs(),
+        &CONFIG.served_cells(),
+        conn,
+    )
+    .await?;
+    Ok(Some(lease))
+}
+
 /// Finalizes a v2 attachment upload: verifies the attachment row still exists (updating
-/// `file_size`), verifies `expected_epoch` in multi-tenant mode, releases `reserved` upload
-/// bytes, and clears `clear_pending_id` in one transaction. On error nothing is released and
-/// any staged cleanup row stays pending.
+/// `file_size`), verifies `expected_epoch` in multi-tenant mode, revalidates actual growth against
+/// `reserved`, releases `reserved` upload bytes, and clears `clear_pending_id` in one transaction.
+/// On error nothing is released and any staged cleanup row stays pending.
 pub async fn finalize_v2_attachment_upload(
     user: &User,
     att: &Attachment,

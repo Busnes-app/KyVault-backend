@@ -12,7 +12,7 @@ use crate::{
         DbConnInner,
         models::{
             Device, TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion, UserId, committed_bytes,
-            lock_tenant,
+            lock_tenant, release_pending_reservations,
         },
         schema::{
             archives, attachments, auth_requests, ciphers, ciphers_collections, collections, collections_groups,
@@ -144,6 +144,7 @@ fn pending(
         object_key: key,
         attempts: 0,
         last_error: None,
+        reserved_bytes: 0,
         created_at: now,
     }
 }
@@ -969,7 +970,7 @@ pub struct PendingItem {
 /// finalization fails (clearing the marker immediately) or `UPLOAD_STAGING_GRACE_SECS` elapses
 /// after a crash so an abandoned upload is still reclaimed.
 pub const UPLOAD_IN_FLIGHT_MARKER: &str = "upload_in_flight";
-const UPLOAD_STAGING_GRACE_SECS: i64 = 900;
+pub const UPLOAD_STAGING_GRACE_SECS: i64 = 900;
 
 #[derive(Debug, Serialize)]
 pub struct PendingResponse {
@@ -1065,6 +1066,8 @@ pub fn cleanup_complete(
             .distinct()
             .load(conn)?;
         affected.sort();
+        let completed: Vec<&str> = req.completed_ids.iter().map(String::as_str).collect();
+        release_pending_reservations(conn, &completed)?;
         resp.deleted = diesel::delete(
             tenant_pending_deletions::table.filter(tenant_pending_deletions::id.eq_any(&req.completed_ids)),
         )
@@ -1389,7 +1392,7 @@ pub fn storage_repair_seq(
 mod tests {
     use super::*;
     use crate::db::{
-        models::{Attachment, AttachmentId, CipherId},
+        models::{Attachment, AttachmentId, CipherId, V2UploadLease},
         test_sqlite_conn,
     };
 
@@ -2508,6 +2511,7 @@ mod tests {
             object_key: "cells/us-east-1/tenants/t1/attachments/missing-cipher/att1".to_owned(),
             attempts: 0,
             last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            reserved_bytes: 0,
             created_at: naive(NOW),
         };
         diesel::insert_into(tenant_pending_deletions::table).values(&staged).execute(c).unwrap();
@@ -2550,6 +2554,7 @@ mod tests {
             object_key: "cells/us-east-1/tenants/t1/attachments/c1/att2".to_owned(),
             attempts: 0,
             last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            reserved_bytes: 0,
             created_at: naive(NOW),
         };
         diesel::insert_into(tenant_pending_deletions::table).values(&staged_ok).execute(c).unwrap();
@@ -2708,6 +2713,7 @@ mod tests {
             object_key: object_key.clone(),
             attempts: 0,
             last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            reserved_bytes: 0,
             created_at: naive(NOW),
         };
         diesel::insert_into(tenant_pending_deletions::table).values(&staged).execute(&mut setup).unwrap();
@@ -2815,6 +2821,7 @@ mod tests {
             object_key: att_ok.get_file_path_in_cell(Some(REGION)).unwrap(),
             attempts: 0,
             last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            reserved_bytes: 0,
             created_at: naive(NOW),
         };
         diesel::insert_into(tenant_pending_deletions::table).values(&staged_ok).execute(&mut setup).unwrap();
@@ -2832,5 +2839,135 @@ mod tests {
         assert_eq!(attachments::table.find("att-ok").first::<Attachment>(&mut setup).unwrap().file_size, 128);
         assert_eq!(tenant(&mut setup, "t1").storage_reserved_bytes, 0);
         assert!(tenant_pending_deletions::table.find("pd-v2-ok").first::<TenantPendingDeletion>(&mut setup).is_err());
+    }
+
+    fn v2_att(aid: &str) -> Attachment {
+        Attachment::new(AttachmentId(aid.to_owned()), CipherId::from("c1".to_owned()), "f".to_owned(), 100, None)
+            .with_tenant_id(Some("t1".to_owned()))
+    }
+
+    /// Tenant t1 with one 100-byte attachment per id and a grant `headroom` bytes above committed.
+    fn v2_setup(c: &mut DbConnInner, attachments: &[&str], headroom: i64) {
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+        cipher(c, "c1", Some("u1"), None, "t1");
+        for aid in attachments {
+            attachment(c, aid, "c1", "t1");
+        }
+        let committed = committed_bytes(c, "t1").unwrap();
+        diesel::update(tenants::table.find("t1"))
+            .set((
+                tenants::storage_ceiling_bytes.eq(committed + headroom),
+                tenants::storage_grant_expires_at.eq(Some(NOW + 600)),
+            ))
+            .execute(c)
+            .unwrap();
+    }
+
+    fn begin(c: &mut DbConnInner, aid: &str, size: i64) -> Result<V2UploadLease, Error> {
+        Tenant::begin_v2_attachment_upload_inner(
+            c,
+            "t1",
+            Some(UserId::from("u1".to_owned())),
+            &v2_att(aid),
+            size,
+            900,
+            &cells(),
+            NOW,
+        )
+    }
+
+    #[test]
+    fn v2_uploads_to_one_attachment_are_serialized_and_sized_from_the_current_row() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["att"], 2_000);
+
+        let first = begin(c, "att", 1_100).unwrap();
+        assert_eq!(first.reserved_bytes, 1_000);
+        // A second upload while the first is in flight would be sized from the same stale row.
+        assert!(begin(c, "att", 1_100).is_err());
+
+        Tenant::finalize_v2_attachment_upload_inner(
+            c,
+            "t1",
+            &v2_att("att"),
+            1_100,
+            first.reserved_bytes,
+            Some(first.access_epoch),
+            Some(&first.pending_cleanup_id),
+        )
+        .unwrap();
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
+
+        // The next upload's growth is measured against the stored 1_100 bytes, not the stale 100.
+        let next = begin(c, "att", 1_200).unwrap();
+        assert_eq!(next.reserved_bytes, 100);
+    }
+
+    #[test]
+    fn v2_upload_admission_counts_other_in_flight_reservations() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["a1", "a2"], 1_500);
+        begin(c, "a1", 1_100).unwrap();
+        // 1_000 already reserved; another 1_000 would pass the 1_500 headroom.
+        assert!(begin(c, "a2", 1_100).is_err());
+        assert!(
+            committed_bytes(c, "t1").unwrap() + tenant(c, "t1").storage_reserved_bytes
+                <= tenant(c, "t1").storage_ceiling_bytes
+        );
+    }
+
+    #[test]
+    fn v2_finalize_rejects_growth_its_reservation_does_not_cover() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["att"], 2_000);
+        let lease = begin(c, "att", 100).unwrap();
+        assert_eq!(lease.reserved_bytes, 0);
+        // The stored size changes after admission, so committing 100 bytes would be unreserved growth.
+        diesel::update(attachments::table.find("att")).set(attachments::file_size.eq(50)).execute(c).unwrap();
+        assert!(
+            Tenant::finalize_v2_attachment_upload_inner(
+                c,
+                "t1",
+                &v2_att("att"),
+                100,
+                lease.reserved_bytes,
+                Some(lease.access_epoch),
+                Some(&lease.pending_cleanup_id),
+            )
+            .is_err()
+        );
+        assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 50);
+    }
+
+    #[test]
+    fn abandoned_upload_returns_its_reservation_exactly_once() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["crashed", "failed"], 5_000);
+        diesel::update(tenants::table.find("t1")).set(tenants::storage_reserved_bytes.eq(500)).execute(c).unwrap();
+
+        // Crash after admission: nothing releases on the request path.
+        let crashed = begin(c, "crashed", 1_100).unwrap();
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 1_500);
+        assert!(cleanup_pending(c, None, &cells(), NOW).unwrap().items.is_empty());
+        let reclaim = cleanup_pending(c, None, &cells(), NOW + UPLOAD_STAGING_GRACE_SECS + 1).unwrap();
+        assert_eq!(reclaim.items.len(), 1);
+        let done = CompleteRequest {
+            completed_ids: vec![crashed.pending_cleanup_id],
+            failed: vec![],
+        };
+        cleanup_complete(c, &done, &cells(), NOW).unwrap();
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 500);
+
+        // Failed finalization: the request path releases, and later reclaim must not release again.
+        let failed = begin(c, "failed", 1_100).unwrap();
+        c.transaction(|c| release_pending_reservations(c, &[failed.pending_cleanup_id.as_str()])).unwrap();
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 500);
+        let done = CompleteRequest {
+            completed_ids: vec![failed.pending_cleanup_id],
+            failed: vec![],
+        };
+        cleanup_complete(c, &done, &cells(), NOW).unwrap();
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 500);
     }
 }

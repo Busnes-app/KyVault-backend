@@ -909,6 +909,18 @@ func uploadAttachment(t *testing.T, base, token, cipher, attID string, size int)
 		map[string]string{"Authorization": "Bearer " + token, "Content-Type": mw.FormDataContentType()}, buf.Bytes())
 }
 
+// callErrUpload is uploadAttachment without t, for use from goroutines.
+func callErrUpload(base, token, cipher, attID string, size int) (resp, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("key", "2.a|b|c")
+	fw, _ := mw.CreateFormFile("data", "blob.bin")
+	_, _ = fw.Write(bytes.Repeat([]byte{0x5a}, size))
+	_ = mw.Close()
+	return callErr("POST", base+"/api/ciphers/"+cipher+"/attachment/"+attID,
+		map[string]string{"Authorization": "Bearer " + token, "Content-Type": mw.FormDataContentType()}, buf.Bytes())
+}
+
 func attachmentKey(cell, tenant, cipher, att string) string {
 	return "attachments/cells/" + cell + "/tenants/" + tenant + "/attachments/" + cipher + "/" + att
 }

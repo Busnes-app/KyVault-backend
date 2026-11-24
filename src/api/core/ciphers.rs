@@ -1458,20 +1458,24 @@ async fn save_attachment(
     }
 
     let (storage_path, created_attachment) = if let Some(ref attachment) = attachment {
-        // v2 API: validate size leeway BEFORE reserving storage or writing object storage.
-        // Actual file_size is committed atomically during post-write finalization so a
-        // concurrently deleted attachment row can never be resurrected.
-        const LEEWAY: i64 = 1024 * 1024; // 1 MiB
-        let Some(max_size) = attachment.file_size.checked_add(LEEWAY) else {
-            err!("Invalid attachment size max")
-        };
-        let Some(min_size) = attachment.file_size.checked_sub(LEEWAY) else {
-            err!("Invalid attachment size min")
-        };
+        // v2 API: in single-tenant mode validate leeway before writing object storage.
+        // In multi-tenant mode `begin_v2_attachment_upload` validates leeway and computes storage
+        // admission atomically from the locked current attachment row AFTER acquiring the
+        // per-attachment in-flight upload lock (so a concurrent bad-size request cannot delete an
+        // in-flight attachment).
+        if !CONFIG.is_multi_tenant() {
+            const LEEWAY: i64 = 1024 * 1024; // 1 MiB
+            let Some(max_size) = attachment.file_size.checked_add(LEEWAY) else {
+                err!("Invalid attachment size max")
+            };
+            let Some(min_size) = attachment.file_size.checked_sub(LEEWAY) else {
+                err!("Invalid attachment size min")
+            };
 
-        if !(min_size <= size && size <= max_size) {
-            attachment.delete(&conn).await.ok();
-            err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
+            if !(min_size <= size && size <= max_size) {
+                attachment.delete(&conn).await.ok();
+                err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
+            }
         }
         let path = attachment.resolve_file_path(&conn).await?;
         (path, None)
@@ -1496,29 +1500,39 @@ async fn save_attachment(
         (path, Some(att))
     };
 
-    let delta_bytes = size.saturating_sub(size_adjust).max(0);
-    let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, delta_bytes, &conn).await?;
-    // Reserved bytes not yet released by transactional finalization.
-    let held = delta_bytes;
-
-    // Record a durable pending-deletion row BEFORE EVERY object write (both v2 and legacy) so
-    // any crash, fencing failure, concurrent attachment deletion, or DB insert failure cannot
-    // orphan the uploaded blob outside accounting and cleanup.
-    let pending_cleanup_id =
-        match crate::tenancy::stage_attachment_cleanup(&headers.user, &storage_path, true, &conn).await {
-            Ok(id) => id,
-            Err(e) => {
-                crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
-                return Err(e);
+    // Acquire upload lease (fencing epoch, reserved bytes, durable upload_in_flight cleanup row).
+    // For hosted v2 uploads this runs in a single transaction under the tenant lock so concurrent
+    // uploads for the same attachment are serialized across replicas and storage admission is
+    // computed from the locked current attachment row.
+    let (upload_epoch, held, pending_cleanup_id) =
+        if let (None, Some(att)) = (&created_attachment, &attachment) {
+            if let Some(lease) = crate::tenancy::begin_v2_attachment_upload(&headers.user, att, size, &conn).await? {
+                (Some(lease.access_epoch), lease.reserved_bytes, Some(lease.pending_cleanup_id))
+            } else {
+                (None, 0, None)
             }
+        } else {
+            let delta_bytes = size.saturating_sub(size_adjust).max(0);
+            let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, delta_bytes, &conn).await?;
+            let pending_cleanup_id =
+                match crate::tenancy::stage_attachment_cleanup(&headers.user, &storage_path, true, delta_bytes, &conn)
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+                        return Err(e);
+                    }
+                };
+            (upload_epoch, delta_bytes, pending_cleanup_id)
         };
 
     if let Err(e) = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await {
         if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
             operator.delete(&storage_path).await.ok();
         }
+        // Returns the row's reserved bytes and hands the object to the cleanup worker.
         crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
-        crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
         return Err(e);
     }
 
@@ -1557,7 +1571,6 @@ async fn save_attachment(
         if let Some(ref att) = attachment {
             att.delete(&conn).await.ok();
         }
-        crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
         return Err(e);
     }
 

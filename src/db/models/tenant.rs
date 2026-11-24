@@ -27,6 +27,20 @@ pub const RECOVERY_BUNDLE_KIT: &str = "personal_kit";
 /// Maximum authority validity window (15 minutes per Design §11 P3).
 pub const MAX_AUTHORITY_AGE_SECS: i64 = 900;
 
+/// Allowed difference between a v2 attachment's declared and uploaded size.
+const V2_SIZE_LEEWAY: i64 = 1024 * 1024;
+
+/// Lease acquired atomically under the tenant lock before a hosted v2 attachment upload writes to
+/// object storage: carries the fencing `access_epoch`, the `reserved_bytes` computed against the
+/// locked current `attachments.file_size`, and the staged `pending_cleanup_id` acting as both
+/// crash-recovery cleanup and cross-replica per-attachment upload serialization lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2UploadLease {
+    pub access_epoch: i64,
+    pub reserved_bytes: i64,
+    pub pending_cleanup_id: String,
+}
+
 #[derive(Clone, Debug, Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = tenants)]
 #[diesel(treat_none_as_null = true)]
@@ -82,6 +96,9 @@ pub struct TenantPendingDeletion {
     pub attempts: i32,
     pub last_error: Option<String>,
     pub created_at: NaiveDateTime,
+    /// Upload bytes reserved for this staged object; returned to the tenant when the row is
+    /// reclaimed so an abandoned upload cannot leak its reservation.
+    pub reserved_bytes: i64,
 }
 
 #[derive(Clone, Debug, Identifiable, Queryable, Insertable, AsChangeset)]
@@ -287,6 +304,7 @@ impl Tenant {
         user_uuid: Option<UserId>,
         object_key: &str,
         in_flight: bool,
+        reserved_bytes: i64,
         conn: &DbConn,
     ) -> Result<String, crate::Error> {
         let row = TenantPendingDeletion {
@@ -297,6 +315,7 @@ impl Tenant {
             object_key: object_key.to_owned(),
             attempts: 0,
             last_error: in_flight.then(|| crate::tenancy::ops::UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            reserved_bytes: reserved_bytes.max(0),
             created_at: Utc::now().naive_utc(),
         };
         let id = row.id.clone();
@@ -316,9 +335,12 @@ impl Tenant {
         let pid = pending_id.to_owned();
         let res = conn
             .run(move |conn| {
-                diesel::update(tenant_pending_deletions::table.find(&pid))
-                    .set(tenant_pending_deletions::last_error.eq(None::<String>))
-                    .execute(conn)
+                conn.transaction(|conn| {
+                    release_pending_reservations(conn, &[pid.as_str()])?;
+                    diesel::update(tenant_pending_deletions::table.find(&pid))
+                        .set(tenant_pending_deletions::last_error.eq(None::<String>))
+                        .execute(conn)
+                })
             })
             .await;
         if let Err(e) = res {
@@ -344,7 +366,10 @@ impl Tenant {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
                 err_code!("Tenant not found", 403);
             };
-            if !tenant.is_active() || expected_epoch.is_some_and(|ep| tenant.access_epoch != ep) {
+            if !tenant.is_active()
+                || tenant.authority_refreshed_at.is_none()
+                || expected_epoch.is_some_and(|ep| tenant.access_epoch != ep)
+            {
                 err_code!("Tenant access was revoked during upload", 403);
             }
             let object_key = att.get_file_path_in_cell(Some(&tenant.home_region))?;
@@ -417,12 +442,157 @@ impl Tenant {
         .await
     }
 
+    /// Transactionally begins a hosted v2 attachment upload under the tenant lock:
+    /// 1. Validates active status, served cell, and authority freshness.
+    /// 2. Serializes concurrent uploads for the same attachment across all replicas by rejecting
+    ///    when a non-expired `upload_in_flight` row already exists for its object key.
+    /// 3. Reads the locked current `attachments.file_size`, checks v2 leeway (1 MiB), computes
+    ///    positive growth delta against that locked row, verifies and reserves storage bytes, and
+    ///    stages the durable `upload_in_flight` cleanup row in the same transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_v2_attachment_upload_inner(
+        conn: &mut DbConnInner,
+        tid: &str,
+        user_uuid: Option<UserId>,
+        att: &Attachment,
+        file_size: i64,
+        max_authority_age_secs: i64,
+        served_cells: &[String],
+        now_ts: i64,
+    ) -> Result<V2UploadLease, crate::Error> {
+        if file_size < 0 {
+            err_code!("Attachment size can't be negative", 400);
+        }
+        let now_dt =
+            chrono::DateTime::from_timestamp(now_ts, 0).map_or_else(|| Utc::now().naive_utc(), |dt| dt.naive_utc());
+        let grace_cutoff = now_dt - chrono::Duration::seconds(crate::tenancy::ops::UPLOAD_STAGING_GRACE_SECS);
+        conn.transaction::<V2UploadLease, crate::Error, _>(|conn| {
+            let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
+                err_code!("Tenant not found", 403);
+            };
+            validate_tenant_growth_tx(&tenant, served_cells, now_ts, max_authority_age_secs)?;
+            let object_key = att.get_file_path_in_cell(Some(&tenant.home_region))?;
+
+            let in_flight: bool = diesel::select(diesel::dsl::exists(
+                tenant_pending_deletions::table
+                    .filter(tenant_pending_deletions::tenant_id.eq(tid))
+                    .filter(tenant_pending_deletions::storage_kind.eq("attachment"))
+                    .filter(tenant_pending_deletions::object_key.eq(&object_key))
+                    .filter(tenant_pending_deletions::last_error.eq(Some(crate::tenancy::ops::UPLOAD_IN_FLIGHT_MARKER)))
+                    .filter(tenant_pending_deletions::created_at.gt(grace_cutoff)),
+            ))
+            .get_result(conn)
+            .map_res("Error checking in-flight attachment upload")?;
+            if in_flight {
+                err_code!("An upload for this attachment is already in progress", 409);
+            }
+
+            let Some(current_size): Option<i64> = attachments::table
+                .filter(attachments::id.eq(&att.id))
+                .filter(attachments::cipher_uuid.eq(&att.cipher_uuid))
+                .filter(attachments::tenant_id.eq(tid))
+                .select(attachments::file_size)
+                .first(conn)
+                .optional()
+                .map_res("Error loading attachment")?
+            else {
+                err_code!("Attachment no longer exists", 404);
+            };
+
+            let Some(max_size) = current_size.checked_add(V2_SIZE_LEEWAY) else {
+                err_code!("Invalid attachment size max", 400);
+            };
+            let Some(min_size) = current_size.checked_sub(V2_SIZE_LEEWAY) else {
+                err_code!("Invalid attachment size min", 400);
+            };
+            if !(min_size <= file_size && file_size <= max_size) {
+                err_code!(
+                    format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {file_size})"),
+                    400
+                );
+            }
+
+            let delta_bytes = file_size.saturating_sub(current_size).max(0);
+            if delta_bytes > 0 {
+                let committed = committed_bytes(conn, tid).map_res("Error checking tenant storage")?;
+                if !tenant.can_grow_storage(committed, delta_bytes, now_ts) {
+                    err_code!("Organization storage quota exceeded or grant expired", 403);
+                }
+                diesel::update(tenants::table.filter(tenants::id.eq(tid)))
+                    .set((
+                        tenants::storage_reserved_bytes
+                            .eq(tenant.storage_reserved_bytes.max(0).saturating_add(delta_bytes)),
+                        tenants::updated_at.eq(now_dt),
+                    ))
+                    .execute(conn)
+                    .map(drop)
+                    .map_res("Error reserving tenant storage bytes")?;
+            }
+
+            let pending_id = get_uuid();
+            let staged = TenantPendingDeletion {
+                id: pending_id.clone(),
+                tenant_id: tid.to_owned(),
+                user_uuid,
+                storage_kind: "attachment".to_owned(),
+                object_key,
+                attempts: 0,
+                last_error: Some(crate::tenancy::ops::UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+                reserved_bytes: delta_bytes,
+                created_at: now_dt,
+            };
+            diesel::insert_into(tenant_pending_deletions::table)
+                .values(&staged)
+                .execute(conn)
+                .map(drop)
+                .map_res("Error staging attachment cleanup")?;
+
+            Ok(V2UploadLease {
+                access_epoch: tenant.access_epoch,
+                reserved_bytes: delta_bytes,
+                pending_cleanup_id: pending_id,
+            })
+        })
+    }
+
+    /// Begins a hosted v2 attachment upload atomically under the PostgreSQL tenant lock.
+    pub async fn begin_v2_attachment_upload(
+        tenant_id: &str,
+        user_uuid: Option<UserId>,
+        att: &Attachment,
+        file_size: i64,
+        max_authority_age_secs: i64,
+        served_cells: &[String],
+        conn: &DbConn,
+    ) -> Result<V2UploadLease, crate::Error> {
+        let tid = tenant_id.to_owned();
+        let cells = served_cells.to_vec();
+        conn.run(move |conn| {
+            if !is_postgresql(conn) {
+                err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
+            }
+            Self::begin_v2_attachment_upload_inner(
+                conn,
+                &tid,
+                user_uuid,
+                att,
+                file_size,
+                max_authority_age_secs,
+                &cells,
+                Utc::now().timestamp(),
+            )
+        })
+        .await
+    }
+
     /// Transactionally finalizes a v2 attachment upload under the tenant lock: verifies tenant
-    /// active status and `expected_epoch`, verifies the pre-created attachment row still exists
-    /// (updating its `file_size` under row lock so a concurrent delete cannot slip past it),
-    /// releases `release` reserved bytes, and clears `clear_pending_id` (plus any stale upload
-    /// cleanup rows for the same object key). If the tenant was fenced or the attachment was
-    /// concurrently deleted, the transaction rolls back and `clear_pending_id` stays queued.
+    /// active status, authority, and `expected_epoch`, loads the locked current attachment row,
+    /// verifies that the upload's reserved bytes (`release`) still cover the actual growth
+    /// (`file_size - current_size`), updates `file_size`, releases `release` reserved bytes, and
+    /// clears `clear_pending_id` (plus any stale upload cleanup rows for the same object key).
+    /// If the tenant was fenced, the attachment was deleted, or the attachment shrank concurrently
+    /// so `release` no longer covers growth, the transaction rolls back and `clear_pending_id`
+    /// stays queued.
     pub fn finalize_v2_attachment_upload_inner(
         conn: &mut DbConnInner,
         tid: &str,
@@ -437,10 +607,28 @@ impl Tenant {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
                 err_code!("Tenant not found", 403);
             };
-            if !tenant.is_active() || expected_epoch.is_some_and(|ep| tenant.access_epoch != ep) {
+            if !tenant.is_active()
+                || tenant.authority_refreshed_at.is_none()
+                || expected_epoch.is_some_and(|ep| tenant.access_epoch != ep)
+            {
                 err_code!("Tenant access was revoked during upload", 403);
             }
             let object_key = att.get_file_path_in_cell(Some(&tenant.home_region))?;
+            let Some(current_size): Option<i64> = attachments::table
+                .filter(attachments::id.eq(&att.id))
+                .filter(attachments::cipher_uuid.eq(&att.cipher_uuid))
+                .filter(attachments::tenant_id.eq(tid))
+                .select(attachments::file_size)
+                .first(conn)
+                .optional()
+                .map_res("Error loading attachment")?
+            else {
+                err_code!("Attachment no longer exists", 404);
+            };
+            let actual_growth = file_size.saturating_sub(current_size).max(0);
+            if actual_growth > release {
+                err_code!("Attachment size changed during upload; storage reservation no longer covers growth", 409);
+            }
             let updated: usize = diesel::update(
                 attachments::table
                     .filter(attachments::id.eq(&att.id))
@@ -677,6 +865,33 @@ pub fn is_postgresql(conn: &DbConnInner) -> bool {
 
 /// Loads a tenant row, holding a `FOR UPDATE` row lock on PostgreSQL (the hosted backend).
 /// Call inside a transaction.
+/// Returns the bytes reserved by cleanup rows `ids` to their tenants and zeroes the rows, so a
+/// reclaimed or abandoned upload releases its reservation exactly once. Call inside a transaction.
+pub fn release_pending_reservations(conn: &mut DbConnInner, ids: &[&str]) -> QueryResult<()> {
+    let rows: Vec<(String, i64)> = tenant_pending_deletions::table
+        .filter(tenant_pending_deletions::id.eq_any(ids))
+        .filter(tenant_pending_deletions::reserved_bytes.gt(0))
+        .select((tenant_pending_deletions::tenant_id, tenant_pending_deletions::reserved_bytes))
+        .load(conn)?;
+    let mut per_tenant = std::collections::BTreeMap::<String, i64>::new();
+    for (tid, bytes) in rows {
+        let total = per_tenant.entry(tid).or_default();
+        *total = total.saturating_add(bytes);
+    }
+    // BTreeMap order gives a stable lock order across concurrent callers.
+    for (tid, bytes) in per_tenant {
+        if let Some(t) = lock_tenant(conn, &tid)? {
+            diesel::update(tenants::table.find(&tid))
+                .set(tenants::storage_reserved_bytes.eq(t.storage_reserved_bytes.saturating_sub(bytes).max(0)))
+                .execute(conn)?;
+        }
+    }
+    diesel::update(tenant_pending_deletions::table.filter(tenant_pending_deletions::id.eq_any(ids)))
+        .set(tenant_pending_deletions::reserved_bytes.eq(0))
+        .execute(conn)?;
+    Ok(())
+}
+
 pub fn lock_tenant(conn: &mut DbConnInner, id: &str) -> QueryResult<Option<Tenant>> {
     match conn {
         #[cfg(postgresql)]

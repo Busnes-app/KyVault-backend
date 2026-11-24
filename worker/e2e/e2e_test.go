@@ -490,6 +490,58 @@ func TestLivePostgres(t *testing.T) {
 			return nil
 		})
 
+		// (f) Overlapping uploads to one attachment on both replicas, shrinking and growing it,
+		// while new admissions compete for the bytes. Uploads to one attachment are serialized
+		// and sized from its current row, so committed plus reserved never passes the grant.
+		e.kyid.setFailing(true)
+		tokOv := e.accessToken(t, a2)
+		var ovCreated resp
+		eventually(t, 10*time.Second, "grant for overlap test", func() error {
+			ovCreated = createAttachment(t, r1, tokOv, pcA2, 600_000)
+			if ovCreated.code != 200 {
+				return fmt.Errorf("%d %s", ovCreated.code, ovCreated.body)
+			}
+			return nil
+		})
+		var ov struct {
+			AttachmentID string `json:"attachmentId"`
+		}
+		ovCreated.json(t, &ov)
+		if r := uploadAttachment(t, r1, tokOv, pcA2, ov.AttachmentID, 600_000); r.code != 200 {
+			t.Fatalf("seed overlap attachment: %d %s", r.code, r.body)
+		}
+		ovStart := make(chan struct{})
+		var ovWG sync.WaitGroup
+		ovCodes := make([]resp, 12)
+		for i := range ovCodes {
+			base := []string{r1, r2}[i%2]
+			ovWG.Add(1)
+			go func() {
+				defer ovWG.Done()
+				<-ovStart
+				switch i % 3 {
+				case 0:
+					ovCodes[i], _ = callErrUpload(base, tokOv, pcA2, ov.AttachmentID, 100_000)
+				case 1:
+					ovCodes[i], _ = callErrUpload(base, tokOv, pcA2, ov.AttachmentID, 1_100_000)
+				default:
+					ovCodes[i], _ = callErrAttach(base, tokOv, pcA2, 400_000)
+				}
+			}()
+		}
+		close(ovStart)
+		ovWG.Wait()
+		for i, c := range ovCodes {
+			if c.code == 0 || c.code >= 500 {
+				t.Fatalf("overlap request %d: %d %s", i, c.code, c.body)
+			}
+		}
+		if g := e.mustTenant(t, orgA); e.committed(t, orgA)+g.Reserved > g.Ceiling || g.Reserved != 0 {
+			t.Fatalf("overlapping uploads broke the grant: committed %d reserved %d ceiling %d",
+				e.committed(t, orgA), g.Reserved, g.Ceiling)
+		}
+		e.kyid.setFailing(false)
+
 		// Real objects for erasure and purge: A1 personal, B1 personal.
 		for _, up := range []struct {
 			u      vaultUser

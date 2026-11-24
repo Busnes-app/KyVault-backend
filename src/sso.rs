@@ -236,7 +236,12 @@ pub struct OIDCIdentifier(String);
 
 impl OIDCIdentifier {
     pub fn new(issuer: &str, subject: &str) -> Self {
-        OIDCIdentifier(crate::tenancy::format_oidc_identifier(issuer, subject))
+        // Single-tenant keeps upstream's verbatim format so existing `sso_users` rows still match.
+        if CONFIG.is_multi_tenant() {
+            OIDCIdentifier(crate::tenancy::format_oidc_identifier(issuer, subject))
+        } else {
+            OIDCIdentifier(format!("{issuer}/{subject}"))
+        }
     }
 }
 
@@ -314,7 +319,7 @@ pub async fn exchange_code(
 
     let issuer = crate::tenancy::canonical_issuer(id_claims.issuer().as_str()).to_owned();
     let subject = id_claims.subject().as_str().trim().to_owned();
-    let identifier = OIDCIdentifier::new(&issuer, &subject);
+    let identifier = OIDCIdentifier::new(id_claims.issuer().as_str(), id_claims.subject().as_str());
 
     let authenticated_user = OIDCAuthenticatedUser {
         refresh_token: refresh_token.cloned(),
@@ -506,5 +511,16 @@ pub async fn exchange_refresh_token(
             create_auth_tokens_impl(device, None, access_claims, access_token)
         }
         None => err!("No token present while in SSO"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OIDCIdentifier;
+
+    #[test]
+    fn single_tenant_identifier_keeps_upstream_format() {
+        assert_eq!(OIDCIdentifier::new("https://id.example/", "sub").to_string(), "https://id.example//sub");
+        assert_eq!(OIDCIdentifier::new("https://id.example", "sub").to_string(), "https://id.example/sub");
     }
 }

@@ -552,3 +552,17 @@ mod postgresql_migrations {
         Ok(())
     }
 }
+
+#[cfg(all(test, sqlite))]
+mod migration_tests {
+    use diesel::Connection;
+    use diesel_migrations::MigrationHarness;
+
+    #[test]
+    fn sqlite_latest_migration_reverts_and_reapplies() {
+        let mut conn = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+        conn.run_pending_migrations(super::sqlite_migrations::MIGRATIONS).unwrap();
+        conn.revert_last_migration(super::sqlite_migrations::MIGRATIONS).unwrap();
+        conn.run_pending_migrations(super::sqlite_migrations::MIGRATIONS).unwrap();
+    }
+}

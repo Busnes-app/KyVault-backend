@@ -54,7 +54,8 @@ CREATE TABLE tenant_pending_deletions (
     object_key TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reserved_bytes BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE INDEX idx_tenant_pending_deletions_tenant ON tenant_pending_deletions (tenant_id);
