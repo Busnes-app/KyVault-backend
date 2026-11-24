@@ -16,7 +16,7 @@ use crate::{
         DbConn, DbPool,
         models::{
             Cipher, EMERGENCY_ACCESS_TIMEOUT_RANGE, EmergencyAccess, EmergencyAccessId, EmergencyAccessStatus,
-            EmergencyAccessType, Invitation, Membership, MembershipType, OrgPolicy, TwoFactor, User, UserId,
+            EmergencyAccessType, Invitation, Membership, MembershipType, OrgPolicy, SsoUser, TwoFactor, User, UserId,
         },
     },
     mail,
@@ -231,8 +231,11 @@ async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, co
         err!("You can not set yourself as an emergency contact.")
     }
 
-    let (grantee_user, new_user) = match User::find_by_mail(&email, &conn).await {
+    let (grantee_user, new_user) = match SsoUser::find_by_mail(&email, &conn).await {
         None => {
+            if CONFIG.is_multi_tenant() {
+                err!(format!("Grantee user does not exist in this organization: {}", email.escape_debug()))
+            }
             if !CONFIG.invitations_allowed() {
                 err!(format!("Grantee user does not exist: {}", email.escape_debug()))
             }
@@ -251,13 +254,16 @@ async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, co
             user.save(&conn).await?;
             (user, true)
         }
-        Some(user) => {
+        Some((user, sso_user)) => {
             if CONFIG.is_multi_tenant() {
                 crate::tenancy::ensure_same_tenant(
                     grantor_user.tenant_id.as_deref(),
                     user.tenant_id.as_deref(),
                     "emergency_access::send_invite",
                 )?;
+                if sso_user.is_none() {
+                    err!(format!("Grantee user is not a verified SSO member: {}", email.escape_debug()))
+                }
             }
             let is_new = user.password_hash.is_empty();
             (user, is_new)

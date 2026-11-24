@@ -268,6 +268,9 @@ async fn is_email_2fa_required(member_id: Option<MembershipId>, conn: &DbConn) -
 }
 
 pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Direct registration is disabled in multi-tenant mode; sign in with SSO", 403);
+    }
     let data: RegisterData = data.into_inner();
     let email = data.email.to_lowercase();
 

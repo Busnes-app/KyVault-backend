@@ -324,6 +324,9 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -
         }
     }
 
+    if CONFIG.is_multi_tenant() {
+        err_code!("Admin user invitations are disabled in multi-tenant mode", 403);
+    }
     let data: InviteData = data.into_inner();
     if User::find_by_mail(&data.email, &conn).await.is_some() {
         err_code!("User already exists", Status::Conflict.code)

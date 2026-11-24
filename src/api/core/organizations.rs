@@ -18,7 +18,7 @@ use crate::{
             Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUser, Device,
             EventType, FillAssistPolicyData, Group, GroupId, GroupUser, Invitation, Membership, MembershipId,
             MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey,
-            OrganizationId, TwoFactor, TwoFactorType, User, UserId,
+            OrganizationId, SsoUser, TwoFactor, TwoFactorType, User, UserId,
         },
     },
     mail,
@@ -1049,8 +1049,11 @@ async fn send_invite(
     let mut user_created: bool;
     for email in &data.emails {
         let mut member_status = MembershipStatus::Invited as i32;
-        let user = match User::find_by_mail(email, &conn).await {
+        let user = match SsoUser::find_by_mail(email, &conn).await {
             None => {
+                if CONFIG.is_multi_tenant() {
+                    err!(format!("User does not exist in this organization: {}", email.escape_debug()))
+                }
                 if !CONFIG.invitations_allowed() {
                     err!(format!("User does not exist: {}", email.escape_debug()))
                 }
@@ -1069,13 +1072,16 @@ async fn send_invite(
                 user_created = true;
                 new_user
             }
-            Some(user) => {
+            Some((user, sso_user)) => {
                 if CONFIG.is_multi_tenant() {
                     crate::tenancy::ensure_same_tenant(
                         headers.user.tenant_id.as_deref(),
                         user.tenant_id.as_deref(),
                         "send_invite",
                     )?;
+                    if sso_user.is_none() {
+                        err!(format!("User is not a verified SSO member: {}", email.escape_debug()))
+                    }
                 }
 
                 if Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await.is_some() {

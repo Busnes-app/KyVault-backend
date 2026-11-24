@@ -102,6 +102,9 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 }
                 user
             } else {
+                if CONFIG.is_multi_tenant() {
+                    err_code!("Public organization import is disabled in multi-tenant mode", 403);
+                }
                 // User does not exist yet
                 let mut new_user = User::new(&user_data.email, None);
                 new_user.tenant_id = org_tenant_id;
