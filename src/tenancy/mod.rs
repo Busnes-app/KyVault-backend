@@ -130,20 +130,50 @@ pub async fn activate_pending_deletion(pending_id: Option<&str>, conn: &DbConn) 
     }
 }
 
-/// Saves an attachment row; in multi-tenant mode it also releases `reserved` upload bytes and
-/// deletes `clear_pending_id` (if any) in the same transaction. On error nothing is released
-/// and any staged cleanup row stays pending.
+/// Saves an attachment row; in multi-tenant mode it also verifies `expected_epoch`, releases
+/// `reserved` upload bytes, and deletes `clear_pending_id` (if any) in the same transaction.
+/// On error nothing is released and any staged cleanup row stays pending.
 pub async fn save_attachment_releasing(
     user: &User,
     att: &Attachment,
     reserved: i64,
+    expected_epoch: Option<i64>,
     clear_pending_id: Option<&str>,
     conn: &DbConn,
 ) -> EmptyResult {
     if !CONFIG.is_multi_tenant() {
         return att.save(conn).await;
     }
-    Tenant::save_attachment_releasing(require_user_tenant(user)?, att, reserved, clear_pending_id, conn).await
+    Tenant::save_attachment_releasing(require_user_tenant(user)?, att, reserved, expected_epoch, clear_pending_id, conn)
+        .await
+}
+
+/// Finalizes a v2 attachment upload: verifies the attachment row still exists (updating
+/// `file_size`), verifies `expected_epoch` in multi-tenant mode, releases `reserved` upload
+/// bytes, and clears `clear_pending_id` in one transaction. On error nothing is released and
+/// any staged cleanup row stays pending.
+pub async fn finalize_v2_attachment_upload(
+    user: &User,
+    att: &Attachment,
+    file_size: i64,
+    reserved: i64,
+    expected_epoch: Option<i64>,
+    clear_pending_id: Option<&str>,
+    conn: &DbConn,
+) -> EmptyResult {
+    if !CONFIG.is_multi_tenant() {
+        return att.update_file_size_if_exists(file_size, conn).await;
+    }
+    Tenant::finalize_v2_attachment_upload(
+        require_user_tenant(user)?,
+        att,
+        file_size,
+        reserved,
+        expected_epoch,
+        clear_pending_id,
+        conn,
+    )
+    .await
 }
 
 /// Releases previously reserved upload bytes in multi-tenant mode.
@@ -154,18 +184,6 @@ pub async fn release_storage_reservation(user: &User, bytes: i64, conn: &DbConn)
     if let Ok(tenant_id) = require_user_tenant(user) {
         Tenant::release_storage_reservation(tenant_id, bytes, conn).await;
     }
-}
-
-/// Verifies that the tenant is still active and `access_epoch` has not changed since reservation.
-pub async fn verify_access_epoch(user: &User, expected_epoch: Option<i64>, conn: &DbConn) -> EmptyResult {
-    if !CONFIG.is_multi_tenant() {
-        return Ok(());
-    }
-    let Some(epoch) = expected_epoch else {
-        return Ok(());
-    };
-    let tenant_id = require_user_tenant(user)?;
-    Tenant::verify_access_epoch(tenant_id, epoch, conn).await
 }
 
 /// Enforces tenant-level active cipher quota in multi-tenant mode.

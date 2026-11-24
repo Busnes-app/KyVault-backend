@@ -1883,7 +1883,7 @@ async fn post_org_import(
         cipher_data.organization_id = Some(org_id.clone());
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
         cipher.tenant_id = headers.user.tenant_id.clone();
-        update_cipher_from_data(
+        let res = update_cipher_from_data(
             &mut cipher,
             cipher_data,
             &headers,
@@ -1892,8 +1892,10 @@ async fn post_org_import(
             &nt,
             UpdateType::None,
         )
-        .await
-        .ok();
+        .await;
+        if CONFIG.is_multi_tenant() {
+            res?;
+        }
         ciphers.push(cipher.uuid);
     }
 

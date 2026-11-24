@@ -16,7 +16,7 @@ use crate::{
     util::get_uuid,
 };
 
-use super::{Attachment, OrganizationId, UserId};
+use super::{Attachment, Cipher, OrganizationId, UserId};
 
 pub const TENANT_STATUS_ACTIVE: &str = "active";
 
@@ -326,22 +326,28 @@ impl Tenant {
         }
     }
 
-    /// Transactionally locks the tenant, saves `att`, releases `release` reserved bytes, and
-    /// clears `clear_pending_id` (if any) from `tenant_pending_deletions`. If saving `att` fails
-    /// (for example on a cipher foreign-key violation), the transaction rolls back so the pending
-    /// cleanup row remains intact.
+    /// Transactionally locks the tenant, verifies active status and `expected_epoch`, saves `att`,
+    /// releases `release` reserved bytes, and clears `clear_pending_id` (plus any stale upload
+    /// cleanup rows for the same object key) from `tenant_pending_deletions`. If any check or the
+    /// insert fails (for example on epoch fencing or a cipher foreign-key violation), the
+    /// transaction rolls back so the pending cleanup row remains intact.
     pub fn save_attachment_releasing_inner(
         conn: &mut DbConnInner,
         tid: &str,
         att: &Attachment,
         release: i64,
+        expected_epoch: Option<i64>,
         clear_pending_id: Option<&str>,
     ) -> EmptyResult {
         let release = release.max(0);
-        conn.transaction::<_, diesel::result::Error, _>(|conn| {
-            let Some(tenant) = lock_tenant(conn, tid)? else {
-                return Err(diesel::result::Error::NotFound);
+        let object_key = att.get_file_path();
+        conn.transaction::<(), crate::Error, _>(|conn| {
+            let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
+                err_code!("Tenant not found", 403);
             };
+            if !tenant.is_active() || expected_epoch.is_some_and(|ep| tenant.access_epoch != ep) {
+                err_code!("Tenant access was revoked during upload", 403);
+            }
             match conn {
                 #[cfg(mysql)]
                 DbConnInner::Mysql(c) => diesel::insert_into(attachments::table)
@@ -349,40 +355,54 @@ impl Tenant {
                     .on_conflict(diesel::dsl::DuplicatedKeys)
                     .do_update()
                     .set(att)
-                    .execute(c)?,
+                    .execute(c),
                 #[cfg(postgresql)]
                 DbConnInner::Postgresql(c) => diesel::insert_into(attachments::table)
                     .values(att)
                     .on_conflict(attachments::id)
                     .do_update()
                     .set(att)
-                    .execute(c)?,
+                    .execute(c),
                 #[cfg(sqlite)]
                 DbConnInner::Sqlite(c) => diesel::insert_into(attachments::table)
                     .values(att)
                     .on_conflict(attachments::id)
                     .do_update()
                     .set(att)
-                    .execute(c)?,
-            };
+                    .execute(c),
+            }
+            .map(|_| ())
+            .map_res("Error saving attachment")?;
             diesel::update(tenants::table.find(tid))
                 .set(tenants::storage_reserved_bytes.eq(tenant.storage_reserved_bytes.saturating_sub(release).max(0)))
-                .execute(conn)?;
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error releasing storage reservation")?;
             if let Some(pid) = clear_pending_id {
-                diesel::delete(tenant_pending_deletions::table.find(pid)).execute(conn)?;
+                diesel::delete(
+                    tenant_pending_deletions::table.filter(
+                        tenant_pending_deletions::id.eq(pid).or(tenant_pending_deletions::tenant_id
+                            .eq(tid)
+                            .and(tenant_pending_deletions::storage_kind.eq("attachment"))
+                            .and(tenant_pending_deletions::object_key.eq(&object_key))),
+                    ),
+                )
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error clearing staged attachment cleanup")?;
             }
             Ok(())
         })
-        .map_res("Error saving attachment")
     }
 
-    /// Saves an attachment row, releases `release` reserved bytes, and clears `clear_pending_id`
-    /// in one transaction under the tenant lock, so a concurrent admission never counts those
-    /// bytes twice and a failed save never drops its cleanup job.
+    /// Saves an attachment row, verifies `expected_epoch`, releases `release` reserved bytes, and
+    /// clears `clear_pending_id` in one transaction under the tenant lock, so a concurrent
+    /// admission never counts those bytes twice and a failed save never drops its cleanup job.
     pub async fn save_attachment_releasing(
         tenant_id: &str,
         att: &Attachment,
         release: i64,
+        expected_epoch: Option<i64>,
         clear_pending_id: Option<&str>,
         conn: &DbConn,
     ) -> EmptyResult {
@@ -392,7 +412,211 @@ impl Tenant {
             if !is_postgresql(conn) {
                 err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
             }
-            Self::save_attachment_releasing_inner(conn, &tid, att, release, pid.as_deref())
+            Self::save_attachment_releasing_inner(conn, &tid, att, release, expected_epoch, pid.as_deref())
+        })
+        .await
+    }
+
+    /// Transactionally finalizes a v2 attachment upload under the tenant lock: verifies tenant
+    /// active status and `expected_epoch`, verifies the pre-created attachment row still exists
+    /// (updating its `file_size` under row lock so a concurrent delete cannot slip past it),
+    /// releases `release` reserved bytes, and clears `clear_pending_id` (plus any stale upload
+    /// cleanup rows for the same object key). If the tenant was fenced or the attachment was
+    /// concurrently deleted, the transaction rolls back and `clear_pending_id` stays queued.
+    pub fn finalize_v2_attachment_upload_inner(
+        conn: &mut DbConnInner,
+        tid: &str,
+        att: &Attachment,
+        file_size: i64,
+        release: i64,
+        expected_epoch: Option<i64>,
+        clear_pending_id: Option<&str>,
+    ) -> EmptyResult {
+        let release = release.max(0);
+        let object_key = att.get_file_path();
+        conn.transaction::<(), crate::Error, _>(|conn| {
+            let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
+                err_code!("Tenant not found", 403);
+            };
+            if !tenant.is_active() || expected_epoch.is_some_and(|ep| tenant.access_epoch != ep) {
+                err_code!("Tenant access was revoked during upload", 403);
+            }
+            let updated: usize = diesel::update(
+                attachments::table
+                    .filter(attachments::id.eq(&att.id))
+                    .filter(attachments::cipher_uuid.eq(&att.cipher_uuid))
+                    .filter(attachments::tenant_id.eq(tid)),
+            )
+            .set(attachments::file_size.eq(file_size))
+            .execute(conn)
+            .map_res("Error finalizing attachment")?;
+            if updated == 0 {
+                err_code!("Attachment no longer exists", 404);
+            }
+            diesel::update(tenants::table.find(tid))
+                .set(tenants::storage_reserved_bytes.eq(tenant.storage_reserved_bytes.saturating_sub(release).max(0)))
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error releasing storage reservation")?;
+            if let Some(pid) = clear_pending_id {
+                diesel::delete(
+                    tenant_pending_deletions::table.filter(
+                        tenant_pending_deletions::id.eq(pid).or(tenant_pending_deletions::tenant_id
+                            .eq(tid)
+                            .and(tenant_pending_deletions::storage_kind.eq("attachment"))
+                            .and(tenant_pending_deletions::object_key.eq(&object_key))),
+                    ),
+                )
+                .execute(conn)
+                .map(|_| ())
+                .map_res("Error clearing staged attachment cleanup")?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Finalizes a v2 attachment upload atomically under the PostgreSQL tenant lock.
+    pub async fn finalize_v2_attachment_upload(
+        tenant_id: &str,
+        att: &Attachment,
+        file_size: i64,
+        release: i64,
+        expected_epoch: Option<i64>,
+        clear_pending_id: Option<&str>,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let tid = tenant_id.to_owned();
+        let pid = clear_pending_id.map(str::to_owned);
+        conn.run(move |conn| {
+            if !is_postgresql(conn) {
+                err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
+            }
+            Self::finalize_v2_attachment_upload_inner(
+                conn,
+                &tid,
+                att,
+                file_size,
+                release,
+                expected_epoch,
+                pid.as_deref(),
+            )
+        })
+        .await
+    }
+
+    /// Transactionally locks the tenant, validates active status/region/authority freshness,
+    /// enforces active cipher count quota on create/restore, checks positive byte deltas against
+    /// the tenant's active storage growth grant, and persists `cipher`. Rejects growth without
+    /// modifying stored data if the grant is expired or exhausted.
+    pub fn save_cipher_enforcing_grant_inner(
+        conn: &mut DbConnInner,
+        tid: &str,
+        cipher: &Cipher,
+        max_authority_age_secs: i64,
+        home_region: &str,
+        default_max_ciphers: i64,
+        now_ts: i64,
+    ) -> EmptyResult {
+        if cipher.tenant_id.as_deref() != Some(tid) {
+            err_code!("Cross-tenant cipher write denied", 403);
+        }
+        conn.transaction::<(), crate::Error, _>(|conn| {
+            let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
+                err_code!("Tenant not found", 403);
+            };
+            validate_tenant_growth_tx(&tenant, home_region, now_ts, max_authority_age_secs)?;
+
+            let existing: Option<Cipher> = ciphers::table
+                .find(&cipher.uuid)
+                .first::<Cipher>(conn)
+                .optional()
+                .map_res("Error loading existing cipher")?;
+            if let Some(ref old) = existing
+                && old.tenant_id.as_deref() != Some(tid)
+            {
+                err_code!("Cross-tenant cipher write denied", 403);
+            }
+
+            let activates_cipher =
+                cipher.deleted_at.is_none() && existing.as_ref().is_none_or(|old| old.deleted_at.is_some());
+            if activates_cipher {
+                let max_ciphers = tenant.max_ciphers_quota().unwrap_or(default_max_ciphers);
+                if max_ciphers > 0 {
+                    let active_count: i64 = ciphers::table
+                        .filter(ciphers::tenant_id.eq(tid))
+                        .filter(ciphers::deleted_at.is_null())
+                        .count()
+                        .first::<i64>(conn)
+                        .map_res("Error counting tenant ciphers")?;
+                    if active_count >= max_ciphers {
+                        err_code!(format!("Organization cipher quota exceeded (limit: {max_ciphers})"), 403);
+                    }
+                }
+            }
+
+            let old_bytes = existing.as_ref().map_or(0, Cipher::storage_bytes);
+            let delta_bytes = cipher.storage_bytes().saturating_sub(old_bytes);
+            if delta_bytes > 0 {
+                let committed = committed_bytes(conn, tid).map_res("Error checking tenant storage")?;
+                if !tenant.can_grow_storage(committed, delta_bytes, now_ts) {
+                    err_code!("Organization storage quota exceeded or grant expired", 403);
+                }
+            }
+
+            match conn {
+                #[cfg(mysql)]
+                DbConnInner::Mysql(c) => diesel::insert_into(ciphers::table)
+                    .values(cipher)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_update()
+                    .set(cipher)
+                    .execute(c),
+                #[cfg(postgresql)]
+                DbConnInner::Postgresql(c) => diesel::insert_into(ciphers::table)
+                    .values(cipher)
+                    .on_conflict(ciphers::uuid)
+                    .do_update()
+                    .set(cipher)
+                    .execute(c),
+                #[cfg(sqlite)]
+                DbConnInner::Sqlite(c) => diesel::insert_into(ciphers::table)
+                    .values(cipher)
+                    .on_conflict(ciphers::uuid)
+                    .do_update()
+                    .set(cipher)
+                    .execute(c),
+            }
+            .map(|_| ())
+            .map_res("Error saving cipher")?;
+            Ok(())
+        })
+    }
+
+    /// Persists a cipher in hosted multi-tenant mode under the PostgreSQL tenant lock, enforcing
+    /// both active cipher quota and storage grant admission atomically.
+    pub async fn save_cipher_enforcing_grant(
+        tenant_id: &str,
+        cipher: &Cipher,
+        max_authority_age_secs: i64,
+        home_region: &str,
+        default_max_ciphers: i64,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let tid = tenant_id.to_owned();
+        let region = home_region.to_owned();
+        conn.run(move |conn| {
+            if !is_postgresql(conn) {
+                err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
+            }
+            Self::save_cipher_enforcing_grant_inner(
+                conn,
+                &tid,
+                cipher,
+                max_authority_age_secs,
+                &region,
+                default_max_ciphers,
+                Utc::now().timestamp(),
+            )
         })
         .await
     }
@@ -431,17 +655,6 @@ impl Tenant {
         if let Err(e) = res {
             error!("Failed to release {bytes} reserved bytes for tenant {tenant_id}: {e}");
         }
-    }
-
-    /// Verifies that the tenant is still active and `access_epoch` has not advanced since upload began.
-    pub async fn verify_access_epoch(tenant_id: &str, expected_epoch: i64, conn: &DbConn) -> EmptyResult {
-        let Some(tenant) = Self::find_by_id(tenant_id, conn).await else {
-            err_code!("Tenant not found", 403);
-        };
-        if !tenant.is_active() || tenant.access_epoch != expected_epoch {
-            err_code!("Tenant access was revoked while request was in flight", 403);
-        }
-        Ok(())
     }
 }
 
@@ -503,7 +716,7 @@ pub fn committed_bytes(conn: &mut DbConnInner, tenant_id: &str) -> QueryResult<i
         .select(diesel::dsl::sum(attachments::file_size))
         .first(conn)?;
 
-    let cipher_sql = octet_sum_sql(conn, &["data"]);
+    let cipher_sql = octet_sum_sql(conn, &["name", "notes", "fields", "data", "password_history", "key"]);
     let records: i64 =
         ciphers::table.filter(ciphers::tenant_id.eq(tenant_id)).select(sql::<BigInt>(&cipher_sql)).first(conn)?;
 

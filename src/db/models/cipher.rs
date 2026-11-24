@@ -98,6 +98,21 @@ impl Cipher {
         }
     }
 
+    /// Total UTF-8 byte length of the cipher's encrypted payload columns counted in
+    /// `tenant::committed_bytes`.
+    pub fn storage_bytes(&self) -> i64 {
+        let opt_len = |s: &Option<String>| s.as_deref().map_or(0, str::len);
+        let total = self
+            .name
+            .len()
+            .saturating_add(opt_len(&self.notes))
+            .saturating_add(opt_len(&self.fields))
+            .saturating_add(self.data.len())
+            .saturating_add(opt_len(&self.password_history))
+            .saturating_add(opt_len(&self.key));
+        i64::try_from(total).unwrap_or(i64::MAX)
+    }
+
     pub fn validate_cipher_data(cipher_data: &[CipherData]) -> EmptyResult {
         let mut validation_errors = serde_json::Map::new();
         let max_note_size = CONFIG._max_note_size();
@@ -438,8 +453,26 @@ impl Cipher {
     }
 
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
-        self.update_users_revision(conn).await;
         self.updated_at = Utc::now().naive_utc();
+
+        if CONFIG.is_multi_tenant() {
+            let Some(tenant_id) = self.tenant_id.as_deref() else {
+                err_code!("Cipher is missing tenant ownership", 403);
+            };
+            super::Tenant::save_cipher_enforcing_grant(
+                tenant_id,
+                self,
+                CONFIG.tenancy_authority_max_age_secs(),
+                &CONFIG.home_region(),
+                CONFIG.tenancy_max_ciphers_per_tenant(),
+                conn,
+            )
+            .await?;
+            self.update_users_revision(conn).await;
+            return Ok(());
+        }
+
+        self.update_users_revision(conn).await;
 
         db_run! { conn:
             mysql {

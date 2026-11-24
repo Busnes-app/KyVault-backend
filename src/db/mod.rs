@@ -471,8 +471,16 @@ impl<'r> FromRequest<'r> for DbConn {
 /// In-memory SQLite connection with every migration applied and foreign keys enforced.
 #[cfg(all(test, sqlite))]
 pub fn test_sqlite_conn() -> DbConnInner {
+    test_sqlite_conn_at(":memory:")
+}
+
+/// SQLite connection at `url` with migrations applied, foreign keys enforced, and a busy timeout
+/// so multi-thread concurrency tests can share a file-backed database.
+#[cfg(all(test, sqlite))]
+pub fn test_sqlite_conn_at(url: &str) -> DbConnInner {
     use diesel_migrations::MigrationHarness;
-    let mut conn = diesel::sqlite::SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
+    let mut conn = diesel::sqlite::SqliteConnection::establish(url).expect("open sqlite");
+    diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut conn).expect("set busy_timeout");
     conn.run_pending_migrations(sqlite_migrations::MIGRATIONS).expect("run sqlite migrations");
     diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut conn).expect("enable foreign keys");
     DbConnInner::Sqlite(conn)

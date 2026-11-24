@@ -1818,7 +1818,7 @@ mod tests {
                         ceiling_bytes: 5000,
                         ttl_seconds: 3600,
                         pool_bytes: 9000,
-                        org_used_bytes: 115,
+                        org_used_bytes: 116,
                         over_since: None,
                     }],
                 },
@@ -1828,7 +1828,7 @@ mod tests {
         };
         let first = StorageReport {
             org_id: "t1".to_owned(),
-            used_bytes: 115,
+            used_bytes: 116,
             seq: 1,
             want_bytes: 1000,
         };
@@ -1837,7 +1837,7 @@ mod tests {
         // Unapplied report replays the exact seq and bytes even after usage changed.
         attachment(c, "pb", "pc", "t1");
         assert_eq!(prep(c)[0].seq, 1);
-        assert_eq!(prep(c)[0].used_bytes, 115);
+        assert_eq!(prep(c)[0].used_bytes, 116);
 
         // Future-dated sent_at is clamped to now; TTL capped at 900 s.
         assert_eq!(apply(c, "ok", 1, NOW + 10_000).applied, 1);
@@ -1846,7 +1846,7 @@ mod tests {
         assert_eq!((t.storage_ceiling_bytes, t.storage_last_applied_seq, t.storage_pending_seq), (5000, 1, None));
 
         let next = prep(c);
-        assert_eq!((next[0].seq, next[0].used_bytes), (2, 215));
+        assert_eq!((next[0].seq, next[0].used_bytes), (2, 216));
         // Out-of-order and never-issued sequences are ignored.
         assert_eq!(apply(c, "ok", 1, NOW).applied, 0);
         assert_eq!(apply(c, "ok", 99, NOW).applied, 0);
@@ -2094,7 +2094,7 @@ mod tests {
             None,
         )
         .with_tenant_id(Some("t1".to_owned()));
-        assert!(Tenant::save_attachment_releasing_inner(c, "t1", &att_fail, 128, Some("pd-staged")).is_err());
+        assert!(Tenant::save_attachment_releasing_inner(c, "t1", &att_fail, 128, Some(1), Some("pd-staged")).is_err());
 
         // Rollback preserves both the staged cleanup row and reserved bytes.
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 128);
@@ -2131,8 +2131,273 @@ mod tests {
             None,
         )
         .with_tenant_id(Some("t1".to_owned()));
-        Tenant::save_attachment_releasing_inner(c, "t1", &att_ok, 128, Some("pd-ok")).unwrap();
+        Tenant::save_attachment_releasing_inner(c, "t1", &att_ok, 128, Some(1), Some("pd-ok")).unwrap();
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
         assert!(tenant_pending_deletions::table.find("pd-ok").first::<TenantPendingDeletion>(c).is_err());
+    }
+
+    #[test]
+    fn cipher_save_enforces_storage_grant_and_preserves_stored_data() {
+        use crate::db::models::{Cipher, committed_bytes};
+
+        let c = &mut test_sqlite_conn();
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+
+        let mut item = Cipher::new(1, "name".to_owned());
+        item.user_uuid = Some(UserId::from("u1".to_owned()));
+        item.tenant_id = Some("t1".to_owned());
+        item.data = "0123456789".to_owned(); // 4 + 10 = 14 bytes
+
+        // 1. Expired storage grant rejects creating a cipher without inserting anything.
+        diesel::update(tenants::table.find("t1"))
+            .set((tenants::storage_ceiling_bytes.eq(1000), tenants::storage_grant_expires_at.eq(Some(NOW - 1))))
+            .execute(c)
+            .unwrap();
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, REGION, 10, NOW).is_err());
+        assert_eq!(ciphers::table.filter(ciphers::tenant_id.eq("t1")).count().get_result::<i64>(c).unwrap(), 0);
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 0);
+
+        // 2. Exhausted storage grant (ceiling smaller than cipher payload) rejects create.
+        diesel::update(tenants::table.find("t1"))
+            .set((tenants::storage_ceiling_bytes.eq(10), tenants::storage_grant_expires_at.eq(Some(NOW + 300))))
+            .execute(c)
+            .unwrap();
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, REGION, 10, NOW).is_err());
+        assert_eq!(ciphers::table.filter(ciphers::tenant_id.eq("t1")).count().get_result::<i64>(c).unwrap(), 0);
+
+        // 3. Sufficient active grant allows creating the cipher and counts all encrypted fields.
+        diesel::update(tenants::table.find("t1")).set(tenants::storage_ceiling_bytes.eq(20)).execute(c).unwrap();
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, REGION, 10, NOW).unwrap();
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 14);
+
+        // 4. Exhausted grant rejects enlarging data or notes without modifying stored data.
+        let mut enlarged = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
+        enlarged.data = "01234567890123456789".to_owned(); // 4 + 20 = 24 > ceiling 20
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &enlarged, 900, REGION, 10, NOW).is_err());
+        let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
+        assert_eq!(stored.data, "0123456789");
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 14);
+
+        let mut big_notes = stored;
+        big_notes.notes = Some("1234567".to_owned()); // 14 + 7 = 21 > ceiling 20
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &big_notes, 900, REGION, 10, NOW).is_err());
+        let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
+        assert_eq!(stored.notes, None);
+
+        // 5. Expired grant rejects even small growth without modifying stored data.
+        diesel::update(tenants::table.find("t1"))
+            .set((tenants::storage_ceiling_bytes.eq(1000), tenants::storage_grant_expires_at.eq(Some(NOW - 5))))
+            .execute(c)
+            .unwrap();
+        let mut small_grow = stored;
+        small_grow.data = "0123456789X".to_owned(); // +1 byte
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &small_grow, 900, REGION, 10, NOW).is_err());
+        let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
+        assert_eq!(stored.data, "0123456789");
+
+        // 6. Shrinking / zero-delta updates (including soft-delete) succeed even with an expired grant.
+        let mut shrunk = stored;
+        shrunk.data = "01234".to_owned();
+        shrunk.deleted_at = Some(naive(NOW));
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &shrunk, 900, REGION, 10, NOW).unwrap();
+        let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
+        assert_eq!(stored.data, "01234");
+        assert!(stored.deleted_at.is_some());
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 9);
+
+        // 7. Active cipher quota is enforced atomically under the tenant lock on create and restore.
+        diesel::update(tenants::table.find("t1"))
+            .set((tenants::storage_ceiling_bytes.eq(1000), tenants::storage_grant_expires_at.eq(Some(NOW + 300))))
+            .execute(c)
+            .unwrap();
+        let mut second = Cipher::new(1, "second".to_owned());
+        second.user_uuid = Some(UserId::from("u1".to_owned()));
+        second.tenant_id = Some("t1".to_owned());
+        second.data = "abc".to_owned();
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &second, 900, REGION, 1, NOW).unwrap();
+
+        // Restoring the trashed first cipher would exceed max_ciphers = 1 -> rejected without mutating it.
+        let mut restore = stored;
+        restore.deleted_at = None;
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &restore, 900, REGION, 1, NOW).is_err());
+        assert!(ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap().deleted_at.is_some());
+    }
+
+    #[test]
+    fn v2_upload_concurrent_delete_retains_staged_cleanup_and_leaves_no_orphan() {
+        use std::sync::{Arc, Barrier};
+
+        use crate::db::{models::committed_bytes, test_sqlite_conn_at};
+
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+
+        let dir = TempDirGuard(std::env::temp_dir().join(format!("kyvault-v2-race-{}", get_uuid())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let db_path = dir.0.join("vault.sqlite3");
+        let db_url = db_path.to_string_lossy().into_owned();
+        let store_root = dir.0.join("objects");
+        std::fs::create_dir_all(&store_root).unwrap();
+
+        let mut setup = test_sqlite_conn_at(&db_url);
+        active_tenant(&mut setup, "t1");
+        user(&mut setup, "u1", "t1", "sub1");
+        cipher(&mut setup, "c1", Some("u1"), None, "t1");
+        // Pre-created v2 attachment row (100 declared bytes, actual uploaded blob will be 128 bytes).
+        attachment(&mut setup, "att-v2", "c1", "t1");
+        diesel::update(tenants::table.find("t1"))
+            .set(tenants::storage_reserved_bytes.eq(28))
+            .execute(&mut setup)
+            .unwrap();
+
+        let att = Attachment::new(
+            AttachmentId("att-v2".to_owned()),
+            CipherId::from("c1".to_owned()),
+            "f".to_owned(),
+            100,
+            None,
+        )
+        .with_tenant_id(Some("t1".to_owned()));
+        let object_key = att.get_file_path();
+        let object_path = store_root.join(&object_key);
+        let pending_id = "pd-v2-race";
+
+        // Stage durable in-flight cleanup BEFORE starting the v2 object write.
+        let staged = TenantPendingDeletion {
+            id: pending_id.to_owned(),
+            tenant_id: "t1".to_owned(),
+            user_uuid: Some(UserId::from("u1".to_owned())),
+            storage_kind: "attachment".to_owned(),
+            object_key: object_key.clone(),
+            attempts: 0,
+            last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            created_at: naive(NOW),
+        };
+        diesel::insert_into(tenant_pending_deletions::table).values(&staged).execute(&mut setup).unwrap();
+        assert!(cleanup_pending(&mut setup, None, NOW).unwrap().items.is_empty());
+
+        // Run the v2 object write and concurrent attachment deletion across two threads synchronized
+        // with barriers so deletion deterministically occurs mid-write.
+        let write_started = Arc::new(Barrier::new(2));
+        let delete_done = Arc::new(Barrier::new(2));
+
+        let deleter_db = db_url;
+        let deleter_path = object_path.clone();
+        let b_start = Arc::clone(&write_started);
+        let b_done = Arc::clone(&delete_done);
+        let deleter = std::thread::spawn(move || {
+            let mut del_conn = test_sqlite_conn_at(&deleter_db);
+            b_start.wait();
+            // Concurrent DELETE /ciphers/c1/attachment/att-v2: removes DB row and attempts
+            // object delete before the in-flight upload finishes writing.
+            let removed =
+                diesel::delete(attachments::table.filter(attachments::id.eq("att-v2"))).execute(&mut del_conn).unwrap();
+            assert_eq!(removed, 1);
+            std::fs::remove_file(&deleter_path).ok();
+            b_done.wait();
+        });
+
+        // Uploader thread: begins object write, pauses while deleter removes the DB row, then
+        // completes writing the full 128-byte object to storage.
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        write_started.wait();
+        delete_done.wait();
+        std::fs::write(&object_path, vec![0xABu8; 128]).unwrap();
+        deleter.join().unwrap();
+
+        // At this point the blob exists on disk, the attachment row is gone, and access_epoch is still 1.
+        assert!(object_path.exists());
+        assert_eq!(tenant(&mut setup, "t1").access_epoch, 1);
+
+        // Finalizing the v2 upload MUST fail because the attachment row no longer exists,
+        // and MUST leave the staged pending-deletion row intact for durable cleanup.
+        assert!(
+            Tenant::finalize_v2_attachment_upload_inner(&mut setup, "t1", &att, 128, 28, Some(1), Some(pending_id))
+                .is_err()
+        );
+        assert!(tenant_pending_deletions::table.find(pending_id).first::<TenantPendingDeletion>(&mut setup).is_ok());
+        assert_eq!(tenant(&mut setup, "t1").storage_reserved_bytes, 28);
+
+        // Simulate best-effort object delete failure on the request path: activate the pending
+        // deletion and release the reservation so the cleanup worker reclaims the orphan.
+        diesel::update(tenant_pending_deletions::table.find(pending_id))
+            .set(tenant_pending_deletions::last_error.eq(None::<String>))
+            .execute(&mut setup)
+            .unwrap();
+        diesel::update(tenants::table.find("t1"))
+            .set(tenants::storage_reserved_bytes.eq(0))
+            .execute(&mut setup)
+            .unwrap();
+
+        let pending = cleanup_pending(&mut setup, None, NOW).unwrap().items;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, pending_id);
+        assert_eq!(pending[0].object_key, object_key);
+
+        // Cleanup worker deletes the object and acknowledges completion.
+        std::fs::remove_file(store_root.join(&pending[0].object_key)).unwrap();
+        let done = cleanup_complete(
+            &mut setup,
+            &CompleteRequest {
+                completed_ids: vec![pending[0].id.clone()],
+                failed: vec![],
+            },
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(done.deleted, 1);
+
+        // No untracked object remains, no pending deletions remain, and accounting matches only cipher c1 (11 bytes).
+        assert!(!object_path.exists());
+        assert!(cleanup_pending(&mut setup, None, NOW + UPLOAD_STAGING_GRACE_SECS + 1).unwrap().items.is_empty());
+        assert_eq!(attachments::table.count().get_result::<i64>(&mut setup).unwrap(), 0);
+        assert_eq!(tenant(&mut setup, "t1").storage_reserved_bytes, 0);
+        assert_eq!(committed_bytes(&mut setup, "t1").unwrap(), 11);
+
+        // Also verify normal v2 finalization updates file_size, releases reservation, and clears staged cleanup;
+        // and epoch fencing rejects v2 finalization while keeping staged cleanup intact.
+        attachment(&mut setup, "att-ok", "c1", "t1");
+        diesel::update(tenants::table.find("t1"))
+            .set(tenants::storage_reserved_bytes.eq(28))
+            .execute(&mut setup)
+            .unwrap();
+        let att_ok = Attachment::new(
+            AttachmentId("att-ok".to_owned()),
+            CipherId::from("c1".to_owned()),
+            "f".to_owned(),
+            100,
+            None,
+        )
+        .with_tenant_id(Some("t1".to_owned()));
+        let staged_ok = TenantPendingDeletion {
+            id: "pd-v2-ok".to_owned(),
+            tenant_id: "t1".to_owned(),
+            user_uuid: Some(UserId::from("u1".to_owned())),
+            storage_kind: "attachment".to_owned(),
+            object_key: att_ok.get_file_path(),
+            attempts: 0,
+            last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            created_at: naive(NOW),
+        };
+        diesel::insert_into(tenant_pending_deletions::table).values(&staged_ok).execute(&mut setup).unwrap();
+
+        // Wrong epoch (fenced tenant) fails and preserves staged cleanup.
+        assert!(
+            Tenant::finalize_v2_attachment_upload_inner(&mut setup, "t1", &att_ok, 128, 28, Some(99), Some("pd-v2-ok"))
+                .is_err()
+        );
+        assert!(tenant_pending_deletions::table.find("pd-v2-ok").first::<TenantPendingDeletion>(&mut setup).is_ok());
+
+        // Matching epoch succeeds, updates file_size to 128, releases 28 reserved bytes, and clears pd-v2-ok.
+        Tenant::finalize_v2_attachment_upload_inner(&mut setup, "t1", &att_ok, 128, 28, Some(1), Some("pd-v2-ok"))
+            .unwrap();
+        assert_eq!(attachments::table.find("att-ok").first::<Attachment>(&mut setup).unwrap().file_size, 128);
+        assert_eq!(tenant(&mut setup, "t1").storage_reserved_bytes, 0);
+        assert!(tenant_pending_deletions::table.find("pd-v2-ok").first::<TenantPendingDeletion>(&mut setup).is_err());
     }
 }

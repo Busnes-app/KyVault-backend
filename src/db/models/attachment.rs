@@ -114,6 +114,26 @@ impl Attachment {
         }
     }
 
+    /// Updates `file_size` only if the attachment still exists for its cipher.
+    pub async fn update_file_size_if_exists(&self, file_size: i64, conn: &DbConn) -> EmptyResult {
+        let updated: usize = conn
+            .run(move |conn| {
+                diesel::update(
+                    attachments::table
+                        .filter(attachments::id.eq(&self.id))
+                        .filter(attachments::cipher_uuid.eq(&self.cipher_uuid)),
+                )
+                .set(attachments::file_size.eq(file_size))
+                .execute(conn)
+                .map_res("Error finalizing attachment")
+            })
+            .await?;
+        if updated == 0 {
+            err_code!("Attachment no longer exists", 404);
+        }
+        Ok(())
+    }
+
     pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
         conn.run(move |conn| {
             crate::util::retry(
@@ -132,6 +152,13 @@ impl Attachment {
             if e.kind() == opendal::ErrorKind::NotFound {
                 debug!("File '{file_path}' already deleted.");
             } else {
+                if CONFIG.is_multi_tenant()
+                    && let Some(ref tid) = self.tenant_id
+                    && let Err(queue_err) =
+                        super::Tenant::stage_attachment_cleanup(tid, None, &file_path, false, conn).await
+                {
+                    error!("Failed to queue durable cleanup for deleted attachment {file_path}: {queue_err}");
+                }
                 return Err(e.into());
             }
         }

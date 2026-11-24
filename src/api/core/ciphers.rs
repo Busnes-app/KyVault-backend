@@ -519,32 +519,6 @@ pub async fn update_cipher_from_data(
         err!("Invalid folder", "Folder does not exist or belongs to another user");
     }
 
-    // Modify attachments name and keys when rotating
-    if let Some(attachments) = data.attachments2 {
-        for (id, attachment) in attachments {
-            let Some(mut saved_att) = Attachment::find_by_id(&id, conn).await else {
-                // Warn and continue here.
-                // A missing attachment means it was removed via an other client.
-                // Also the Desktop Client supports removing attachments and save an update afterwards.
-                // Bitwarden it self ignores these mismatches server side.
-                warn!("Attachment {} doesn't exist", id.escape_debug());
-                continue;
-            };
-
-            if saved_att.cipher_uuid != cipher.uuid {
-                // Warn and break here since cloning ciphers provides attachment data but will not be cloned.
-                // If we error out here it will break the whole cloning and causes empty ciphers to appear.
-                warn!("Attachment is not owned by the cipher");
-                break;
-            }
-
-            saved_att.akey = Some(attachment.key);
-            saved_att.file_name = attachment.file_name;
-
-            saved_att.save(conn).await?;
-        }
-    }
-
     let type_data_opt = match data.r#type {
         1 => data.login,
         2 => data.secure_note,
@@ -580,6 +554,34 @@ pub async fn update_cipher_from_data(
     cipher.reprompt = data.reprompt.filter(|r| *r == RepromptType::None as i32 || *r == RepromptType::Password as i32);
 
     cipher.save(conn).await?;
+
+    // Modify attachments name and keys when rotating (after cipher.save succeeds so a rejected
+    // storage grant leaves all stored records untouched).
+    if let Some(attachments) = data.attachments2 {
+        for (id, attachment) in attachments {
+            let Some(mut saved_att) = Attachment::find_by_id(&id, conn).await else {
+                // Warn and continue here.
+                // A missing attachment means it was removed via an other client.
+                // Also the Desktop Client supports removing attachments and save an update afterwards.
+                // Bitwarden it self ignores these mismatches server side.
+                warn!("Attachment {} doesn't exist", id.escape_debug());
+                continue;
+            };
+
+            if saved_att.cipher_uuid != cipher.uuid {
+                // Warn and break here since cloning ciphers provides attachment data but will not be cloned.
+                // If we error out here it will break the whole cloning and causes empty ciphers to appear.
+                warn!("Attachment is not owned by the cipher");
+                break;
+            }
+
+            saved_att.akey = Some(attachment.key);
+            saved_att.file_name = attachment.file_name;
+
+            saved_att.save(conn).await?;
+        }
+    }
+
     cipher.move_to_folder(data.folder_id, &headers.user.uuid, conn).await?;
     cipher.set_favorite(data.favorite, &headers.user.uuid, conn).await?;
 
@@ -1180,6 +1182,7 @@ async fn share_cipher_by_uuid(
     }
 
     let mut shared_to_collections = vec![];
+    let mut newly_linked_collections = vec![];
 
     if let Some(organization_id) = &data.cipher.organization_id {
         if CONFIG.is_multi_tenant() {
@@ -1192,12 +1195,17 @@ async fn share_cipher_by_uuid(
                 "share_cipher_by_uuid_org",
             )?;
         }
+        let existing_collections: HashSet<CollectionId> =
+            HashSet::from_iter(cipher.get_collections(headers.user.uuid.clone(), conn).await);
         for col_id in &data.collection_ids {
             match Collection::find_by_uuid_and_org(col_id, organization_id, conn).await {
                 None => err!("Invalid collection ID provided"),
                 Some(collection) => {
                     if collection.is_writable_by_user(&headers.user.uuid, conn).await {
                         CollectionCipher::save(&cipher.uuid, &collection.uuid, conn).await?;
+                        if !existing_collections.contains(&collection.uuid) {
+                            newly_linked_collections.push(collection.uuid.clone());
+                        }
                         shared_to_collections.push(collection.uuid);
                     } else {
                         err!("No rights to modify the collection")
@@ -1217,7 +1225,14 @@ async fn share_cipher_by_uuid(
         UpdateType::SyncCipherCreate
     };
 
-    update_cipher_from_data(&mut cipher, data.cipher, headers, Some(shared_to_collections), conn, nt, ut).await?;
+    if let Err(e) =
+        update_cipher_from_data(&mut cipher, data.cipher, headers, Some(shared_to_collections), conn, nt, ut).await
+    {
+        for col_id in &newly_linked_collections {
+            CollectionCipher::delete(&cipher.uuid, col_id, conn).await.ok();
+        }
+        return Err(e);
+    }
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))
 }
@@ -1314,6 +1329,14 @@ async fn post_attachment_v2(
         err!("Cipher doesn't exist")
     };
 
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::ensure_same_tenant(
+            headers.user.tenant_id.as_deref(),
+            cipher.tenant_id.as_deref(),
+            "post_attachment_v2",
+        )?;
+    }
+
     if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await {
         err!("Cipher is not write accessible")
     }
@@ -1341,13 +1364,11 @@ async fn post_attachment_v2(
     let attachment =
         Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key))
             .with_tenant_id(headers.user.tenant_id.clone());
-    if let Err(e) = crate::tenancy::save_attachment_releasing(&headers.user, &attachment, file_size, None, &conn).await
+    if let Err(e) =
+        crate::tenancy::save_attachment_releasing(&headers.user, &attachment, file_size, upload_epoch, None, &conn)
+            .await
     {
         crate::tenancy::release_storage_reservation(&headers.user, file_size, &conn).await;
-        return Err(e);
-    }
-    if let Err(e) = crate::tenancy::verify_access_epoch(&headers.user, upload_epoch, &conn).await {
-        attachment.delete(&conn).await.ok();
         return Err(e);
     }
     notify_attachment_created(&cipher, &headers, &conn, &nt).await;
@@ -1382,7 +1403,7 @@ struct UploadData<'f> {
 /// When used with the legacy API, this function is responsible for creating
 /// the attachment database record, so `attachment` is None.
 async fn save_attachment(
-    mut attachment: Option<Attachment>,
+    attachment: Option<Attachment>,
     cipher_id: CipherId,
     data: Form<UploadData<'_>>,
     headers: &Headers,
@@ -1402,6 +1423,21 @@ async fn save_attachment(
         err!("Cipher doesn't exist")
     };
 
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::ensure_same_tenant(
+            headers.user.tenant_id.as_deref(),
+            cipher.tenant_id.as_deref(),
+            "save_attachment_cipher",
+        )?;
+        if let Some(ref att) = attachment {
+            crate::tenancy::ensure_same_tenant(
+                headers.user.tenant_id.as_deref(),
+                att.tenant_id.as_deref(),
+                "save_attachment_att",
+            )?;
+        }
+    }
+
     if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await {
         err!("Cipher is not write accessible")
     }
@@ -1419,48 +1455,20 @@ async fn save_attachment(
         err!("Attachment storage limit exceeded with this file");
     }
 
-    let delta_bytes = size.saturating_sub(size_adjust).max(0);
-    let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, delta_bytes, &conn).await?;
-    // Reserved bytes not yet released into a saved attachment row.
-    let mut held = delta_bytes;
-
-    let file_id = match &attachment {
-        Some(attachment) => attachment.id.clone(), // v2 API
-        None => crypto::generate_attachment_id(),  // Legacy API
-    };
-
-    let (storage_path, created_attachment) = if let Some(attachment) = &mut attachment {
-        // v2 API
-
-        // Check the actual size against the size initially provided by
-        // the client. Upstream allows +/- 1 MiB deviation from this
-        // size, but it's not clear when or why this is needed.
+    let (storage_path, created_attachment) = if let Some(ref attachment) = attachment {
+        // v2 API: validate size leeway BEFORE reserving storage or writing object storage.
+        // Actual file_size is committed atomically during post-write finalization so a
+        // concurrently deleted attachment row can never be resurrected.
         const LEEWAY: i64 = 1024 * 1024; // 1 MiB
         let Some(max_size) = attachment.file_size.checked_add(LEEWAY) else {
-            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             err!("Invalid attachment size max")
         };
         let Some(min_size) = attachment.file_size.checked_sub(LEEWAY) else {
-            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             err!("Invalid attachment size min")
         };
 
-        if min_size <= size && size <= max_size {
-            if size != attachment.file_size {
-                // Update the attachment with the actual file size.
-                attachment.file_size = size;
-                if let Err(e) =
-                    crate::tenancy::save_attachment_releasing(&headers.user, attachment, held, None, &conn).await
-                {
-                    crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
-                    return Err(e);
-                }
-                held = 0;
-            }
-        } else {
-            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
+        if !(min_size <= size && size <= max_size) {
             attachment.delete(&conn).await.ok();
-
             err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
         }
         (attachment.get_file_path(), None)
@@ -1473,82 +1481,81 @@ async fn save_attachment(
         let encrypted_filename = data.data.raw_name().map(|s| s.dangerous_unsafe_unsanitized_raw().to_string());
 
         if encrypted_filename.is_none() {
-            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             err!("No filename provided")
         }
         if data.key.is_none() {
-            crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
             err!("No attachment key provided")
         }
-        let att = Attachment::new(file_id.clone(), cipher_id.clone(), encrypted_filename.unwrap(), size, data.key)
+        let file_id = crypto::generate_attachment_id();
+        let att = Attachment::new(file_id, cipher_id.clone(), encrypted_filename.unwrap(), size, data.key)
             .with_tenant_id(headers.user.tenant_id.clone());
         let path = att.get_file_path();
         (path, Some(att))
     };
 
-    // For legacy uploads, record a durable pending-deletion row before writing object storage so
-    // any crash, fencing failure, or attachment-insert failure cannot orphan the uploaded blob.
-    let pending_cleanup_id = if created_attachment.is_some() {
+    let delta_bytes = size.saturating_sub(size_adjust).max(0);
+    let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, delta_bytes, &conn).await?;
+    // Reserved bytes not yet released by transactional finalization.
+    let held = delta_bytes;
+
+    // Record a durable pending-deletion row BEFORE EVERY object write (both v2 and legacy) so
+    // any crash, fencing failure, concurrent attachment deletion, or DB insert failure cannot
+    // orphan the uploaded blob outside accounting and cleanup.
+    let pending_cleanup_id =
         match crate::tenancy::stage_attachment_cleanup(&headers.user, &storage_path, true, &conn).await {
             Ok(id) => id,
             Err(e) => {
                 crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
                 return Err(e);
             }
-        }
-    } else {
-        None
-    };
+        };
 
-    let write_res = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await;
-    if let Err(e) = write_res {
+    if let Err(e) = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await {
+        if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
+            operator.delete(&storage_path).await.ok();
+        }
         crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
         crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
         return Err(e);
     }
 
-    // Fence late uploaders: verify tenant is still active at the same access_epoch BEFORE
-    // committing/keeping the uploaded object.
-    if let Err(e) = crate::tenancy::verify_access_epoch(&headers.user, upload_epoch, &conn).await {
-        let deleted = match CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
-            Ok(operator) => operator.delete(&storage_path).await.is_ok(),
-            Err(_) => false,
-        };
-        if pending_cleanup_id.is_some() {
-            crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
-        } else if !deleted
-            && let Err(queue_err) =
-                crate::tenancy::stage_attachment_cleanup(&headers.user, &storage_path, false, &conn).await
-        {
-            error!("Failed to queue durable cleanup for fenced v2 upload {storage_path}: {queue_err}");
+    let finalize_res = match (&created_attachment, &attachment) {
+        (Some(att), _) => {
+            crate::tenancy::save_attachment_releasing(
+                &headers.user,
+                att,
+                held,
+                upload_epoch,
+                pending_cleanup_id.as_deref(),
+                &conn,
+            )
+            .await
         }
+        (None, Some(att)) => {
+            crate::tenancy::finalize_v2_attachment_upload(
+                &headers.user,
+                att,
+                size,
+                held,
+                upload_epoch,
+                pending_cleanup_id.as_deref(),
+                &conn,
+            )
+            .await
+        }
+        (None, None) => unreachable!("either created_attachment or attachment is always Some"),
+    };
+
+    if let Err(e) = finalize_res {
+        if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
+            operator.delete(&storage_path).await.ok();
+        }
+        crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
         if let Some(ref att) = attachment {
             att.delete(&conn).await.ok();
         }
         crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
         return Err(e);
-    }
-
-    match created_attachment {
-        Some(ref att) => {
-            if let Err(e) = crate::tenancy::save_attachment_releasing(
-                &headers.user,
-                att,
-                held,
-                pending_cleanup_id.as_deref(),
-                &conn,
-            )
-            .await
-            {
-                if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
-                    operator.delete(&storage_path).await.ok();
-                }
-                crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
-                crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
-                return Err(e);
-            }
-        }
-        None => crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await,
     }
 
     // With the v2 API, post_attachment_v2() already did this when it created the attachment record
