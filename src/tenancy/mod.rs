@@ -264,5 +264,6 @@ mod tests {
         assert!(!pubsub::is_safe_pg_ident(""));
         assert!(!pubsub::is_safe_pg_ident("kyvault; DROP TABLE users;--"));
         assert!(!pubsub::is_safe_pg_ident("bad-hyphen"));
+        assert!(!pubsub::is_safe_pg_ident("KyVault_notify"), "the listener and config share this check");
     }
 }

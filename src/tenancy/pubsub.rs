@@ -62,7 +62,6 @@ pub fn publish_user_logout(user_id: &UserId) {
     }
 }
 
-#[cfg_attr(not(postgresql), allow(dead_code, reason = "only the PostgreSQL listener and tests use it"))]
 pub(crate) fn is_safe_pg_ident(s: &str) -> bool {
     !s.is_empty() && s.len() <= 63 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }

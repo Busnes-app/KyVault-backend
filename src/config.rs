@@ -1213,15 +1213,8 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
             if !(60..=900).contains(&cfg.tenancy_authority_max_age_secs) {
                 err!("`TENANCY_AUTHORITY_MAX_AGE_SECS` must be between 60 and 900 seconds");
             }
-            let ch = cfg.tenancy_pg_notify_channel.as_str();
-            let valid_channel = !ch.is_empty()
-                && ch.len() <= 63
-                && ch
-                    .bytes()
-                    .enumerate()
-                    .all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit()));
-            if !valid_channel {
-                err!("`TENANCY_PG_NOTIFY_CHANNEL` must be a valid PostgreSQL identifier");
+            if !crate::tenancy::pubsub::is_safe_pg_ident(&cfg.tenancy_pg_notify_channel) {
+                err!("`TENANCY_PG_NOTIFY_CHANNEL` must be 1-63 characters of [a-z0-9_]");
             }
         }
         other => {
