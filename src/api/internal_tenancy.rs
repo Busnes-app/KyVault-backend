@@ -154,7 +154,7 @@ async fn cleanup_pending(
     conn: DbConn,
     limit: Option<i64>,
 ) -> ApiResult<Json<ops::PendingResponse>> {
-    Ok(Json(conn.run(move |c| ops::cleanup_pending(c, limit)).await?))
+    Ok(Json(conn.run(move |c| ops::cleanup_pending(c, limit, now())).await?))
 }
 
 #[post("/cleanup/complete", data = "<data>")]

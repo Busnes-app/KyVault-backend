@@ -169,7 +169,13 @@ async fn put_personal_recovery(data: Json<PersonalRecoveryPayload>, headers: Hea
         data.wrapped_private_key,
         data.recovery_key_hint,
     );
-    bundle.upsert_personal_kit(&conn).await?;
+    if CONFIG.is_multi_tenant() {
+        bundle
+            .upsert_personal_kit_enforcing_grant(&CONFIG.home_region(), CONFIG.tenancy_authority_max_age_secs(), &conn)
+            .await?;
+    } else {
+        bundle.upsert_personal_kit(&conn).await?;
+    }
 
     info!("AUDIT: User {} updated personal_kit recovery bundle {} (tenant {})", headers.user.uuid, bundle.uuid, tid);
 

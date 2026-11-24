@@ -279,37 +279,120 @@ impl Tenant {
         .await
     }
 
-    /// Saves an attachment row and releases `release` reserved bytes in one transaction under
-    /// the tenant lock, so a concurrent admission never counts those bytes twice.
-    #[cfg_attr(not(postgresql), expect(unused_variables, reason = "hosted storage is PostgreSQL-only"))]
+    /// Records a pending attachment deletion row before writing an upload to storage, tagged with
+    /// `last_error = "upload_in_flight"` so active uploads are not deleted by the worker until
+    /// either finalization fails (which activates it immediately) or the staging grace expires.
+    pub async fn stage_attachment_cleanup(
+        tenant_id: &str,
+        user_uuid: Option<UserId>,
+        object_key: &str,
+        in_flight: bool,
+        conn: &DbConn,
+    ) -> Result<String, crate::Error> {
+        let row = TenantPendingDeletion {
+            id: get_uuid(),
+            tenant_id: tenant_id.to_owned(),
+            user_uuid,
+            storage_kind: "attachment".to_owned(),
+            object_key: object_key.to_owned(),
+            attempts: 0,
+            last_error: in_flight.then(|| crate::tenancy::ops::UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            created_at: Utc::now().naive_utc(),
+        };
+        let id = row.id.clone();
+        conn.run(move |conn| -> EmptyResult {
+            diesel::insert_into(tenant_pending_deletions::table)
+                .values(&row)
+                .execute(conn)
+                .map_res("Error staging attachment cleanup")
+        })
+        .await?;
+        Ok(id)
+    }
+
+    /// Clears the `upload_in_flight` marker on a staged pending deletion so the cleanup worker
+    /// drains it on its very next pass.
+    pub async fn activate_pending_deletion(pending_id: &str, conn: &DbConn) {
+        let pid = pending_id.to_owned();
+        let res = conn
+            .run(move |conn| {
+                diesel::update(tenant_pending_deletions::table.find(&pid))
+                    .set(tenant_pending_deletions::last_error.eq(None::<String>))
+                    .execute(conn)
+            })
+            .await;
+        if let Err(e) = res {
+            error!("Failed to activate staged pending deletion {pending_id}: {e}");
+        }
+    }
+
+    /// Transactionally locks the tenant, saves `att`, releases `release` reserved bytes, and
+    /// clears `clear_pending_id` (if any) from `tenant_pending_deletions`. If saving `att` fails
+    /// (for example on a cipher foreign-key violation), the transaction rolls back so the pending
+    /// cleanup row remains intact.
+    pub fn save_attachment_releasing_inner(
+        conn: &mut DbConnInner,
+        tid: &str,
+        att: &Attachment,
+        release: i64,
+        clear_pending_id: Option<&str>,
+    ) -> EmptyResult {
+        let release = release.max(0);
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            let Some(tenant) = lock_tenant(conn, tid)? else {
+                return Err(diesel::result::Error::NotFound);
+            };
+            match conn {
+                #[cfg(mysql)]
+                DbConnInner::Mysql(c) => diesel::insert_into(attachments::table)
+                    .values(att)
+                    .on_conflict(diesel::dsl::DuplicatedKeys)
+                    .do_update()
+                    .set(att)
+                    .execute(c)?,
+                #[cfg(postgresql)]
+                DbConnInner::Postgresql(c) => diesel::insert_into(attachments::table)
+                    .values(att)
+                    .on_conflict(attachments::id)
+                    .do_update()
+                    .set(att)
+                    .execute(c)?,
+                #[cfg(sqlite)]
+                DbConnInner::Sqlite(c) => diesel::insert_into(attachments::table)
+                    .values(att)
+                    .on_conflict(attachments::id)
+                    .do_update()
+                    .set(att)
+                    .execute(c)?,
+            };
+            diesel::update(tenants::table.find(tid))
+                .set(tenants::storage_reserved_bytes.eq(tenant.storage_reserved_bytes.saturating_sub(release).max(0)))
+                .execute(conn)?;
+            if let Some(pid) = clear_pending_id {
+                diesel::delete(tenant_pending_deletions::table.find(pid)).execute(conn)?;
+            }
+            Ok(())
+        })
+        .map_res("Error saving attachment")
+    }
+
+    /// Saves an attachment row, releases `release` reserved bytes, and clears `clear_pending_id`
+    /// in one transaction under the tenant lock, so a concurrent admission never counts those
+    /// bytes twice and a failed save never drops its cleanup job.
     pub async fn save_attachment_releasing(
         tenant_id: &str,
         att: &Attachment,
         release: i64,
+        clear_pending_id: Option<&str>,
         conn: &DbConn,
     ) -> EmptyResult {
         let tid = tenant_id.to_owned();
-        let release = release.max(0);
-        conn.run(move |conn| match conn {
-            #[cfg(postgresql)]
-            DbConnInner::Postgresql(pg) => pg
-                .transaction::<_, diesel::result::Error, _>(|pg| {
-                    let reserved: i64 =
-                        tenants::table.find(&tid).select(tenants::storage_reserved_bytes).for_update().first(pg)?;
-                    diesel::insert_into(attachments::table)
-                        .values(att)
-                        .on_conflict(attachments::id)
-                        .do_update()
-                        .set(att)
-                        .execute(pg)?;
-                    diesel::update(tenants::table.find(&tid))
-                        .set(tenants::storage_reserved_bytes.eq(reserved.saturating_sub(release).max(0)))
-                        .execute(pg)?;
-                    Ok(())
-                })
-                .map_res("Error saving attachment"),
-            #[allow(unreachable_patterns, reason = "only reachable when another backend is compiled in")]
-            _ => err_code!("Hosted multi-tenant storage requires PostgreSQL", 503),
+        let pid = clear_pending_id.map(str::to_owned);
+        conn.run(move |conn| {
+            if !is_postgresql(conn) {
+                err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
+            }
+            Self::save_attachment_releasing_inner(conn, &tid, att, release, pid.as_deref())
         })
         .await
     }
@@ -427,7 +510,6 @@ pub fn committed_bytes(conn: &mut DbConnInner, tenant_id: &str) -> QueryResult<i
     let bundle_sql = octet_sum_sql(conn, &["wrapped_user_key", "wrapped_private_key"]);
     let bundles: i64 = tenant_recovery_bundles::table
         .filter(tenant_recovery_bundles::tenant_id.eq(tenant_id))
-        .filter(tenant_recovery_bundles::revoked_at.is_null())
         .select(sql::<BigInt>(&bundle_sql))
         .first(conn)?;
 
@@ -533,6 +615,11 @@ impl TenantRecoveryBundle {
         }
     }
 
+    pub fn byte_len(&self) -> i64 {
+        let total = self.wrapped_user_key.len().saturating_add(self.wrapped_private_key.as_deref().map_or(0, str::len));
+        i64::try_from(total).unwrap_or(i64::MAX)
+    }
+
     pub async fn find_active_personal_kit(tenant_id: &str, user_uuid: &UserId, conn: &DbConn) -> Option<Self> {
         let tid = tenant_id.to_owned();
         let uid = user_uuid.clone();
@@ -549,53 +636,98 @@ impl TenantRecoveryBundle {
         .await
     }
 
-    /// Atomically revokes any prior active personal kit for this user and inserts the new bundle.
-    pub async fn upsert_personal_kit(&self, conn: &DbConn) -> EmptyResult {
-        let row = self.clone();
-        let now = Utc::now().naive_utc();
-        db_run! { conn:
-            postgresql, sqlite, mysql {
-                conn.transaction::<_, crate::Error, _>(|conn| {
-                    diesel::update(
-                        tenant_recovery_bundles::table
-                            .filter(tenant_recovery_bundles::tenant_id.eq(&row.tenant_id))
-                            .filter(tenant_recovery_bundles::user_uuid.eq(&row.user_uuid))
-                            .filter(tenant_recovery_bundles::bundle_type.eq(RECOVERY_BUNDLE_KIT))
-                            .filter(tenant_recovery_bundles::revoked_at.is_null()),
-                    )
-                    .set((
-                        tenant_recovery_bundles::revoked_at.eq(Some(now)),
-                        tenant_recovery_bundles::updated_at.eq(now),
-                    ))
-                    .execute(conn)
-                    .map(drop)
-                    .map_res("Error revoking previous recovery bundle")?;
+    /// Transactionally enforces storage admission (when `check_grant` is `Some`), deletes any
+    /// prior personal kit rows for this user so superseded ciphertext is never retained
+    /// unaccounted, and inserts `row`.
+    pub fn upsert_personal_kit_inner(
+        conn: &mut DbConnInner,
+        row: &Self,
+        check_grant: Option<(&str, i64)>,
+        now: i64,
+    ) -> EmptyResult {
+        use diesel::{dsl::sql, sql_types::BigInt};
 
-                    diesel::insert_into(tenant_recovery_bundles::table)
-                        .values(&row)
-                        .execute(conn)
-                        .map(drop)
-                        .map_res("Error inserting recovery bundle")?;
+        conn.transaction::<_, crate::Error, _>(|conn| {
+            if let Some((home_region, max_authority_age_secs)) = check_grant {
+                let Some(tenant) = lock_tenant(conn, &row.tenant_id)? else {
+                    err_code!("Tenant not found", 403);
+                };
+                validate_tenant_growth_tx(&tenant, home_region, now, max_authority_age_secs)?;
 
-                    Ok(())
-                })
+                let bundle_sql = octet_sum_sql(conn, &["wrapped_user_key", "wrapped_private_key"]);
+                let existing_bytes: i64 = tenant_recovery_bundles::table
+                    .filter(tenant_recovery_bundles::tenant_id.eq(&row.tenant_id))
+                    .filter(tenant_recovery_bundles::user_uuid.eq(&row.user_uuid))
+                    .filter(tenant_recovery_bundles::bundle_type.eq(RECOVERY_BUNDLE_KIT))
+                    .select(sql::<BigInt>(&bundle_sql))
+                    .first::<i64>(conn)
+                    .map_res("Error measuring existing recovery bundle")?
+                    .max(0);
+                let delta = row.byte_len().saturating_sub(existing_bytes).max(0);
+                if delta > 0 {
+                    let committed = committed_bytes(conn, &row.tenant_id).map_res("Error checking tenant storage")?;
+                    if !tenant.can_grow_storage(committed, delta, now) {
+                        err_code!("Organization storage quota exceeded or grant expired", 403);
+                    }
+                }
             }
-        }
+
+            diesel::delete(
+                tenant_recovery_bundles::table
+                    .filter(tenant_recovery_bundles::tenant_id.eq(&row.tenant_id))
+                    .filter(tenant_recovery_bundles::user_uuid.eq(&row.user_uuid))
+                    .filter(tenant_recovery_bundles::bundle_type.eq(RECOVERY_BUNDLE_KIT)),
+            )
+            .execute(conn)
+            .map(drop)
+            .map_res("Error replacing previous recovery bundle")?;
+
+            diesel::insert_into(tenant_recovery_bundles::table)
+                .values(row)
+                .execute(conn)
+                .map(drop)
+                .map_res("Error inserting recovery bundle")?;
+
+            Ok(())
+        })
     }
 
+    /// Atomically replaces any prior personal kit for this user (single-tenant mode).
+    pub async fn upsert_personal_kit(&self, conn: &DbConn) -> EmptyResult {
+        let row = self.clone();
+        conn.run(move |conn| Self::upsert_personal_kit_inner(conn, &row, None, Utc::now().timestamp())).await
+    }
+
+    /// Atomically checks tenant storage grant admission under the tenant lock and replaces any
+    /// prior personal kit for this user (hosted multi-tenant mode).
+    pub async fn upsert_personal_kit_enforcing_grant(
+        &self,
+        home_region: &str,
+        max_authority_age_secs: i64,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let row = self.clone();
+        let region = home_region.to_owned();
+        conn.run(move |conn| {
+            if !is_postgresql(conn) {
+                err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
+            }
+            Self::upsert_personal_kit_inner(conn, &row, Some((&region, max_authority_age_secs)), Utc::now().timestamp())
+        })
+        .await
+    }
+
+    /// Deletes the user's personal recovery kit rows so revoked ciphertext is not retained.
     pub async fn revoke_personal_kit(tenant_id: &str, user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
         let tid = tenant_id.to_owned();
         let uid = user_uuid.clone();
-        let now = Utc::now().naive_utc();
         conn.run(move |conn| {
-            diesel::update(
+            diesel::delete(
                 tenant_recovery_bundles::table
                     .filter(tenant_recovery_bundles::tenant_id.eq(tid))
                     .filter(tenant_recovery_bundles::user_uuid.eq(uid))
-                    .filter(tenant_recovery_bundles::bundle_type.eq(RECOVERY_BUNDLE_KIT))
-                    .filter(tenant_recovery_bundles::revoked_at.is_null()),
+                    .filter(tenant_recovery_bundles::bundle_type.eq(RECOVERY_BUNDLE_KIT)),
             )
-            .set((tenant_recovery_bundles::revoked_at.eq(Some(now)), tenant_recovery_bundles::updated_at.eq(now)))
             .execute(conn)
             .map_res("Error revoking recovery bundle")
         })

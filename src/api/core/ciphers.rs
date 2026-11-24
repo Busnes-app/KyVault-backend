@@ -1341,7 +1341,8 @@ async fn post_attachment_v2(
     let attachment =
         Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key))
             .with_tenant_id(headers.user.tenant_id.clone());
-    if let Err(e) = crate::tenancy::save_attachment_releasing(&headers.user, &attachment, file_size, &conn).await {
+    if let Err(e) = crate::tenancy::save_attachment_releasing(&headers.user, &attachment, file_size, None, &conn).await
+    {
         crate::tenancy::release_storage_reservation(&headers.user, file_size, &conn).await;
         return Err(e);
     }
@@ -1448,7 +1449,8 @@ async fn save_attachment(
             if size != attachment.file_size {
                 // Update the attachment with the actual file size.
                 attachment.file_size = size;
-                if let Err(e) = crate::tenancy::save_attachment_releasing(&headers.user, attachment, held, &conn).await
+                if let Err(e) =
+                    crate::tenancy::save_attachment_releasing(&headers.user, attachment, held, None, &conn).await
                 {
                     crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
                     return Err(e);
@@ -1484,8 +1486,23 @@ async fn save_attachment(
         (path, Some(att))
     };
 
+    // For legacy uploads, record a durable pending-deletion row before writing object storage so
+    // any crash, fencing failure, or attachment-insert failure cannot orphan the uploaded blob.
+    let pending_cleanup_id = if created_attachment.is_some() {
+        match crate::tenancy::stage_attachment_cleanup(&headers.user, &storage_path, true, &conn).await {
+            Ok(id) => id,
+            Err(e) => {
+                crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
     let write_res = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await;
     if let Err(e) = write_res {
+        crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
         crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
         return Err(e);
     }
@@ -1493,8 +1510,17 @@ async fn save_attachment(
     // Fence late uploaders: verify tenant is still active at the same access_epoch BEFORE
     // committing/keeping the uploaded object.
     if let Err(e) = crate::tenancy::verify_access_epoch(&headers.user, upload_epoch, &conn).await {
-        if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
-            operator.delete(&storage_path).await.ok();
+        let deleted = match CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
+            Ok(operator) => operator.delete(&storage_path).await.is_ok(),
+            Err(_) => false,
+        };
+        if pending_cleanup_id.is_some() {
+            crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
+        } else if !deleted
+            && let Err(queue_err) =
+                crate::tenancy::stage_attachment_cleanup(&headers.user, &storage_path, false, &conn).await
+        {
+            error!("Failed to queue durable cleanup for fenced v2 upload {storage_path}: {queue_err}");
         }
         if let Some(ref att) = attachment {
             att.delete(&conn).await.ok();
@@ -1505,7 +1531,19 @@ async fn save_attachment(
 
     match created_attachment {
         Some(ref att) => {
-            if let Err(e) = crate::tenancy::save_attachment_releasing(&headers.user, att, held, &conn).await {
+            if let Err(e) = crate::tenancy::save_attachment_releasing(
+                &headers.user,
+                att,
+                held,
+                pending_cleanup_id.as_deref(),
+                &conn,
+            )
+            .await
+            {
+                if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
+                    operator.delete(&storage_path).await.ok();
+                }
+                crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
                 crate::tenancy::release_storage_reservation(&headers.user, held, &conn).await;
                 return Err(e);
             }

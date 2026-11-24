@@ -298,10 +298,11 @@ pub fn reconcile_orgs(
         let mut kicks = Kicks::default();
         for i in order {
             let org = &req.orgs[i];
-            if !home_region.is_empty() && !org.home_region.is_empty() && org.home_region != home_region {
+            let existing = lock_tenant(conn, &org.id)?;
+            let wrong_region = !home_region.is_empty() && !org.home_region.is_empty() && org.home_region != home_region;
+            if existing.is_none() && wrong_region {
                 continue;
             }
-            let existing = lock_tenant(conn, &org.id)?;
             if let Some(t) = &existing {
                 if is_tombstoned(&t.status) {
                     if t.status != STATUS_DELETED || t.erased_at.is_none() {
@@ -310,15 +311,19 @@ pub fn reconcile_orgs(
                     continue;
                 }
                 if org.revision > 0 && t.revision > 0 && org.revision < t.revision {
-                    diesel::update(tenants::table.find(&t.id))
-                        .set(tenants::authority_refreshed_at.eq(Some(now)))
-                        .execute(conn)?;
+                    if !wrong_region {
+                        diesel::update(tenants::table.find(&t.id))
+                            .set(tenants::authority_refreshed_at.eq(Some(now)))
+                            .execute(conn)?;
+                    }
                     continue;
                 }
             }
             let created = existing.is_none();
             let mut t = existing.unwrap_or_else(|| Tenant::new(org.id.clone(), org.home_region.clone()));
-            let was_active = !created && t.is_active();
+            let was_locally_active = !created
+                && t.is_active()
+                && (home_region.is_empty() || t.home_region.is_empty() || t.home_region == home_region);
 
             if !org.home_region.is_empty() {
                 t.home_region.clone_from(&org.home_region);
@@ -332,11 +337,15 @@ pub fn reconcile_orgs(
             t.app_enabled = org.enabled;
             t.revision = t.revision.max(org.revision);
             t.quotas_json.clone_from(&quotas[i]);
-            t.authority_refreshed_at = Some(now);
+            t.authority_refreshed_at = if wrong_region {
+                None
+            } else {
+                Some(now)
+            };
             t.updated_at = now_dt;
 
-            let non_active = !org.enabled || org.status != TENANT_STATUS_ACTIVE;
-            if non_active && (was_active || created) {
+            let non_active = wrong_region || !org.enabled || org.status != TENANT_STATUS_ACTIVE;
+            if non_active && (was_locally_active || created) {
                 t.access_epoch = t.access_epoch.saturating_add(1);
                 t.storage_ceiling_bytes = 0;
                 t.storage_grant_expires_at = None;
@@ -897,14 +906,28 @@ pub struct PendingItem {
     pub attempts: i32,
 }
 
+/// Marker stored in `tenant_pending_deletions.last_error` while an attachment upload is actively
+/// writing to object storage. `cleanup_pending` hides rows with this marker until either upload
+/// finalization fails (clearing the marker immediately) or `UPLOAD_STAGING_GRACE_SECS` elapses
+/// after a crash so an abandoned upload is still reclaimed.
+pub const UPLOAD_IN_FLIGHT_MARKER: &str = "upload_in_flight";
+const UPLOAD_STAGING_GRACE_SECS: i64 = 900;
+
 #[derive(Debug, Serialize)]
 pub struct PendingResponse {
     pub items: Vec<PendingItem>,
 }
 
-pub fn cleanup_pending(conn: &mut DbConnInner, limit: Option<i64>) -> OpResult<PendingResponse> {
+pub fn cleanup_pending(conn: &mut DbConnInner, limit: Option<i64>, now: i64) -> OpResult<PendingResponse> {
     let limit = limit.unwrap_or(100).clamp(1, MAX_BATCH_SQL);
+    let staging_cutoff = naive(now.saturating_sub(UPLOAD_STAGING_GRACE_SECS));
     let items = tenant_pending_deletions::table
+        .filter(
+            tenant_pending_deletions::last_error
+                .is_null()
+                .or(tenant_pending_deletions::last_error.ne(UPLOAD_IN_FLIGHT_MARKER))
+                .or(tenant_pending_deletions::created_at.le(staging_cutoff)),
+        )
         .order((tenant_pending_deletions::created_at.asc(), tenant_pending_deletions::id.asc()))
         .limit(limit)
         .select((
@@ -1705,9 +1728,9 @@ mod tests {
         // Re-run is idempotent: no duplicate prefix sweep.
         assert_eq!(purge_begin(c, "ta", ISS, NOW).unwrap().0.pending_deletions, 3);
 
-        let items = cleanup_pending(c, Some(2)).unwrap().items;
+        let items = cleanup_pending(c, Some(2), NOW).unwrap().items;
         assert_eq!(items.len(), 2);
-        let all: Vec<String> = cleanup_pending(c, None).unwrap().items.into_iter().map(|i| i.id).collect();
+        let all: Vec<String> = cleanup_pending(c, None, NOW).unwrap().items.into_iter().map(|i| i.id).collect();
         let r = cleanup_complete(
             c,
             &CompleteRequest {
@@ -1879,7 +1902,7 @@ mod tests {
                 c,
                 &RepairSeqRequest {
                     org_id: "nope".to_owned(),
-                    next_seq: 1
+                    next_seq: 1,
                 }
             )
             .is_err()
@@ -1908,5 +1931,208 @@ mod tests {
         let comp: CompleteRequest = serde_json::from_str(r#"{"completed_ids":null,"failed":null}"#).unwrap();
         assert_eq!(comp.completed_ids.len(), 0);
         assert_eq!(comp.failed.len(), 0);
+    }
+
+    #[test]
+    fn reconcile_home_region_change_fences_existing_tenant() {
+        let c = &mut test_sqlite_conn();
+        reconcile(c, vec![snap("t1", "active", true, 1)], false, NOW);
+        user(c, "u1", "t1", "sub1");
+        diesel::update(tenants::table.find("t1"))
+            .set((tenants::storage_ceiling_bytes.eq(5000), tenants::storage_grant_expires_at.eq(Some(NOW + 600))))
+            .execute(c)
+            .unwrap();
+        assert_eq!(stamp(c, "u1"), "stamp-u1");
+
+        // Snapshot moves existing local tenant t1 to another region and also contains an unknown
+        // foreign tenant t2. With touch_all_active=true, t1 must be fenced and NOT refreshed,
+        // while t2 must not be created locally.
+        let mut moved = snap("t1", "active", true, 2);
+        moved.home_region = "eu-west-1".to_owned();
+        let mut foreign = snap("t2", "active", true, 1);
+        foreign.home_region = "eu-west-1".to_owned();
+
+        let (resp, kicks) = reconcile_orgs(
+            c,
+            &ReconcileRequest {
+                orgs: vec![moved, foreign],
+                touch_all_active: true,
+            },
+            "us-east-1",
+            NOW + 60,
+        )
+        .unwrap();
+
+        assert_eq!(resp.applied, 1);
+        assert_eq!(resp.fenced_tenant_ids, vec!["t1"]);
+        assert_eq!(kicks.tenants, vec!["t1"]);
+        assert!(tenants::table.find("t2").first::<Tenant>(c).is_err());
+
+        let t = tenant(c, "t1");
+        assert_eq!(t.home_region, "eu-west-1");
+        assert_eq!(t.access_epoch, 2);
+        assert_eq!(t.storage_ceiling_bytes, 0);
+        assert_eq!(t.storage_grant_expires_at, None);
+        assert_eq!(t.authority_refreshed_at, None);
+        assert_ne!(stamp(c, "u1"), "stamp-u1");
+        let rt: String = devices::table.find(("dev-u1", "u1")).select(devices::refresh_token).first(c).unwrap();
+        assert_ne!(rt, "rt-u1");
+    }
+
+    #[test]
+    fn recovery_kit_enforces_storage_grant_and_replaces_old_ciphertext() {
+        use crate::db::models::{TenantRecoveryBundle, UserId, committed_bytes};
+
+        let c = &mut test_sqlite_conn();
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+        diesel::update(tenants::table.find("t1"))
+            .set((
+                tenants::storage_ceiling_bytes.eq(30),
+                tenants::storage_grant_expires_at.eq(Some(NOW + 600)),
+                tenants::authority_refreshed_at.eq(Some(NOW)),
+            ))
+            .execute(c)
+            .unwrap();
+
+        let k1 = TenantRecoveryBundle::new_personal_kit(
+            "t1".to_owned(),
+            UserId::from("u1".to_owned()),
+            1,
+            "{}".to_owned(),
+            "a".repeat(10),
+            None,
+            None,
+        );
+        TenantRecoveryBundle::upsert_personal_kit_inner(c, &k1, Some(("us-east-1", 900)), NOW).unwrap();
+        assert_eq!(tenant_recovery_bundles::table.count().get_result::<i64>(c).unwrap(), 1);
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 10);
+
+        // Rotate within grant: old bundle is deleted, not left uncounted.
+        let k2 = TenantRecoveryBundle::new_personal_kit(
+            "t1".to_owned(),
+            UserId::from("u1".to_owned()),
+            1,
+            "{}".to_owned(),
+            "b".repeat(20),
+            None,
+            None,
+        );
+        TenantRecoveryBundle::upsert_personal_kit_inner(c, &k2, Some(("us-east-1", 900)), NOW).unwrap();
+        assert_eq!(tenant_recovery_bundles::table.count().get_result::<i64>(c).unwrap(), 1);
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 20);
+
+        // Exhausted grant rejects larger upload without touching existing kit.
+        let k_too_big = TenantRecoveryBundle::new_personal_kit(
+            "t1".to_owned(),
+            UserId::from("u1".to_owned()),
+            1,
+            "{}".to_owned(),
+            "c".repeat(40),
+            None,
+            None,
+        );
+        assert!(TenantRecoveryBundle::upsert_personal_kit_inner(c, &k_too_big, Some(("us-east-1", 900)), NOW).is_err());
+
+        // Expired grant rejects larger upload without inserting or revoking rows.
+        diesel::update(tenants::table.find("t1"))
+            .set((tenants::storage_ceiling_bytes.eq(1000), tenants::storage_grant_expires_at.eq(Some(NOW - 10))))
+            .execute(c)
+            .unwrap();
+        let k3 = TenantRecoveryBundle::new_personal_kit(
+            "t1".to_owned(),
+            UserId::from("u1".to_owned()),
+            1,
+            "{}".to_owned(),
+            "d".repeat(30),
+            None,
+            None,
+        );
+        assert!(TenantRecoveryBundle::upsert_personal_kit_inner(c, &k3, Some(("us-east-1", 900)), NOW).is_err());
+
+        let remaining: Vec<TenantRecoveryBundle> = tenant_recovery_bundles::table.load(c).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].uuid, k2.uuid);
+        assert_eq!(remaining[0].revoked_at, None);
+    }
+
+    #[test]
+    fn staged_upload_cleanup_survives_insert_failure_and_respects_grace() {
+        use crate::db::models::{Attachment, AttachmentId, CipherId, TenantPendingDeletion};
+        use diesel::connection::SimpleConnection;
+
+        let c = &mut test_sqlite_conn();
+        #[allow(irrefutable_let_patterns)]
+        if let DbConnInner::Sqlite(s) = c {
+            s.batch_execute("PRAGMA foreign_keys = ON;").unwrap();
+        }
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+        diesel::update(tenants::table.find("t1")).set(tenants::storage_reserved_bytes.eq(128)).execute(c).unwrap();
+
+        let staged = TenantPendingDeletion {
+            id: "pd-staged".to_owned(),
+            tenant_id: "t1".to_owned(),
+            user_uuid: Some(UserId::from("u1".to_owned())),
+            storage_kind: "attachment".to_owned(),
+            object_key: "tenants/t1/attachments/missing-cipher/att1".to_owned(),
+            attempts: 0,
+            last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            created_at: naive(NOW),
+        };
+        diesel::insert_into(tenant_pending_deletions::table).values(&staged).execute(c).unwrap();
+
+        // While upload is actively in flight, worker does not see it.
+        assert!(cleanup_pending(c, None, NOW).unwrap().items.is_empty());
+
+        // Simulating a mid-upload cipher deletion causes attachment insert to fail its FK constraint.
+        let att_fail = Attachment::new(
+            AttachmentId("att1".to_owned()),
+            CipherId::from("missing-cipher".to_owned()),
+            "f".to_owned(),
+            128,
+            None,
+        )
+        .with_tenant_id(Some("t1".to_owned()));
+        assert!(Tenant::save_attachment_releasing_inner(c, "t1", &att_fail, 128, Some("pd-staged")).is_err());
+
+        // Rollback preserves both the staged cleanup row and reserved bytes.
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 128);
+        assert!(tenant_pending_deletions::table.find("pd-staged").first::<TenantPendingDeletion>(c).is_ok());
+
+        // After the staging grace expires (e.g. process crash), cleanup_pending exposes it automatically.
+        assert_eq!(cleanup_pending(c, None, NOW + UPLOAD_STAGING_GRACE_SECS + 1).unwrap().items.len(), 1);
+
+        // Activating the row on failure exposes it immediately at NOW.
+        diesel::update(tenant_pending_deletions::table.find("pd-staged"))
+            .set(tenant_pending_deletions::last_error.eq(None::<String>))
+            .execute(c)
+            .unwrap();
+        assert_eq!(cleanup_pending(c, None, NOW).unwrap().items.len(), 1);
+
+        // Happy path: with a real cipher, saving the attachment atomically clears the staged row.
+        cipher(c, "c1", Some("u1"), None, "t1");
+        let staged_ok = TenantPendingDeletion {
+            id: "pd-ok".to_owned(),
+            tenant_id: "t1".to_owned(),
+            user_uuid: Some(UserId::from("u1".to_owned())),
+            storage_kind: "attachment".to_owned(),
+            object_key: "tenants/t1/attachments/c1/att2".to_owned(),
+            attempts: 0,
+            last_error: Some(UPLOAD_IN_FLIGHT_MARKER.to_owned()),
+            created_at: naive(NOW),
+        };
+        diesel::insert_into(tenant_pending_deletions::table).values(&staged_ok).execute(c).unwrap();
+        let att_ok = Attachment::new(
+            AttachmentId("att2".to_owned()),
+            CipherId::from("c1".to_owned()),
+            "f".to_owned(),
+            128,
+            None,
+        )
+        .with_tenant_id(Some("t1".to_owned()));
+        Tenant::save_attachment_releasing_inner(c, "t1", &att_ok, 128, Some("pd-ok")).unwrap();
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
+        assert!(tenant_pending_deletions::table.find("pd-ok").first::<TenantPendingDeletion>(c).is_err());
     }
 }

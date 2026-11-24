@@ -103,13 +103,47 @@ pub async fn reserve_storage_grant(
     Ok(Some(epoch))
 }
 
-/// Saves an attachment row; in multi-tenant mode it also releases `reserved` upload bytes in
-/// the same transaction. On error nothing is released.
-pub async fn save_attachment_releasing(user: &User, att: &Attachment, reserved: i64, conn: &DbConn) -> EmptyResult {
+/// Records a durable pending cleanup row for an attachment upload in multi-tenant mode.
+/// When `in_flight` is true, the row is hidden from the cleanup worker until either upload
+/// finalization fails (`activate_pending_deletion`) or the staging grace expires after a crash.
+pub async fn stage_attachment_cleanup(
+    user: &User,
+    object_key: &str,
+    in_flight: bool,
+    conn: &DbConn,
+) -> Result<Option<String>, crate::Error> {
+    if !CONFIG.is_multi_tenant() {
+        return Ok(None);
+    }
+    let tenant_id = require_user_tenant(user)?;
+    let id = Tenant::stage_attachment_cleanup(tenant_id, Some(user.uuid.clone()), object_key, in_flight, conn).await?;
+    Ok(Some(id))
+}
+
+/// Immediately makes a staged upload cleanup row visible to the cleanup worker.
+pub async fn activate_pending_deletion(pending_id: Option<&str>, conn: &DbConn) {
+    if !CONFIG.is_multi_tenant() {
+        return;
+    }
+    if let Some(pid) = pending_id {
+        Tenant::activate_pending_deletion(pid, conn).await;
+    }
+}
+
+/// Saves an attachment row; in multi-tenant mode it also releases `reserved` upload bytes and
+/// deletes `clear_pending_id` (if any) in the same transaction. On error nothing is released
+/// and any staged cleanup row stays pending.
+pub async fn save_attachment_releasing(
+    user: &User,
+    att: &Attachment,
+    reserved: i64,
+    clear_pending_id: Option<&str>,
+    conn: &DbConn,
+) -> EmptyResult {
     if !CONFIG.is_multi_tenant() {
         return att.save(conn).await;
     }
-    Tenant::save_attachment_releasing(require_user_tenant(user)?, att, reserved, conn).await
+    Tenant::save_attachment_releasing(require_user_tenant(user)?, att, reserved, clear_pending_id, conn).await
 }
 
 /// Releases previously reserved upload bytes in multi-tenant mode.
