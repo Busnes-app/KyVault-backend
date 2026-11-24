@@ -1,75 +1,179 @@
-# KyVault Multi-Tenant Architecture & Operations Guide
+# KyVault multi-tenancy
 
-`Busnes-app/KyVault-backend` is a focused AGPL-3.0-only fork of Vaultwarden (`1.37.5`) implementing hosted multi-tenant isolation, zero-knowledge Recovery Kit & Organization Admin Escrow, hardened import/quota guardrails, PostgreSQL `LISTEN`/`NOTIFY` multi-replica WebSocket fanout, and the Go suite worker (`worker/`).
+`Busnes-app/KyVault-backend` is an AGPL-3.0-only fork of Vaultwarden that serves many
+KyIdentity organisations from one shared install. With `TENANCY_MODE=single` (the default)
+it is plain Vaultwarden: no tenancy table is consulted and `/internal/tenancy/v1/*` answers
+`404`.
 
-All single-tenant / self-hosted Vaultwarden behavior remains unchanged when `MULTI_TENANT_ENABLED=false` (the default).
+Two processes share one PostgreSQL database:
 
-## Architecture
+- **`vaultwarden` (Rust, `src/`)** runs as one or more replicas. It is the **sole writer of
+  every vault table**, including `tenants`, `tenant_erased_subjects`,
+  `tenant_pending_deletions` and `tenant_recovery_bundles`.
+- **`kyvault-worker` (Go, `worker/`)** talks to KyIdentity. It owns only
+  `worker_sync_cursors` and `worker_processed_events`, and changes vault state only by
+  calling the Rust replicas' private API.
 
-1. **Rust Vaultwarden Backend (`src/`)**
-   - **Strict Tenant Isolation**: Every user, organization, cipher, attachment, send, SSO link, and recovery bundle is bound to a KyIdentity `tenant_id` (`tenants.id`). Cross-tenant reads, invites, cipher sharing, emergency access, and WebSocket subscriptions are denied server-side.
-   - **Fail-Closed Startup Guardrails**: When `MULTI_TENANT_ENABLED=true`, startup refuses to boot unless `SSO_ENABLED=true`, `SSO_ONLY=true`, `SIGNUPS_ALLOWED=false`, `INVITATIONS_ALLOWED=false`, `ENABLE_WEBSOCKET=true`, `ADMIN_TOKEN` is unset, `TENANCY_HOME_REGION` is set, and PostgreSQL is active.
-   - **Tenant Lifecycle & Export-Only Billing Hold**:
-     - `active` + `app_enabled=true`: Full access.
-     - `suspended` / `app_enabled=false` / `erasing` / `deleted`: Login, refresh, and API access denied (`403`), active WebSockets disconnected across all replicas via PostgreSQL `NOTIFY`.
-     - `billing_state=export_only`: Mutations blocked (`403`) while read/export routes (`/api/sync`, `/api/ciphers/*/attachment/*`, `/api/organizations/*/export`, `/api/tenancy/*`) remain accessible.
-   - **Zero-Knowledge Recovery Kit & Org Admin Escrow (`/api/tenancy/recovery/*`)**:
-     - `GET/PUT/DELETE /api/tenancy/recovery/personal` — stores an opaque client-wrapped `UserKey` blob (encrypted with a random 256-bit Recovery Kit secret; server never sees plaintext).
-     - `GET/PUT/DELETE /api/tenancy/recovery/escrow/<org_id>` — allows a tenant member to opt into Organization Admin Escrow (client wraps `UserKey` to the organization's public key).
-     - `GET /api/tenancy/recovery/escrow/<org_id>/<target_user_id>` — allows a same-tenant Organization Owner/Admin to retrieve the wrapped escrow blob for an enrolled member with audit logging.
-   - **Import Guardrails & Quotas**:
-     - `POST /api/ciphers/import` and `POST /api/organizations/<org_id>/import` enforce `TENANCY_MAX_IMPORT_CIPHERS` (default `5000`), `TENANCY_MAX_IMPORT_FOLDERS` (default `500`), per-tenant `max_ciphers` quota (`tenants.quotas_json`), and per-tenant storage pool quotas (`tenants.storage_pool_bytes` / `storage_over_since`).
-   - **Multi-Replica WebSocket Fanout (PostgreSQL `LISTEN`/`NOTIFY`)**:
-     - No Redis dependency. Local WebSocket notifications, `user_logout`, and `tenant_kick` events publish JSON envelopes over `TENANCY_PG_NOTIFY_CHANNEL` (`kyvault_notify`) so every Rust replica fans out updates and disconnects revoked users/tenants immediately.
+## Isolation in the vault
 
-2. **Go Suite Worker (`worker/`)**
-   - Reuses `github.com/Busnes-app/ky-primitives` (`oidcverify`, `syncauth`, `scim`).
-   - **HTTP Endpoints**:
-     - `GET /healthz` — verifies PostgreSQL pool health.
-     - `POST /api/sync/events` — verifies `X-KySignOn-Signature` (`syncauth.Verify`), deduplicates `event_id` in `tenant_processed_events`, and handles `user.created`, `user.updated`, `user.deleted`, `user.erased`, `tenant.updated`, `tenant.suspended`, `tenant.erased`.
-     - `POST /api/oidc/backchannel-logout` — verifies `logout_token` RS256 signature & claims via `oidcverify.Verifier.VerifyLogout`, enforces durable JTI replay prevention in `tenant_processed_events`, rotates `users.security_stamp`, clears `devices.refresh_token`, and emits PostgreSQL `NOTIFY user_logout`.
-   - **Background Loops**:
-     - **Org Entitlement Sync (`GET /api/suite/orgs`)**: Filters by `HOME_REGION`, enforces monotonic `revision`, never resurrects `erasing`/`deleted` tombstones, and fences + broadcasts `tenant_kick` on suspension/disable.
-     - **Erasure Polling (`GET /api/suite/erased`)**: Durable cursor in `tenant_sync_cursors`, retries any tenant stuck in `erasing`, deletes tenant S3/local files under `tenants/<tenant_id>/` BEFORE purging DB rows across all 32 tables, and retains a permanent `deleted` tombstone. User erasure purges personal vaults while preserving tenant-owned shared organization ciphers.
-     - **Canonical Storage Metering (`POST /api/suite/storage`)**: Reports `attachment_bytes + send_file_bytes + cipher_data_bytes` per active tenant with a durable monotonic sequence.
-     - **Processed-Events GC**: Periodically prunes expired replay-guard rows while preserving permanent year-9999 erasure tombstones.
+- Every user, organisation, cipher, attachment, Send and SSO link carries a `tenant_id`
+  (a KyIdentity org ID, `tenants.id`). Cross-tenant reads, invites, sharing and WebSocket
+  subscriptions are refused server-side. Access tokens carry the tenant in `tid`, and every
+  request checks it against the user's binding.
+- Sign-in is SSO only. The tenant comes from the ID token's `org_id` claim. Platform staff
+  principals, `export_only` principals and erased `(issuer, subject)` pairs are refused.
+  No session kind short of full access exists: export-only sessions were removed.
+- A request is served only when the tenant is `active`, `app_enabled`, in this replica's
+  `HOME_REGION`, and its KyIdentity authority was refreshed within
+  `TENANCY_AUTHORITY_MAX_AGE_SECS` (at most 900 s). Otherwise the request fails closed:
+  `403`, or `503` when authority is stale.
+- Sends are always off in multi-tenant mode. Emergency access is off unless
+  `TENANCY_ALLOW_EMERGENCY_ACCESS=true`.
+- **Recovery Kit** (`/api/tenancy/recovery/personal`) stores only a client-wrapped user key.
+  The user holds the recovery secret offline, so the server never sees plaintext. There is
+  no server escrow and no organisation-admin escrow: an administrator cannot recover a
+  member's vault.
 
-## Key Environment Variables
+### Startup refuses to run multi-tenant without
 
-### Rust Backend (`vaultwarden`)
-| Variable | Default | Description |
+`HOME_REGION`, `SSO_ENABLED=true` and `SSO_ONLY=true`, `SIGNUPS_ALLOWED=false`, an unset
+`ADMIN_TOKEN`, a PostgreSQL `DATABASE_URL`, an `s3://` `ATTACHMENTS_FOLDER`,
+`TENANCY_INTERNAL_API_SECRET` of at least 32 characters, `TENANCY_AUTHORITY_MAX_AGE_SECS`
+between 60 and 900, a `TENANCY_PG_NOTIFY_CHANNEL` of `[a-z0-9_]{1,63}`, and a
+pre-provisioned `rsa_key.pem`. Replicas must share that key. A replica never generates its
+own.
+
+### Cross-replica disconnects
+
+Fences and logouts happen inside a transaction. After it commits, the replica disconnects
+its own WebSockets and publishes `user_logout` / `tenant_kick` on PostgreSQL
+`NOTIFY TENANCY_PG_NOTIFY_CHANNEL`. Every other replica `LISTEN`s and disconnects the same
+users. No Redis is involved. The rotated security stamps are the real revocation; the
+NOTIFY only makes it immediate for open sockets.
+
+## Private management API: `/internal/tenancy/v1/*`
+
+Mounted at a fixed path (not under `DOMAIN`'s base path). Each call needs
+`Authorization: Bearer $TENANCY_INTERNAL_API_SECRET`: a missing or wrong secret gets `401`,
+and an unset or short one gets `503`. **Never route this path through the public proxy.**
+Expose it only on the private network the worker uses.
+
+| Route | Does |
+| --- | --- |
+| `GET health` | `{status, multi_tenant, home_region}` |
+| `POST orgs/reconcile` | Applies KyIdentity org snapshots for this region. A newly non-active org is fenced: `access_epoch` +1, grant zeroed, every user's stamp and refresh tokens rotated, sockets kicked. `deleted` becomes `purge_pending`. Tombstoned tenants are never resurrected. |
+| `POST users/logout` | Rotates stamp and refresh tokens of the exact `{issuer}/{subject}` SSO link (optionally within one tenant) |
+| `POST users/sync` | `user.created/updated/deleted`: disable/re-enable, rename. Erased subjects answer `erased_tombstone`. |
+| `POST users/erase` | Records the permanent tombstone, queues the user's objects, deletes personal data. Organisation ciphers, collections and other members stay. |
+| `POST tenants/<id>/purge/begin` | Queues every tenant object plus a `tenants/<id>/` sweep, tombstones all subjects, deletes all tenant rows. Status `purge_pending`. |
+| `GET cleanup/pending`, `POST cleanup/complete` | The durable `tenant_pending_deletions` queue. Rows go only when the worker reports a verified deletion. Failures bump `attempts`. When a `purge_pending` tenant's queue is empty it is finalised to `deleted` with `erased_at`. |
+| `POST storage/prepare`, `POST storage/apply` | The storage-grant exchange (below) |
+| `POST storage/repair-seq` | Operator recovery for a `stale` sequence: sets the next report seq, which must exceed the current one |
+
+## Storage grants
+
+Growth needs a grant from KyIdentity's pool (`POST /api/suite/storage`).
+
+1. `storage/prepare` fixes each live tenant's report: committed bytes plus reservations,
+   and the next `storage_report_seq`. Committed bytes are attachments, file Sends,
+   `OCTET_LENGTH(ciphers.data)` and active Recovery Kit envelopes. The report is stored as
+   pending, so a failed exchange is resent with the **same seq and bytes**, which KyIdentity
+   treats as a replay. Non-active tenants report `want_bytes: 0`.
+2. The worker sends the batch, noting `sent_at` before the request leaves.
+3. `storage/apply` installs `ok` grants. Expiry is `min(sent_at, now) + ttl`, with ttl capped
+   at 900 s. Out-of-order seqs are ignored. An answer for a tenant fenced in the meantime
+   records the seq but installs no grant.
+4. Uploads take the grant under `SELECT … FOR UPDATE` on the tenant row:
+   `committed + reserved + new <= ceiling`, an unexpired grant, and not over the pool. The
+   attachment row is saved and its reservation released in one transaction, so concurrent
+   uploads on any replica never over- or double-count. An upload finishes only if the
+   tenant's `access_epoch` is unchanged.
+
+`stale` (KyIdentity holds a newer seq, as after a database restore) sets
+`storage_seq_stale`. The tenant keeps its existing grant until expiry, stops reporting, and
+its seq is **never reset automatically**. The worker logs `STORAGE SEQUENCE STALE`. An
+operator calls `storage/repair-seq` with a `next_seq` above KyIdentity's.
+
+## The worker
+
+Built on `github.com/Busnes-app/ky-primitives`: `suitedir` (KyIdentity
+`/api/suite/{orgs,erased,storage}` with `client_secret_basic`), `syncauth` (signed webhooks)
+and `oidcverify` (RS256 back-channel logout).
+
+- **Startup** reconciles orgs and erased subjects before `/readyz` turns ready and webhooks
+  are accepted.
+- **Orgs** are polled from the saved cursor. Each page goes to `orgs/reconcile`, and
+  `purge_required` tenants go to `purge/begin`. The cursor is saved only after the vault
+  accepted the page.
+- **Erased subjects** are polled and sent to `users/erase`, using the same cursor rule.
+- **Storage**: every interval it runs prepare → KyIdentity → apply, never with two reports
+  in flight for one org.
+- **Cleanup** drains `cleanup/pending` against the same storage roots the vault uses, then
+  reports to `cleanup/complete`. Local roots go through `os.Root`. S3 roots delete every
+  object version and abort multipart uploads. A missing root or S3 error leaves the item
+  pending. Keys outside `tenants/<id>/` are refused.
+- **`POST /api/sync/events`** verifies `X-KySignOn-*` (`syncauth`), then forwards
+  `user.created/updated/deleted/erased`. **`POST /api/oidc/backchannel-logout`** verifies the
+  `logout+jwt` against the issuer's JWKS and calls `users/logout`. Both claim the event in
+  `worker_processed_events`, and mark it completed **only after the vault applied it**. A
+  failed attempt answers `502` and stays retryable; a completed one answers
+  `200 {"status":"duplicate"}`.
+- **Restore**: after restoring the vault database from backup, start one worker with
+  `TENANCY_RECONCILE_FROM_ZERO=true`. It replays orgs and erasures from revision 0 before it
+  becomes ready. Storage seqs are untouched: a `stale` answer then goes through
+  `repair-seq`.
+
+## Configuration
+
+### Rust replicas (multi-tenant)
+
+| Variable | Default | |
 | --- | --- | --- |
-| `MULTI_TENANT_ENABLED` | `false` | Enables strict multi-tenant isolation & startup guardrails |
-| `TENANCY_HOME_REGION` | `""` | Required region ID (e.g. `us-east-1`); matched against `tenants.home_region` |
-| `TENANCY_ORG_CLAIM` | `org_id` | OIDC ID-token claim carrying KyIdentity tenant ID |
-| `TENANCY_PG_NOTIFY_ENABLED` | `true` | Enables PostgreSQL `LISTEN`/`NOTIFY` multi-replica WebSocket fanout & kicks |
-| `TENANCY_PG_NOTIFY_CHANNEL` | `kyvault_notify` | Safe PostgreSQL identifier (`[a-z0-9_]+`) for `LISTEN`/`NOTIFY` |
-| `TENANCY_MAX_IMPORT_CIPHERS` | `5000` | Max ciphers allowed per `/import` request |
-| `TENANCY_MAX_IMPORT_FOLDERS` | `500` | Max folders allowed per `/import` request |
-| `TENANCY_DEFAULT_MAX_CIPHERS` | `0` | Fallback per-tenant cipher cap when `quotas_json.max_ciphers` is unset (`0` = unlimited) |
+| `TENANCY_MODE` | `single` | `multi` enables everything above |
+| `HOME_REGION` | — | Region slug this install serves; orgs homed elsewhere are skipped |
+| `TENANCY_INTERNAL_API_SECRET` | — | ≥ 32 chars, shared with the worker |
+| `TENANCY_AUTHORITY_MAX_AGE_SECS` | `900` | 60–900 |
+| `TENANCY_PG_NOTIFY_ENABLED` | `true` | Cross-replica disconnects |
+| `TENANCY_PG_NOTIFY_CHANNEL` | `kyvault_notify` | `[a-z0-9_]{1,63}` |
+| `TENANCY_MAX_IMPORT_CIPHERS` / `TENANCY_MAX_IMPORT_FOLDERS` | `5000` / `500` | Per import request |
+| `TENANCY_ALLOW_EMERGENCY_ACCESS` | `false` | |
+| `TENANCY_MAX_CIPHERS_PER_TENANT` | `50000` | Default when the org's quotas set no `max_ciphers` |
+| `ATTACHMENTS_FOLDER` | — | `s3://bucket/prefix?endpoint=…&region=…`; credentials from the AWS chain |
 
-### Go Suite Worker (`kyvault-worker`)
-| Variable | Required | Description |
+Plus the Vaultwarden SSO settings (`SSO_ENABLED`, `SSO_ONLY`, `SSO_AUTHORITY`,
+`SSO_CLIENT_ID`, `SSO_CLIENT_SECRET`), `DATABASE_URL` and `DOMAIN`, which all replicas share.
+
+### Worker (`kyvault-worker`)
+
+| Variable | Default | |
 | --- | --- | --- |
-| `DATABASE_URL` | Yes | Shared PostgreSQL DSN |
-| `HOME_REGION` | Yes | Region filter matching `TENANCY_HOME_REGION` |
-| `KYIDENTITY_BASE_URL` | Yes | KyIdentity control plane base URL |
-| `KYIDENTITY_SUITE_TOKEN` | Yes | Bearer token for `/api/suite/*` |
-| `SYNC_WEBHOOK_SECRET` | Yes | Shared HMAC key (>=16 bytes) for `ky-primitives/syncauth` |
-| `SSO_AUTHORITY` / `SSO_CLIENT_ID` / `OIDC_JWKS_URL` | Recommended | RS256 OIDC Back-Channel Logout verification (`ky-primitives/oidcverify`) |
-| `TENANCY_PG_NOTIFY_CHANNEL` | No (`kyvault_notify`) | Shared PostgreSQL `NOTIFY` channel |
-| `S3_ENDPOINT` / `S3_BUCKET` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | Optional | Enables AWS SigV4 tenant object prefix (`tenants/<id>/`) erasure |
-| `DATA_FOLDER` | Optional | Enables local filesystem `tenants/<id>/` erasure |
+| `DATABASE_URL` | required | The vault's PostgreSQL (worker tables only) |
+| `VAULT_INTERNAL_API_URL` | required | A replica's private base URL. `https` anywhere, plain `http` only to loopback, private or single-label hosts. |
+| `TENANCY_INTERNAL_API_SECRET` | required | Same as the replicas |
+| `SSO_AUTHORITY` | required | OIDC issuer; also the KyIdentity base URL |
+| `KYIDENTITY_BASE_URL` | `SSO_AUTHORITY` | Override for `/api/suite/*` |
+| `SSO_CLIENT_ID` / `SSO_CLIENT_SECRET` | required | Suite directory credentials and logout audience |
+| `OIDC_JWKS_URL` | `$SSO_AUTHORITY/.well-known/jwks.json` | |
+| `SYNC_WEBHOOK_SECRET` | required | ≥ 32 chars |
+| `WORKER_LISTEN_ADDR` | `127.0.0.1:8085` | |
+| `ORG_POLL_INTERVAL` / `ERASED_POLL_INTERVAL` / `STORAGE_REPORT_INTERVAL` | `30s` | Clamped to ≤ 60 s |
+| `CLEANUP_INTERVAL` | `60s` | Clamped to ≤ 60 s |
+| `PRUNE_INTERVAL` | `1h` | Expired `worker_processed_events` |
+| `STORAGE_WANT_BYTES` | `268435456` | Growth requested per active tenant |
+| `STORAGE_RENEW_BEFORE` | `180s` | < 900 s. Sent to the vault, which currently reports every live tenant on each pass. |
+| `TENANCY_RECONCILE_FROM_ZERO` | `false` | Restore reconciliation (above) |
+| `ATTACHMENTS_FOLDER` / `SENDS_FOLDER` | `$DATA_FOLDER/attachments` / `…/sends` | The vault's roots: a local dir or `s3://bucket/prefix` with no query string |
+| `S3_ENDPOINT` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_FORCE_PATH_STYLE` | — / `us-east-1` / — / — / `true` | For `s3://` roots |
 
-## Running Tests
+## Tests
 
 ```bash
-# Rust checks (PostgreSQL + S3 + SQLite)
-cargo check --features postgresql,s3,sqlite
-cargo test --features sqlite,s3
+cargo test --features sqlite,s3            # tenancy ops run against SQLite
+cd worker && GOWORK=off go test -race ./...
 
-# Go worker unit + live PostgreSQL 16 integration tests
-cd worker
-go test -race ./...
-KYVAULT_TEST_DATABASE_URL="postgres://kyvault:kyvault@127.0.0.1:55433/kyvault_test" go test -v -race ./...
+# Live: Rust built with PostgreSQL in Docker, two multi-tenant replicas and one
+# single-tenant SQLite replica, PostgreSQL 17, RustFS, the worker binary and a TLS
+# KyIdentity fake on the SUITE-DIRECTORY.md wire format.
+worker/e2e/run.sh            # --clean also drops the cargo cache volumes
+worker/e2e/cargo.sh test --features postgresql,s3
 ```
