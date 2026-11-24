@@ -29,7 +29,7 @@ use crate::{
     db::{
         DbConn,
         models::{
-            AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError,
+            AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError, Organization,
             OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
             TwoFactorType, User, UserId,
         },
@@ -202,9 +202,29 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
     };
 
     let (sso_auth, user_infos) = sso::exchange_code(code, code_verifier, conn).await?;
+
+    let multi_tenant_id = if CONFIG.is_multi_tenant() {
+        let Some(tid) = user_infos.org_id.as_deref().filter(|s| !s.trim().is_empty()) else {
+            err_code!("OIDC token is missing required org_id claim", 403);
+        };
+        crate::tenancy::check_tenant_active(tid, user_infos.export_only, conn).await?;
+        Some(tid.to_owned())
+    } else {
+        None
+    };
+
     let user_with_sso = match SsoUser::find_by_identifier(&user_infos.identifier, conn).await {
         None => match SsoUser::find_by_mail(&user_infos.email, conn).await {
             None => None,
+            Some((user, _))
+                if CONFIG.is_multi_tenant() && user.tenant_id.as_deref() != multi_tenant_id.as_deref() =>
+            {
+                error!(
+                    "Login failure ({}), email ({}) belongs to a different tenant",
+                    user_infos.identifier, user.email
+                );
+                err_code!("Account belongs to a different organization", 403)
+            }
             Some((user, Some(_))) => {
                 error!(
                     "Login failure ({}), existing SSO user ({}) with same email ({})",
@@ -218,7 +238,8 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                 )
             }
             Some((user, None))
-                if user.private_key.is_none()
+                if !CONFIG.is_multi_tenant()
+                    && user.private_key.is_none()
                     && !CONFIG.sso_signups_allowed()
                     && !CONFIG.is_email_domain_allowed(&user.email)
                     && !CONFIG.mail_enabled()
@@ -235,7 +256,9 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                     }
                 )
             }
-            Some((user, None)) if user.private_key.is_some() && !CONFIG.sso_signups_match_email() => {
+            Some((user, None))
+                if !CONFIG.is_multi_tenant() && user.private_key.is_some() && !CONFIG.sso_signups_match_email() =>
+            {
                 error!(
                     "Login failure ({}), existing non SSO user ({}) with same email ({}) and association is disabled",
                     user_infos.identifier, user.uuid, user.email
@@ -275,14 +298,23 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                 _ => Some((user, None)),
             },
         },
-        Some((user, sso_user)) => Some((user, Some(sso_user))),
+        Some((user, sso_user)) => {
+            if CONFIG.is_multi_tenant() && user.tenant_id.as_deref() != multi_tenant_id.as_deref() {
+                error!(
+                    "Cross-tenant SSO login rejected for identifier ({}): user tenant {:?}, token org_id {:?}",
+                    user_infos.identifier, user.tenant_id, multi_tenant_id
+                );
+                err_code!("Cross-tenant login denied", 403);
+            }
+            Some((user, Some(sso_user)))
+        }
     };
 
     let now = Utc::now().naive_utc();
     // Will trigger 2FA flow if needed
     let (user, mut device, twofactor_token, sso_user) = match user_with_sso {
         None => {
-            if !CONFIG.is_sso_signup_allowed(&user_infos.email) {
+            if !CONFIG.is_multi_tenant() && !CONFIG.is_sso_signup_allowed(&user_infos.email) {
                 if CONFIG.signups_domains_whitelist().is_empty() {
                     err!(
                         "Signups are disabled. You will need an invitation",
@@ -297,6 +329,10 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                         event: EventType::UserFailedLogIn
                     }
                 );
+            }
+
+            if CONFIG.is_multi_tenant() && user_infos.export_only {
+                err_code!("Cannot provision new user during export-only grace window", 403);
             }
 
             match user_infos.email_verified {
@@ -318,6 +354,7 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
 
             let mut user = User::new(&user_infos.email, user_infos.user_name.clone());
             user.verified_at = Some(now);
+            user.tenant_id = multi_tenant_id.clone();
             user.save(conn).await?;
 
             let device = get_device(&data, conn, &user).await?;
@@ -647,6 +684,11 @@ async fn user_api_key_login(
         )
     }
 
+    if CONFIG.is_multi_tenant() {
+        let tid = crate::tenancy::require_user_tenant(&user)?;
+        crate::tenancy::check_tenant_active(tid, false, conn).await?;
+    }
+
     // Check API key. Note that API key logins bypass 2FA.
     let client_secret = data.client_secret.as_ref().unwrap();
     if !user.check_valid_api_key(client_secret) {
@@ -758,6 +800,16 @@ async fn organization_api_key_login(data: ConnectData, conn: &DbConn, ip: &Clien
     let Some(org_api_key) = OrganizationApiKey::find_by_org_uuid(&org_id, conn).await else {
         err!("Invalid client_id", format!("IP: {}.", ip.ip))
     };
+
+    if CONFIG.is_multi_tenant() {
+        let Some(org) = Organization::find_by_uuid(&org_api_key.org_uuid, conn).await else {
+            err_code!("Organization not found", 403);
+        };
+        let Some(tid) = org.tenant_id.as_deref().filter(|s| !s.is_empty()) else {
+            err_code!("Organization has no tenant binding", 403);
+        };
+        crate::tenancy::check_tenant_active(tid, false, conn).await?;
+    }
 
     // Check API key.
     let client_secret = data.client_secret.as_ref().unwrap();

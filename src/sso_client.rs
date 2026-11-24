@@ -1,16 +1,16 @@
 use std::{borrow::Cow, collections::HashSet, future::Future, pin::Pin, sync::LazyLock, time::Duration};
 
 use openidconnect::{
-    AccessToken, AsyncHttpClient, AuthDisplay, AuthPrompt, AuthType, AuthenticationFlow, AuthorizationCode,
-    AuthorizationRequest, ClientId, ClientSecret, CsrfToken, EmptyAdditionalClaims, EmptyExtraTokenFields,
-    EndpointNotSet, EndpointSet, HttpClientError, HttpRequest, HttpResponse, IdTokenClaims, IdTokenFields, Nonce,
-    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RefreshToken, ResponseType, Scope, StandardErrorResponse,
-    StandardTokenResponse,
+    AccessToken, AdditionalClaims, AsyncHttpClient, AuthDisplay, AuthPrompt, AuthType, AuthenticationFlow,
+    AuthorizationCode, AuthorizationRequest, ClientId, ClientSecret, CsrfToken, EmptyExtraTokenFields, EndpointMaybeSet, EndpointNotSet,
+    EndpointSet, HttpClientError, HttpRequest, HttpResponse, IdTokenClaims, IdTokenFields, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RefreshToken, ResponseType, Scope, StandardErrorResponse,
+    StandardTokenResponse, UserInfoClaims,
     core::{
-        CoreAuthDisplay, CoreAuthPrompt, CoreClient, CoreClientAuthMethod, CoreErrorResponseType, CoreGenderClaim,
+        CoreAuthDisplay, CoreAuthPrompt, CoreClientAuthMethod, CoreErrorResponseType, CoreGenderClaim,
         CoreIdTokenVerifier, CoreJsonWebKey, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
         CoreProviderMetadata, CoreResponseType, CoreRevocableToken, CoreRevocationErrorResponse,
-        CoreTokenIntrospectionResponse, CoreTokenResponse, CoreTokenType, CoreUserInfoClaims,
+        CoreTokenIntrospectionResponse, CoreTokenType,
     },
     http, url,
 };
@@ -25,6 +25,34 @@ use crate::{
     sso::{OIDCCode, OIDCCodeChallenge, OIDCCodeVerifier, OIDCState},
 };
 
+/// Custom KyIdentity multi-tenant OIDC claims parsed from ID Tokens and UserInfo.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct KyAdditionalClaims {
+    #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
+    pub export_only: Option<bool>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub roles: Option<Vec<String>>,
+}
+
+impl AdditionalClaims for KyAdditionalClaims {}
+
+pub type KyTokenResponse = StandardTokenResponse<
+    IdTokenFields<
+        KyAdditionalClaims,
+        EmptyExtraTokenFields,
+        CoreGenderClaim,
+        CoreJweContentEncryptionAlgorithm,
+        CoreJwsSigningAlgorithm,
+    >,
+    CoreTokenType,
+>;
+
+pub type KyUserInfoClaims = UserInfoClaims<KyAdditionalClaims, CoreGenderClaim>;
+
 static CLIENT_CACHE_KEY: LazyLock<String> = LazyLock::new(|| "sso-client".to_owned());
 static CLIENT_CACHE: LazyLock<moka::sync::Cache<String, Client>> = LazyLock::new(|| {
     moka::sync::Cache::builder()
@@ -35,16 +63,16 @@ static CLIENT_CACHE: LazyLock<moka::sync::Cache<String, Client>> = LazyLock::new
 static REFRESH_CACHE: LazyLock<moka::future::Cache<String, Result<RefreshTokenResponse, String>>> =
     LazyLock::new(|| moka::future::Cache::builder().max_capacity(1000).time_to_live(Duration::from_secs(30)).build());
 
-/// OpenID Connect Core client.
+/// OpenID Connect Core client with KyIdentity additional claims support.
 pub type CustomClient = openidconnect::Client<
-    EmptyAdditionalClaims,
+    KyAdditionalClaims,
     CoreAuthDisplay,
     CoreGenderClaim,
     CoreJweContentEncryptionAlgorithm,
     CoreJsonWebKey,
     CoreAuthPrompt,
     StandardErrorResponse<CoreErrorResponseType>,
-    CoreTokenResponse,
+    KyTokenResponse,
     CoreTokenIntrospectionResponse,
     CoreRevocableToken,
     CoreRevocationErrorResponse,
@@ -125,7 +153,25 @@ impl Client {
             .token_endpoint_auth_methods_supported()
             .map(|v| v.iter().map(ToOwned::to_owned).collect());
 
-        let mut base_client = CoreClient::from_provider_metadata(provider_metadata, client_id, Some(client_secret));
+        let mut base_client = openidconnect::Client::<
+            KyAdditionalClaims,
+            CoreAuthDisplay,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJsonWebKey,
+            CoreAuthPrompt,
+            StandardErrorResponse<CoreErrorResponseType>,
+            KyTokenResponse,
+            CoreTokenIntrospectionResponse,
+            CoreRevocableToken,
+            CoreRevocationErrorResponse,
+            EndpointSet,
+            EndpointNotSet,
+            EndpointNotSet,
+            EndpointNotSet,
+            EndpointMaybeSet,
+            EndpointMaybeSet,
+        >::from_provider_metadata(provider_metadata, client_id, Some(client_secret));
 
         if let Some(am) = auth_methods {
             if am.contains(&CoreClientAuthMethod::ClientSecretBasic) {
@@ -227,19 +273,7 @@ impl Client {
         code: OIDCCode,
         client_verifier: OIDCCodeVerifier,
         sso_auth: &SsoAuth,
-    ) -> ApiResult<(
-        StandardTokenResponse<
-            IdTokenFields<
-                EmptyAdditionalClaims,
-                EmptyExtraTokenFields,
-                CoreGenderClaim,
-                CoreJweContentEncryptionAlgorithm,
-                CoreJwsSigningAlgorithm,
-            >,
-            CoreTokenType,
-        >,
-        IdTokenClaims<EmptyAdditionalClaims, CoreGenderClaim>,
-    )> {
+    ) -> ApiResult<(KyTokenResponse, IdTokenClaims<KyAdditionalClaims, CoreGenderClaim>)> {
         let oidc_code = AuthorizationCode::new(code.to_string());
 
         let mut exchange = self.core_client.exchange_code(oidc_code);
@@ -279,7 +313,7 @@ impl Client {
         }
     }
 
-    pub async fn user_info(&self, access_token: AccessToken) -> ApiResult<CoreUserInfoClaims> {
+    pub async fn user_info(&self, access_token: AccessToken) -> ApiResult<KyUserInfoClaims> {
         match self.core_client.user_info(access_token, None).request_async(&self.http_client).await {
             Err(err) => err!(format!("Request to user_info endpoint failed: {err}")),
             Ok(user_info) => Ok(user_info),

@@ -361,8 +361,11 @@ async fn post_ciphers_create(
     // cipher.save() below.
     enforce_personal_ownership_policy(Some(&data.cipher), &headers, &conn).await?;
 
+    crate::tenancy::check_cipher_quota(&headers.user, 1, &conn).await?;
+
     let mut cipher = Cipher::new(data.cipher.r#type, data.cipher.name.clone());
     cipher.user_uuid = Some(headers.user.uuid.clone());
+    cipher.tenant_id = headers.user.tenant_id.clone();
     cipher.save(&conn).await?;
 
     // When cloning a cipher, the Bitwarden clients seem to set this field
@@ -402,7 +405,10 @@ async fn post_ciphers(data: Json<CipherData>, headers: Headers, conn: DbConn, nt
     // needed when creating a new cipher, so just ignore it unconditionally.
     data.last_known_revision_date = None;
 
+    crate::tenancy::check_cipher_quota(&headers.user, 1, &conn).await?;
+
     let mut cipher = Cipher::new(data.r#type, data.name.clone());
+    cipher.tenant_id = headers.user.tenant_id.clone();
     update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherCreate).await?;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
@@ -637,6 +643,8 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
     // Bitwarden does not process the import if there is one item invalid.
     // Since we check for the size of the encrypted note length, we need to do that here to pre-validate it.
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
+    crate::tenancy::check_import_limits(data.ciphers.len(), data.folders.len())?;
+    crate::tenancy::check_cipher_quota(&headers.user, data.ciphers.len() as i64, &conn).await?;
     Cipher::validate_cipher_data(&data.ciphers)?;
 
     // Read and create the folders
@@ -671,6 +679,7 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
         cipher_data.organization_id = None;
 
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+        cipher.tenant_id = headers.user.tenant_id.clone();
         update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
     }
 
@@ -1154,6 +1163,14 @@ async fn share_cipher_by_uuid(
         err!("Cipher doesn't exist")
     };
 
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::ensure_same_tenant(
+            headers.user.tenant_id.as_deref(),
+            cipher.tenant_id.as_deref(),
+            "share_cipher_by_uuid",
+        )?;
+    }
+
     // `update_cipher_from_data()` rejects this too, but only after the collections below were
     // already linked. There are no transactions, so that would leave the cipher linked to a
     // collection of another organization.
@@ -1164,6 +1181,16 @@ async fn share_cipher_by_uuid(
     let mut shared_to_collections = vec![];
 
     if let Some(organization_id) = &data.cipher.organization_id {
+        if CONFIG.is_multi_tenant() {
+            let Some(org) = crate::db::models::Organization::find_by_uuid(organization_id, conn).await else {
+                err!("Organization doesn't exist");
+            };
+            crate::tenancy::ensure_same_tenant(
+                headers.user.tenant_id.as_deref(),
+                org.tenant_id.as_deref(),
+                "share_cipher_by_uuid_org",
+            )?;
+        }
         for col_id in &data.collection_ids {
             match Collection::find_by_uuid_and_org(col_id, organization_id, conn).await {
                 None => err!("Invalid collection ID provided"),
@@ -1307,9 +1334,12 @@ async fn post_attachment_v2(
         err!("Attachment storage limit exceeded with this file");
     }
 
+    crate::tenancy::check_storage_quota(&headers.user, file_size, &conn).await?;
+
     let attachment_id = crypto::generate_attachment_id();
     let attachment =
-        Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key));
+        Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key))
+            .with_tenant_id(headers.user.tenant_id.clone());
     attachment.save(&conn).await.expect("Error saving attachment");
     notify_attachment_created(&cipher, &headers, &conn, &nt).await;
 
@@ -1380,12 +1410,17 @@ async fn save_attachment(
         err!("Attachment storage limit exceeded with this file");
     }
 
+    let delta_bytes = size.saturating_sub(size_adjust);
+    if delta_bytes > 0 {
+        crate::tenancy::check_storage_quota(&headers.user, delta_bytes, &conn).await?;
+    }
+
     let file_id = match &attachment {
         Some(attachment) => attachment.id.clone(), // v2 API
         None => crypto::generate_attachment_id(),  // Legacy API
     };
 
-    if let Some(attachment) = &mut attachment {
+    let storage_path = if let Some(attachment) = &mut attachment {
         // v2 API
 
         // Check the actual size against the size initially provided by
@@ -1410,6 +1445,7 @@ async fn save_attachment(
 
             err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
         }
+        attachment.get_file_path()
     } else {
         // Legacy API
 
@@ -1425,11 +1461,13 @@ async fn save_attachment(
             err!("No attachment key provided")
         }
         let attachment =
-            Attachment::new(file_id.clone(), cipher_id.clone(), encrypted_filename.unwrap(), size, data.key);
+            Attachment::new(file_id.clone(), cipher_id.clone(), encrypted_filename.unwrap(), size, data.key)
+                .with_tenant_id(headers.user.tenant_id.clone());
         attachment.save(&conn).await.expect("Error saving attachment");
-    }
+        attachment.get_file_path()
+    };
 
-    save_temp_file(&PathType::Attachments, &format!("{cipher_id}/{file_id}"), data.data, true).await?;
+    save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await?;
 
     // With the v2 API, post_attachment_v2() already did this when it created the attachment record
     if attachment.is_none() {

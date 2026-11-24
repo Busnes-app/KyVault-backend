@@ -563,12 +563,20 @@ async fn put_avatar(data: Json<AvatarData>, headers: Headers, conn: DbConn) -> J
 }
 
 #[get("/users/<user_id>/public-key")]
-async fn get_public_keys(user_id: UserId, _headers: Headers, conn: DbConn) -> JsonResult {
+async fn get_public_keys(user_id: UserId, headers: Headers, conn: DbConn) -> JsonResult {
     let user = match User::find_by_uuid(&user_id, &conn).await {
         Some(user) if user.public_key.is_some() => user,
         Some(_) => err_code!("User has no public_key", Status::NotFound.code),
         None => err_code!("User doesn't exist", Status::NotFound.code),
     };
+
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::ensure_same_tenant(
+            headers.user.tenant_id.as_deref(),
+            user.tenant_id.as_deref(),
+            "get_public_keys",
+        )?;
+    }
 
     Ok(Json(json!({
         "userId": user.uuid,

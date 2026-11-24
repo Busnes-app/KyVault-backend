@@ -871,6 +871,28 @@ make_config! {
         sso_debug_tokens:               bool,   true,   def,    false;
     },
 
+    /// Multi-tenant KyVault settings
+    tenancy {
+        /// Tenancy mode |> ("single" or "multi") Enables strict multi-tenant isolation for hosted KyVault deployments
+        tenancy_mode:                   String, false,  def,    "single".to_owned();
+        /// Home region |> Region slug owned by this KyVault instance (required when TENANCY_MODE=multi)
+        home_region:                    String, false,  def,    String::new();
+        /// Allow emergency access in multi-tenant mode |> Disabled by default to prevent cross-tenant grants
+        tenancy_allow_emergency_access: bool,   false,  def,    false;
+        /// Allow Sends in multi-tenant mode
+        tenancy_allow_sends:            bool,   false,  def,    true;
+        /// Maximum ciphers accepted in a single import request
+        tenancy_max_import_ciphers:     usize,  false,  def,    5_000;
+        /// Maximum folders accepted in a single import request
+        tenancy_max_import_folders:     usize,  false,  def,    500;
+        /// Default maximum active ciphers per tenant (overridable via tenant quotas_json.max_ciphers)
+        tenancy_max_ciphers_per_tenant: i64,    false,  def,    50_000;
+        /// PostgreSQL LISTEN/NOTIFY channel name for multi-replica WebSocket fanout
+        tenancy_pg_notify_channel:      String, false,  def,    "kyvault_notify".to_owned();
+        /// Enable PostgreSQL LISTEN/NOTIFY fanout across replicas
+        tenancy_pg_notify_enabled:      bool,   false,  def,    true;
+    },
+
     /// Yubikey settings
     yubico: _enable_yubico {
         /// Enabled
@@ -1155,6 +1177,40 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         validate_internal_sso_issuer_url(&cfg.sso_authority)?;
         validate_internal_sso_redirect_url(&cfg.sso_callback_path)?;
         validate_sso_master_password_policy(cfg.sso_master_password_policy.as_ref())?;
+    }
+
+    match cfg.tenancy_mode.to_ascii_lowercase().as_str() {
+        "single" => {}
+        "multi" => {
+            if cfg.home_region.trim().is_empty() {
+                err!("`HOME_REGION` must be set when `TENANCY_MODE=multi`");
+            }
+            if !cfg.sso_enabled || !cfg.sso_only {
+                err!("`SSO_ENABLED=true` and `SSO_ONLY=true` are required when `TENANCY_MODE=multi`");
+            }
+            if cfg.signups_allowed {
+                err!("`SIGNUPS_ALLOWED=false` is required when `TENANCY_MODE=multi`");
+            }
+            if cfg.admin_token.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                err!("`ADMIN_TOKEN` must be unset when `TENANCY_MODE=multi`");
+            }
+            let db_url = cfg.database_url.trim().to_ascii_lowercase();
+            if !(db_url.starts_with("postgres://") || db_url.starts_with("postgresql://")) {
+                err!("PostgreSQL `DATABASE_URL` is required when `TENANCY_MODE=multi`");
+            }
+            let ch = cfg.tenancy_pg_notify_channel.as_str();
+            let valid_channel = !ch.is_empty()
+                && ch.len() <= 63
+                && ch.bytes().enumerate().all(|(i, b)| {
+                    b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit())
+                });
+            if !valid_channel {
+                err!("`TENANCY_PG_NOTIFY_CHANNEL` must be a valid PostgreSQL identifier");
+            }
+        }
+        other => {
+            err!(format!("`TENANCY_MODE` must be 'single' or 'multi', got '{other}'"));
+        }
     }
 
     if cfg._enable_yubico {
@@ -1710,8 +1766,16 @@ impl Config {
         Url::parse(&self.domain()).expect("DOMAIN not a valid URL").domain().is_some()
     }
 
+    /// Tests whether multi-tenant KyVault mode is active.
+    pub fn is_multi_tenant(&self) -> bool {
+        self.tenancy_mode().eq_ignore_ascii_case("multi")
+    }
+
     /// Tests whether the admin token is set to a non-empty value.
     pub fn is_admin_token_set(&self) -> bool {
+        if self.is_multi_tenant() {
+            return false;
+        }
         let token = self.admin_token();
 
         token.is_some() && !token.unwrap().trim().is_empty()

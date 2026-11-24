@@ -85,12 +85,25 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 member.save(&conn).await?;
             }
         } else {
+            let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
+                err!("Error looking up organization")
+            };
+            let (org_name, org_email, org_tenant_id) = (org.name, org.billing_email, org.tenant_id);
+
             // If user is not part of the organization
             let user = if let Some(user) = User::find_by_mail(&user_data.email, &conn).await {
+                if CONFIG.is_multi_tenant() {
+                    crate::tenancy::ensure_same_tenant(
+                        org_tenant_id.as_deref(),
+                        user.tenant_id.as_deref(),
+                        "public::import",
+                    )?;
+                }
                 user
             } else {
                 // User does not exist yet
                 let mut new_user = User::new(&user_data.email, None);
+                new_user.tenant_id = org_tenant_id;
                 new_user.save(&conn).await?;
 
                 if !CONFIG.mail_enabled() {
@@ -103,12 +116,6 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 MembershipStatus::Invited as i32
             } else {
                 MembershipStatus::Accepted as i32 // Automatically mark user as accepted if no email invites
-            };
-
-            let (org_name, org_email) = if let Some(org) = Organization::find_by_uuid(&org_id, &conn).await {
-                (org.name, org.billing_email)
-            } else {
-                err!("Error looking up organization")
             };
 
             let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(org_email.clone()));

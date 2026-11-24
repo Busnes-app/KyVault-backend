@@ -192,6 +192,9 @@ async fn get_send(send_id: SendId, headers: Headers, conn: DbConn) -> JsonResult
 
 #[post("/sends", data = "<data>")]
 async fn post_send(data: Json<SendData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> JsonResult {
+    if CONFIG.is_multi_tenant() && !CONFIG.tenancy_allow_sends() {
+        err_code!("Sends are disabled for this deployment", 403);
+    }
     enforce_disable_send_policy(&headers, &conn).await?;
 
     let data: SendData = data.into_inner();
@@ -202,6 +205,7 @@ async fn post_send(data: Json<SendData>, headers: Headers, conn: DbConn, nt: Not
     }
 
     let mut send = create_send(data, headers.user.uuid)?;
+    send.tenant_id = headers.user.tenant_id.clone();
     send.save(&conn).await?;
     nt.send_send_update(
         UpdateType::SyncSendCreate,
@@ -223,6 +227,9 @@ struct UploadDataV2<'f> {
 // Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/Tools/Controllers/SendsController.cs#L165
 #[post("/sends/file/v2", data = "<data>")]
 async fn post_send_file_v2(data: Json<SendData>, headers: Headers, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() && !CONFIG.tenancy_allow_sends() {
+        err_code!("Sends are disabled for this deployment", 403);
+    }
     enforce_disable_send_policy(&headers, &conn).await?;
 
     let data = data.into_inner();
@@ -263,7 +270,10 @@ async fn post_send_file_v2(data: Json<SendData>, headers: Headers, conn: DbConn)
         err!("Send storage limit exceeded with this file");
     }
 
+    crate::tenancy::check_storage_quota(&headers.user, file_length, &conn).await?;
+
     let mut send = create_send(data, headers.user.uuid)?;
+    send.tenant_id = headers.user.tenant_id.clone();
 
     let file_id = crate::crypto::generate_send_file_id();
 
@@ -303,6 +313,9 @@ async fn post_send_file_v2_data(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> EmptyResult {
+    if CONFIG.is_multi_tenant() && !CONFIG.tenancy_allow_sends() {
+        err_code!("Sends are disabled for this deployment", 403);
+    }
     enforce_disable_send_policy(&headers, &conn).await?;
 
     let data = data.into_inner();
@@ -323,8 +336,8 @@ async fn post_send_file_v2_data(
         Some(raw_file_name)
             if raw_file_name.dangerous_unsafe_unsanitized_raw() == send_data.fileName
             // be less strict only if using CLI, cf. https://github.com/dani-garcia/vaultwarden/issues/5614
-            || (headers.device.is_cli() && send_data.fileName.ends_with(raw_file_name.dangerous_unsafe_unsanitized_raw().as_str())
-            ) => {}
+            || (headers.device.is_cli()
+                && send_data.fileName.ends_with(raw_file_name.dangerous_unsafe_unsanitized_raw().as_str())) => {}
         Some(raw_file_name) => err!(
             "Send file name does not match.",
             format!(
@@ -348,7 +361,7 @@ async fn post_send_file_v2_data(
         err!("Send file size does not match.", format!("Expected a file size of {} got {size}", send_data.size));
     }
 
-    let file_path = format!("{send_id}/{file_id}");
+    let file_path = send.get_file_path(&file_id);
 
     save_temp_file(&PathType::Sends, &file_path, data.data, false).await?;
 
@@ -436,29 +449,33 @@ async fn process_access_file(send: Send, file_id: SendFileId, host: Host, conn: 
     Ok(Json(json!({
         "object": "send-fileDownload",
         "id": file_id,
-        "url": download_url(&host, &send.uuid, &file_id).await?,
+        "url": download_url(&host, &send, &file_id).await?,
     })))
 }
 
-async fn download_url(host: &Host, send_id: &SendId, file_id: &SendFileId) -> Result<String, crate::Error> {
+async fn download_url(host: &Host, send: &Send, file_id: &SendFileId) -> Result<String, crate::Error> {
     let operator = CONFIG.opendal_operator_for_path_type(&PathType::Sends)?;
 
     if crate::storage::is_fs_operator(&operator) {
-        let token_claims = crate::auth::generate_send_claims(send_id, file_id);
+        let token_claims = crate::auth::generate_send_claims(&send.uuid, file_id);
         let token = crate::auth::encode_jwt(&token_claims);
 
-        Ok(format!("{}/api/sends/{send_id}/{file_id}?t={token}", host.host))
+        Ok(format!("{}/api/sends/{}/{file_id}?t={token}", host.host, send.uuid))
     } else {
-        Ok(operator.presign_read(&format!("{send_id}/{file_id}"), Duration::from_mins(5)).await?.uri().to_string())
+        Ok(operator.presign_read(&send.get_file_path(file_id), Duration::from_mins(5)).await?.uri().to_string())
     }
 }
 
 #[get("/sends/<send_id>/<file_id>?<t>")]
-async fn download_send(send_id: SendId, file_id: SendFileId, t: &str) -> Option<NamedFile> {
+async fn download_send(send_id: SendId, file_id: SendFileId, t: &str, conn: DbConn) -> Option<NamedFile> {
     if let Ok(claims) = crate::auth::decode_send(t)
         && claims.sub == format!("{send_id}/{file_id}")
     {
-        return NamedFile::open(Path::new(&CONFIG.sends_folder()).join(send_id).join(file_id)).await.ok();
+        let rel_path = match Send::find_by_uuid(&send_id, &conn).await {
+            Some(send) => send.get_file_path(&file_id),
+            None => format!("{send_id}/{file_id}"),
+        };
+        return NamedFile::open(Path::new(&CONFIG.sends_folder()).join(rel_path)).await.ok();
     }
     None
 }

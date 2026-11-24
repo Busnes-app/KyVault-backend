@@ -202,7 +202,8 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
         (None, None)
     };
 
-    let org = Organization::new(data.name, &data.billing_email, private_key, public_key);
+    let mut org = Organization::new(data.name, &data.billing_email, private_key, public_key);
+    org.tenant_id = headers.user.tenant_id.clone();
     let mut member = Membership::new(headers.user.uuid, org.uuid.clone(), None);
     let collection = Collection::new(org.uuid.clone(), data.collection_name, None);
 
@@ -1048,11 +1049,20 @@ async fn send_invite(
                 }
 
                 let mut new_user = User::new(email, None);
+                new_user.tenant_id = headers.user.tenant_id.clone();
                 new_user.save(&conn).await?;
                 user_created = true;
                 new_user
             }
             Some(user) => {
+                if CONFIG.is_multi_tenant() {
+                    crate::tenancy::ensure_same_tenant(
+                        headers.user.tenant_id.as_deref(),
+                        user.tenant_id.as_deref(),
+                        "send_invite",
+                    )?;
+                }
+
                 if Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await.is_some() {
                     err!(format!("User already in organization: {}", email.escape_debug()))
                 }
@@ -1840,6 +1850,9 @@ async fn post_org_import(
 
     let headers: Headers = headers.into();
 
+    crate::tenancy::check_import_limits(data.ciphers.len(), collections.len())?;
+    crate::tenancy::check_cipher_quota(&headers.user, data.ciphers.len() as i64, &conn).await?;
+
     let mut ciphers: Vec<CipherId> = Vec::with_capacity(data.ciphers.len());
     for mut cipher_data in data.ciphers {
         // Always clear folder_id's via an organization import
@@ -1847,6 +1860,7 @@ async fn post_org_import(
         // Replace the client-provided, unvalidated organizationId with the real target org
         cipher_data.organization_id = Some(org_id.clone());
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+        cipher.tenant_id = headers.user.tenant_id.clone();
         update_cipher_from_data(
             &mut cipher,
             cipher_data,

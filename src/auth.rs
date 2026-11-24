@@ -21,6 +21,7 @@ use ring::hmac;
 use serde::{de::DeserializeOwned, ser::Serialize};
 
 use rocket::{
+    http::Status,
     outcome::try_outcome,
     request::{FromRequest, Outcome, Request},
 };
@@ -234,6 +235,12 @@ pub struct LoginJwtClaims {
     pub scope: Vec<String>,
     // [ "Application" ]
     pub amr: Vec<String>,
+
+    // Multi-tenant KyVault claims
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_only: Option<bool>,
 }
 
 impl LoginJwtClaims {
@@ -289,6 +296,8 @@ impl LoginJwtClaims {
             client_id: client_id.unwrap_or("undefined".to_owned()),
             scope,
             amr: vec!["Application".into()],
+            tid: user.tenant_id.clone(),
+            export_only: None,
         }
     }
 
@@ -706,6 +715,29 @@ impl<'r> FromRequest<'r> for Headers {
             err_handler!("Device has no user associated")
         };
 
+        if !user.enabled {
+            err_handler!("User is disabled")
+        }
+
+        if CONFIG.is_multi_tenant() {
+            let Some(user_tid) = user.tenant_id.as_deref().filter(|s| !s.is_empty()) else {
+                err_handler!("User has no tenant binding")
+            };
+            if claims.tid.as_deref() != Some(user_tid) {
+                err_handler!("Token tenant mismatch")
+            }
+            let export_only = claims.export_only.unwrap_or(false);
+            if export_only
+                && !crate::tenancy::is_export_only_route_allowed(request.method(), request.uri().path().as_str())
+            {
+                return Outcome::Error((Status::Forbidden, "Export-only session cannot perform this action"));
+            }
+            if let Err(e) = crate::tenancy::check_tenant_active(user_tid, export_only, &conn).await {
+                warn!("Rejected request for tenant {user_tid}: {e}");
+                return Outcome::Error((Status::Forbidden, "Tenant is unavailable"));
+            }
+        }
+
         if user.security_stamp != claims.sstamp {
             if let Some(stamp_exception) =
                 user.stamp_exception.as_deref().and_then(|s| serde_json::from_str::<UserStampException>(s).ok())
@@ -797,7 +829,7 @@ impl<'r> FromRequest<'r> for OrgIdGuard {
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         match get_org_id(request) {
             Some(_) => Outcome::Success(OrgIdGuard),
-            None => Outcome::Forward(rocket::http::Status::NotFound),
+            None => Outcome::Forward(Status::NotFound),
         }
     }
 }
@@ -819,6 +851,20 @@ impl<'r> FromRequest<'r> for OrgHeaders {
                 };
 
                 let user = headers.user;
+                if CONFIG.is_multi_tenant() {
+                    let Some(org) = crate::db::models::Organization::find_by_uuid(&org_id, &conn).await else {
+                        return Outcome::Error((Status::Forbidden, "Organization not found"));
+                    };
+                    if crate::tenancy::ensure_same_tenant(
+                        user.tenant_id.as_deref(),
+                        org.tenant_id.as_deref(),
+                        "OrgHeaders",
+                    )
+                    .is_err()
+                    {
+                        return Outcome::Error((Status::Forbidden, "Cross-tenant organization access denied"));
+                    }
+                }
                 let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await else {
                     err_handler!("The current user isn't member of the organization");
                 };
@@ -1308,6 +1354,11 @@ pub struct RefreshJwtClaims {
     pub device_token: String,
 
     pub token: Option<TokenWrapper>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1352,6 +1403,8 @@ impl AuthTokens {
             sub,
             device_token: device.refresh_token.clone(),
             token: None,
+            tid: user.tenant_id.clone(),
+            export_only: None,
         };
 
         Self {
@@ -1387,7 +1440,20 @@ pub async fn refresh_tokens(
         err!("Impossible to find user")
     };
 
-    let auth_tokens = match refresh_claims.sub {
+    if !user.enabled {
+        err_code!("User is disabled", 403);
+    }
+
+    let export_only = refresh_claims.export_only.unwrap_or(false);
+    if CONFIG.is_multi_tenant() {
+        let user_tid = crate::tenancy::require_user_tenant(&user)?;
+        if refresh_claims.tid.as_deref() != Some(user_tid) {
+            err_code!("Refresh token tenant mismatch", 403);
+        }
+        crate::tenancy::check_tenant_active(user_tid, export_only, conn).await?;
+    }
+
+    let mut auth_tokens = match refresh_claims.sub {
         AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {
             AuthTokens::new(&device, &user, refresh_claims.sub, client_id)
         }
@@ -1399,6 +1465,11 @@ pub async fn refresh_tokens(
         AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
         _ => err!("Invalid auth method, cannot refresh token"),
     };
+
+    if export_only {
+        auth_tokens.access_claims.export_only = Some(true);
+        auth_tokens.refresh_claims.export_only = Some(true);
+    }
 
     Ok((device, auth_tokens))
 }

@@ -222,6 +222,10 @@ async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, co
 
     let grantor_user = headers.user;
 
+    if CONFIG.is_multi_tenant() && !CONFIG.tenancy_allow_emergency_access() {
+        err_code!("Emergency access is disabled in multi-tenant mode", 403);
+    }
+
     // avoid setting yourself as emergency contact
     if email == grantor_user.email {
         err!("You can not set yourself as an emergency contact.")
@@ -243,11 +247,21 @@ async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, co
             }
 
             let mut user = User::new(&email, None);
+            user.tenant_id = grantor_user.tenant_id.clone();
             user.save(&conn).await?;
             (user, true)
         }
-        Some(user) if user.password_hash.is_empty() => (user, true),
-        Some(user) => (user, false),
+        Some(user) => {
+            if CONFIG.is_multi_tenant() {
+                crate::tenancy::ensure_same_tenant(
+                    grantor_user.tenant_id.as_deref(),
+                    user.tenant_id.as_deref(),
+                    "emergency_access::send_invite",
+                )?;
+            }
+            let is_new = user.password_hash.is_empty();
+            (user, is_new)
+        }
     };
 
     if EmergencyAccess::find_by_grantor_uuid_and_grantee_uuid_or_email(

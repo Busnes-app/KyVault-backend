@@ -230,7 +230,7 @@ async fn web_files(p: PathBuf) -> Cached<Option<NamedFile>> {
 }
 
 #[get("/attachments/<cipher_id>/<file_id>?<token>")]
-async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String) -> Option<NamedFile> {
+async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String, conn: DbConn) -> Option<NamedFile> {
     let Ok(claims) = decode_file_download(&token) else {
         return None;
     };
@@ -238,7 +238,12 @@ async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String) 
         return None;
     }
 
-    NamedFile::open(Path::new(&CONFIG.attachments_folder()).join(cipher_id.as_ref()).join(file_id.as_ref())).await.ok()
+    let rel_path = match crate::db::models::Attachment::find_by_id(&file_id, &conn).await {
+        Some(att) => att.get_file_path(),
+        None => format!("{cipher_id}/{file_id}"),
+    };
+
+    NamedFile::open(Path::new(&CONFIG.attachments_folder()).join(rel_path)).await.ok()
 }
 
 // We use DbConn here to let the alive healthcheck also verify the database connection.

@@ -292,6 +292,17 @@ pub async fn exchange_code(
 
     let user_name = id_claims.preferred_username().or(user_info.preferred_username()).map(|un| un.to_string());
 
+    let org_id = id_claims
+        .additional_claims()
+        .org_id
+        .clone()
+        .or_else(|| user_info.additional_claims().org_id.clone());
+    let export_only = id_claims
+        .additional_claims()
+        .export_only
+        .or(user_info.additional_claims().export_only)
+        .unwrap_or(false);
+
     let refresh_token = token_response.refresh_token().map(openidconnect::RefreshToken::secret);
     if refresh_token.is_none() && CONFIG.sso_scopes_vec().contains(&"offline_access".to_owned()) {
         error!("Scope offline_access is present but response contain no refresh_token");
@@ -307,6 +318,8 @@ pub async fn exchange_code(
         email: email.clone(),
         email_verified,
         user_name: user_name.clone(),
+        org_id,
+        export_only,
     };
 
     if CONFIG.sso_debug_tokens() {
@@ -337,12 +350,13 @@ pub async fn redeem(
         let user_sso = SsoUser {
             user_uuid: user.uuid.clone(),
             identifier: auth_user.identifier.clone(),
+            tenant_id: user.tenant_id.clone(),
         };
         user_sso.save(conn).await?;
     }
 
-    if CONFIG.sso_auth_only_not_session() {
-        Ok(AuthTokens::new(device, user, AuthMethod::Sso, client_id))
+    let mut tokens = if CONFIG.sso_auth_only_not_session() {
+        AuthTokens::new(device, user, AuthMethod::Sso, client_id)
     } else {
         let now = Utc::now();
 
@@ -356,8 +370,15 @@ pub async fn redeem(
         let access_claims =
             auth::LoginJwtClaims::new(device, user, ap_nbf, ap_exp, AuthMethod::Sso.scope_vec(), client_id, now);
 
-        create_auth_tokens_impl(device, auth_user.refresh_token, access_claims, auth_user.access_token)
+        create_auth_tokens_impl(device, auth_user.refresh_token, access_claims, auth_user.access_token)?
+    };
+
+    if auth_user.export_only {
+        tokens.access_claims.export_only = Some(true);
+        tokens.refresh_claims.export_only = Some(true);
     }
+
+    Ok(tokens)
 }
 
 // We always return a refresh_token (with no refresh_token some secrets are not displayed in the web front).
@@ -419,6 +440,8 @@ fn create_auth_tokens_impl(
         sub: AuthMethod::Sso,
         device_token: device.refresh_token.clone(),
         token: Some(token),
+        tid: access_claims.tid.clone(),
+        export_only: access_claims.export_only,
     };
 
     Ok(AuthTokens {
