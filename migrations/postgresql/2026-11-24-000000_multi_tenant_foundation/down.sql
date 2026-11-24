@@ -17,6 +17,6 @@ DROP INDEX IF EXISTS idx_users_tenant_id;
 ALTER TABLE users DROP COLUMN IF EXISTS tenant_id;
 
 DROP TABLE IF EXISTS tenant_recovery_bundles;
-DROP TABLE IF EXISTS tenant_processed_events;
-DROP TABLE IF EXISTS tenant_sync_cursors;
+DROP TABLE IF EXISTS tenant_pending_deletions;
+DROP TABLE IF EXISTS tenant_erased_subjects;
 DROP TABLE IF EXISTS tenants;

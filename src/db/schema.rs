@@ -294,7 +294,18 @@ table! {
         revision -> BigInt,
         quotas_json -> Text,
         storage_pool_bytes -> BigInt,
+        storage_ceiling_bytes -> BigInt,
+        storage_reserved_bytes -> BigInt,
+        storage_grant_expires_at -> Nullable<BigInt>,
+        storage_org_used_bytes -> BigInt,
         storage_over_since -> Nullable<BigInt>,
+        storage_report_seq -> BigInt,
+        storage_last_applied_seq -> BigInt,
+        storage_pending_seq -> Nullable<BigInt>,
+        storage_pending_used_bytes -> Nullable<BigInt>,
+        storage_seq_stale -> Bool,
+        authority_refreshed_at -> Nullable<BigInt>,
+        access_epoch -> BigInt,
         primary_org_uuid -> Nullable<Text>,
         created_at -> Timestamp,
         updated_at -> Timestamp,
@@ -304,20 +315,25 @@ table! {
 }
 
 table! {
-    tenant_sync_cursors (name) {
-        name -> Text,
+    tenant_erased_subjects (issuer, subject) {
+        issuer -> Text,
+        subject -> Text,
+        tenant_id -> Text,
         revision -> BigInt,
-        after_id -> Text,
-        updated_at -> Timestamp,
+        erased_at -> Timestamp,
     }
 }
 
 table! {
-    tenant_processed_events (event_id) {
-        event_id -> Text,
-        event_type -> Text,
-        expires_at -> BigInt,
-        processed_at -> Timestamp,
+    tenant_pending_deletions (id) {
+        id -> Text,
+        tenant_id -> Text,
+        user_uuid -> Nullable<Text>,
+        storage_kind -> Text,
+        object_key -> Text,
+        attempts -> Integer,
+        last_error -> Nullable<Text>,
+        created_at -> Timestamp,
     }
 }
 
@@ -332,7 +348,6 @@ table! {
         wrapped_user_key -> Text,
         wrapped_private_key -> Nullable<Text>,
         recovery_key_hint -> Nullable<Text>,
-        escrow_org_uuid -> Nullable<Text>,
         created_at -> Timestamp,
         updated_at -> Timestamp,
         revoked_at -> Nullable<Timestamp>,
@@ -461,8 +476,8 @@ allow_tables_to_appear_in_same_query!(
     sends,
     sso_users,
     tenants,
-    tenant_sync_cursors,
-    tenant_processed_events,
+    tenant_erased_subjects,
+    tenant_pending_deletions,
     tenant_recovery_bundles,
     twofactor,
     users,

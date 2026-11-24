@@ -89,6 +89,12 @@ pub async fn initialize_keys() -> Result<(), Error> {
     let (priv_key, priv_key_buffer) = if let Some(priv_key_buffer) = priv_key_buffer {
         (Rsa::private_key_from_pem(priv_key_buffer.to_vec().as_slice())?, priv_key_buffer.to_vec())
     } else {
+        if CONFIG.is_multi_tenant() {
+            err!(
+                "Pre-provisioned shared RSA signing key '{}' is missing in multi-tenant mode; refusing to auto-generate per-replica key",
+                CONFIG.private_rsa_key()
+            );
+        }
         let rsa_key = Rsa::generate(2048)?;
         let priv_key_buffer = rsa_key.private_key_to_pem()?;
         operator.write(&rsa_key_filename, priv_key_buffer.clone()).await?;
@@ -720,20 +726,20 @@ impl<'r> FromRequest<'r> for Headers {
         }
 
         if CONFIG.is_multi_tenant() {
-            let Some(user_tid) = user.tenant_id.as_deref().filter(|s| !s.is_empty()) else {
+            let Some(tenant_id) = user.tenant_id.as_deref().filter(|s| !s.is_empty()) else {
                 err_handler!("User has no tenant binding")
             };
-            if claims.tid.as_deref() != Some(user_tid) {
+            if claims.tid.as_deref() != Some(tenant_id) {
                 err_handler!("Token tenant mismatch")
             }
-            let export_only = claims.export_only.unwrap_or(false);
-            if export_only
-                && !crate::tenancy::is_export_only_route_allowed(request.method(), request.uri().path().as_str())
-            {
-                return Outcome::Error((Status::Forbidden, "Export-only session cannot perform this action"));
+            if claims.export_only.unwrap_or(false) {
+                return Outcome::Error((
+                    Status::Forbidden,
+                    "Export-only sessions are not allowed on ordinary vault endpoints",
+                ));
             }
-            if let Err(e) = crate::tenancy::check_tenant_active(user_tid, export_only, &conn).await {
-                warn!("Rejected request for tenant {user_tid}: {e}");
+            if let Err(e) = crate::tenancy::check_tenant_active(tenant_id, &conn).await {
+                warn!("Rejected request for tenant {tenant_id}: {e}");
                 return Outcome::Error((Status::Forbidden, "Tenant is unavailable"));
             }
         }
@@ -1444,16 +1450,18 @@ pub async fn refresh_tokens(
         err_code!("User is disabled", 403);
     }
 
-    let export_only = refresh_claims.export_only.unwrap_or(false);
     if CONFIG.is_multi_tenant() {
+        if refresh_claims.export_only.unwrap_or(false) {
+            err_code!("Export-only sessions cannot refresh ordinary vault tokens", 403);
+        }
         let user_tid = crate::tenancy::require_user_tenant(&user)?;
         if refresh_claims.tid.as_deref() != Some(user_tid) {
             err_code!("Refresh token tenant mismatch", 403);
         }
-        crate::tenancy::check_tenant_active(user_tid, export_only, conn).await?;
+        crate::tenancy::check_tenant_active(user_tid, conn).await?;
     }
 
-    let mut auth_tokens = match refresh_claims.sub {
+    let auth_tokens = match refresh_claims.sub {
         AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {
             AuthTokens::new(&device, &user, refresh_claims.sub, client_id)
         }
@@ -1465,11 +1473,6 @@ pub async fn refresh_tokens(
         AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
         _ => err!("Invalid auth method, cannot refresh token"),
     };
-
-    if export_only {
-        auth_tokens.access_claims.export_only = Some(true);
-        auth_tokens.refresh_claims.export_only = Some(true);
-    }
 
     Ok((device, auth_tokens))
 }

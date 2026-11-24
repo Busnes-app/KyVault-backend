@@ -100,10 +100,10 @@ pub struct SendData {
 /// controls this policy globally.
 async fn enforce_disable_send_policy(headers: &Headers, conn: &DbConn) -> EmptyResult {
     let user_id = &headers.user.uuid;
-    if !CONFIG.sends_allowed()
+    if !CONFIG.is_sends_allowed()
         || OrgPolicy::is_applicable_to_user(user_id, OrgPolicyType::DisableSend, None, conn).await
     {
-        err!("Due to an Enterprise Policy, you are only able to delete an existing Send.")
+        err_code!("Bitwarden Send is disabled by server or organization policy", 403)
     }
     Ok(())
 }
@@ -270,7 +270,9 @@ async fn post_send_file_v2(data: Json<SendData>, headers: Headers, conn: DbConn)
         err!("Send storage limit exceeded with this file");
     }
 
-    crate::tenancy::check_storage_quota(&headers.user, file_length, &conn).await?;
+    if !CONFIG.is_sends_allowed() {
+        err_code!("Bitwarden Send is disabled in hosted multi-tenant mode", 403);
+    }
 
     let mut send = create_send(data, headers.user.uuid)?;
     send.tenant_id = headers.user.tenant_id.clone();
@@ -379,6 +381,9 @@ async fn post_send_file_v2_data(
 
 #[post("/sends/access")]
 async fn post_access(headers: SendHeaders, conn: DbConn, nt: Notify<'_>) -> JsonResult {
+    if !CONFIG.is_sends_allowed() {
+        err_code!("Bitwarden Send is disabled in hosted multi-tenant mode", 403);
+    }
     let Some(mut send) = Send::find_by_uuid(&headers.send_id, &conn).await else {
         err_code!(SEND_INACCESSIBLE_MSG, 404)
     };
@@ -413,6 +418,9 @@ async fn post_access_file(
     conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
+    if !CONFIG.is_sends_allowed() {
+        err_code!("Bitwarden Send is disabled in hosted multi-tenant mode", 403);
+    }
     let Some(mut send) = Send::find_by_uuid(&headers.send_id, &conn).await else {
         err_code!(SEND_INACCESSIBLE_MSG, 404)
     };
@@ -468,6 +476,9 @@ async fn download_url(host: &Host, send: &Send, file_id: &SendFileId) -> Result<
 
 #[get("/sends/<send_id>/<file_id>?<t>")]
 async fn download_send(send_id: SendId, file_id: SendFileId, t: &str, conn: DbConn) -> Option<NamedFile> {
+    if !CONFIG.is_sends_allowed() {
+        return None;
+    }
     if let Ok(claims) = crate::auth::decode_send(t)
         && claims.sub == format!("{send_id}/{file_id}")
     {

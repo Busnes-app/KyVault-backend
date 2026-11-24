@@ -644,7 +644,8 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
     // Since we check for the size of the encrypted note length, we need to do that here to pre-validate it.
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
     crate::tenancy::check_import_limits(data.ciphers.len(), data.folders.len())?;
-    crate::tenancy::check_cipher_quota(&headers.user, data.ciphers.len() as i64, &conn).await?;
+    crate::tenancy::check_cipher_quota(&headers.user, i64::try_from(data.ciphers.len()).unwrap_or(i64::MAX), &conn)
+        .await?;
     Cipher::validate_cipher_data(&data.ciphers)?;
 
     // Read and create the folders
@@ -1334,13 +1335,19 @@ async fn post_attachment_v2(
         err!("Attachment storage limit exceeded with this file");
     }
 
-    crate::tenancy::check_storage_quota(&headers.user, file_size, &conn).await?;
+    let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, file_size, &conn).await?;
 
     let attachment_id = crypto::generate_attachment_id();
     let attachment =
         Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key))
             .with_tenant_id(headers.user.tenant_id.clone());
-    attachment.save(&conn).await.expect("Error saving attachment");
+    let save_res = attachment.save(&conn).await;
+    crate::tenancy::release_storage_reservation(&headers.user, file_size, &conn).await;
+    save_res.expect("Error saving attachment");
+    if let Err(e) = crate::tenancy::verify_access_epoch(&headers.user, upload_epoch, &conn).await {
+        attachment.delete(&conn).await.ok();
+        return Err(e);
+    }
     notify_attachment_created(&cipher, &headers, &conn, &nt).await;
 
     let url = format!("/ciphers/{}/attachment/{attachment_id}", cipher.uuid);
@@ -1367,11 +1374,11 @@ struct UploadData<'f> {
 /// Saves the data content of an attachment to a file. This is common code
 /// shared between the v2 and legacy attachment APIs.
 ///
-/// When used with the legacy API, this function is responsible for creating
-/// the attachment database record, so `attachment` is None.
-///
 /// When used with the v2 API, post_attachment_v2() has already created the
 /// database record, which is passed in as `attachment`.
+///
+/// When used with the legacy API, this function is responsible for creating
+/// the attachment database record, so `attachment` is None.
 async fn save_attachment(
     mut attachment: Option<Attachment>,
     cipher_id: CipherId,
@@ -1410,17 +1417,15 @@ async fn save_attachment(
         err!("Attachment storage limit exceeded with this file");
     }
 
-    let delta_bytes = size.saturating_sub(size_adjust);
-    if delta_bytes > 0 {
-        crate::tenancy::check_storage_quota(&headers.user, delta_bytes, &conn).await?;
-    }
+    let delta_bytes = size.saturating_sub(size_adjust).max(0);
+    let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, delta_bytes, &conn).await?;
 
     let file_id = match &attachment {
         Some(attachment) => attachment.id.clone(), // v2 API
         None => crypto::generate_attachment_id(),  // Legacy API
     };
 
-    let storage_path = if let Some(attachment) = &mut attachment {
+    let (storage_path, created_attachment) = if let Some(attachment) = &mut attachment {
         // v2 API
 
         // Check the actual size against the size initially provided by
@@ -1428,9 +1433,11 @@ async fn save_attachment(
         // size, but it's not clear when or why this is needed.
         const LEEWAY: i64 = 1024 * 1024; // 1 MiB
         let Some(max_size) = attachment.file_size.checked_add(LEEWAY) else {
+            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
             err!("Invalid attachment size max")
         };
         let Some(min_size) = attachment.file_size.checked_sub(LEEWAY) else {
+            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
             err!("Invalid attachment size min")
         };
 
@@ -1441,11 +1448,12 @@ async fn save_attachment(
                 attachment.save(&conn).await.expect("Error updating attachment");
             }
         } else {
+            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
             attachment.delete(&conn).await.ok();
 
             err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
         }
-        attachment.get_file_path()
+        (attachment.get_file_path(), None)
     } else {
         // Legacy API
 
@@ -1455,19 +1463,42 @@ async fn save_attachment(
         let encrypted_filename = data.data.raw_name().map(|s| s.dangerous_unsafe_unsanitized_raw().to_string());
 
         if encrypted_filename.is_none() {
+            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
             err!("No filename provided")
         }
         if data.key.is_none() {
+            crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
             err!("No attachment key provided")
         }
-        let attachment =
-            Attachment::new(file_id.clone(), cipher_id.clone(), encrypted_filename.unwrap(), size, data.key)
-                .with_tenant_id(headers.user.tenant_id.clone());
-        attachment.save(&conn).await.expect("Error saving attachment");
-        attachment.get_file_path()
+        let att = Attachment::new(file_id.clone(), cipher_id.clone(), encrypted_filename.unwrap(), size, data.key)
+            .with_tenant_id(headers.user.tenant_id.clone());
+        let path = att.get_file_path();
+        (path, Some(att))
     };
 
-    save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await?;
+    let write_res = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await;
+    if let Err(e) = write_res {
+        crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+        return Err(e);
+    }
+
+    // Fence late uploaders: verify tenant is still active at the same access_epoch BEFORE
+    // committing/keeping the uploaded object.
+    if let Err(e) = crate::tenancy::verify_access_epoch(&headers.user, upload_epoch, &conn).await {
+        if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
+            operator.delete(&storage_path).await.ok();
+        }
+        if let Some(ref att) = attachment {
+            att.delete(&conn).await.ok();
+        }
+        crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
+        return Err(e);
+    }
+
+    if let Some(ref att) = created_attachment {
+        att.save(&conn).await.expect("Error saving attachment");
+    }
+    crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
 
     // With the v2 API, post_attachment_v2() already did this when it created the attachment record
     if attachment.is_none() {

@@ -63,10 +63,7 @@ pub fn publish_user_logout(user_id: &UserId) {
 }
 
 pub(crate) fn is_safe_pg_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 63
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    !s.is_empty() && s.len() <= 63 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Publishes an immediate tenant-wide disconnect across all replicas.
@@ -105,7 +102,7 @@ fn handle_remote_envelope(payload: &str) {
         "ws_frame" => {
             if let (Some(uid), Some(b64)) = (env.user_id, env.payload_b64) {
                 match BASE64.decode(b64.as_bytes()) {
-                    Ok(bytes) => WS_USERS.deliver_local_raw(&UserId::from(uid), bytes),
+                    Ok(bytes) => WS_USERS.deliver_local_raw(&UserId::from(uid), &bytes),
                     Err(e) => warn!("Invalid base64 in PG NOTIFY ws_frame: {e}"),
                 }
             }
@@ -132,43 +129,6 @@ pub fn start_pg_notify_loop() {
 
     use futures::StreamExt;
 
-    if !CONFIG.tenancy_pg_notify_enabled() {
-        return;
-    }
-
-    if crate::db::ACTIVE_DB_TYPE.get() != Some(&crate::db::DbConnType::Postgresql) {
-        return;
-    }
-
-    let channel = CONFIG.tenancy_pg_notify_channel();
-    if !is_safe_pg_ident(&channel) {
-        error!("Refusing invalid TENANCY_PG_NOTIFY_CHANNEL '{channel}': must match [a-z0-9_]+");
-        return;
-    }
-    let db_url = CONFIG.database_url();
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    if PUBLISH_TX.set(tx).is_err() {
-        return;
-    }
-
-    tokio::spawn(async move {
-        let mut backoff = Duration::from_millis(500);
-        loop {
-            match connect_and_listen(&db_url, &channel, &mut rx).await {
-                Ok(()) => {
-                    warn!("PostgreSQL LISTEN connection closed; reconnecting...");
-                    backoff = Duration::from_millis(500);
-                }
-                Err(e) => {
-                    warn!("PostgreSQL LISTEN/NOTIFY loop error: {e}; retrying in {backoff:?}");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                }
-            }
-        }
-    });
-
     async fn connect_and_listen(
         db_url: &str,
         channel: &str,
@@ -187,9 +147,8 @@ pub fn start_pg_notify_loop() {
                 builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
             }
             let connector = postgres_openssl::MakeTlsConnector::new(builder.build());
-            let (client, mut connection) = tokio_postgres::connect(db_url, connector)
-                .await
-                .map_err(|e| format!("pg tls connect error: {e}"))?;
+            let (client, mut connection) =
+                tokio_postgres::connect(db_url, connector).await.map_err(|e| format!("pg tls connect error: {e}"))?;
 
             tokio::spawn(async move {
                 let mut stream = futures::stream::poll_fn(move |cx| connection.poll_message(cx));
@@ -230,10 +189,7 @@ pub fn start_pg_notify_loop() {
             client
         };
 
-        client
-            .batch_execute(&format!("LISTEN \"{channel}\""))
-            .await
-            .map_err(|e| format!("LISTEN failed: {e}"))?;
+        client.batch_execute(&format!("LISTEN \"{channel}\"")).await.map_err(|e| format!("LISTEN failed: {e}"))?;
         info!("PostgreSQL LISTEN/NOTIFY fanout active on channel '{channel}' (instance {})", *INSTANCE_ID);
 
         loop {
@@ -260,6 +216,43 @@ pub fn start_pg_notify_loop() {
             }
         }
     }
+
+    if !CONFIG.tenancy_pg_notify_enabled() {
+        return;
+    }
+
+    if crate::db::ACTIVE_DB_TYPE.get() != Some(&crate::db::DbConnType::Postgresql) {
+        return;
+    }
+
+    let channel = CONFIG.tenancy_pg_notify_channel();
+    if !is_safe_pg_ident(&channel) {
+        error!("Refusing invalid TENANCY_PG_NOTIFY_CHANNEL '{channel}': must match [a-z0-9_]+");
+        return;
+    }
+    let db_url = CONFIG.database_url();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    if PUBLISH_TX.set(tx).is_err() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_millis(500);
+        loop {
+            match connect_and_listen(&db_url, &channel, &mut rx).await {
+                Ok(()) => {
+                    warn!("PostgreSQL LISTEN connection closed; reconnecting...");
+                    backoff = Duration::from_millis(500);
+                }
+                Err(e) => {
+                    warn!("PostgreSQL LISTEN/NOTIFY loop error: {e}; retrying in {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+    });
 }
 
 #[cfg(not(postgresql))]

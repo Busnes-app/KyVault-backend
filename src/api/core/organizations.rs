@@ -186,6 +186,9 @@ struct BulkMembershipIds {
 
 #[post("/organizations", data = "<data>")]
 async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organizations are provisioned by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if !CONFIG.is_org_creation_allowed(&headers.user.email) {
         err!("User not allowed to create organizations")
     }
@@ -226,6 +229,9 @@ async fn delete_organization(
     headers: OwnerHeaders,
     conn: DbConn,
 ) -> EmptyResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organizations are managed by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -241,6 +247,9 @@ async fn delete_organization(
 
 #[post("/organizations/<org_id>/leave")]
 async fn leave_organization(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> EmptyResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organization membership is managed by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if headers.membership.status != MembershipStatus::Confirmed as i32 {
         err!("You need to be a Member of the Organization to call this endpoint")
     }
@@ -285,6 +294,9 @@ async fn put_organization(
     data: Json<OrganizationUpdateData>,
     conn: DbConn,
 ) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organizations are managed by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -1002,6 +1014,9 @@ async fn send_invite(
     headers: AdminHeaders,
     conn: DbConn,
 ) -> EmptyResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organization invitations are managed by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -1851,7 +1866,8 @@ async fn post_org_import(
     let headers: Headers = headers.into();
 
     crate::tenancy::check_import_limits(data.ciphers.len(), collections.len())?;
-    crate::tenancy::check_cipher_quota(&headers.user, data.ciphers.len() as i64, &conn).await?;
+    crate::tenancy::check_cipher_quota(&headers.user, i64::try_from(data.ciphers.len()).unwrap_or(i64::MAX), &conn)
+        .await?;
 
     let mut ciphers: Vec<CipherId> = Vec::with_capacity(data.ciphers.len());
     for mut cipher_data in data.ciphers {

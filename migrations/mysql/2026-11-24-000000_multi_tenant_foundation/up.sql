@@ -4,11 +4,22 @@ CREATE TABLE tenants (
     id VARCHAR(64) PRIMARY KEY NOT NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'active',
     home_region VARCHAR(64) NOT NULL DEFAULT '',
-    app_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    app_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     revision BIGINT NOT NULL DEFAULT 0,
     quotas_json TEXT NOT NULL,
     storage_pool_bytes BIGINT NOT NULL DEFAULT 0,
+    storage_ceiling_bytes BIGINT NOT NULL DEFAULT 0,
+    storage_reserved_bytes BIGINT NOT NULL DEFAULT 0,
+    storage_grant_expires_at BIGINT,
+    storage_org_used_bytes BIGINT NOT NULL DEFAULT 0,
     storage_over_since BIGINT,
+    storage_report_seq BIGINT NOT NULL DEFAULT 0,
+    storage_last_applied_seq BIGINT NOT NULL DEFAULT 0,
+    storage_pending_seq BIGINT,
+    storage_pending_used_bytes BIGINT,
+    storage_seq_stale BOOLEAN NOT NULL DEFAULT FALSE,
+    authority_refreshed_at BIGINT,
+    access_epoch BIGINT NOT NULL DEFAULT 1,
     primary_org_uuid CHAR(36),
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -16,18 +27,24 @@ CREATE TABLE tenants (
     erased_at DATETIME
 );
 
-CREATE TABLE tenant_sync_cursors (
-    name VARCHAR(64) PRIMARY KEY NOT NULL,
+CREATE TABLE tenant_erased_subjects (
+    issuer VARCHAR(255) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    tenant_id VARCHAR(64) NOT NULL,
     revision BIGINT NOT NULL DEFAULT 0,
-    after_id VARCHAR(64) NOT NULL DEFAULT '',
-    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    erased_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (issuer, subject)
 );
 
-CREATE TABLE tenant_processed_events (
-    event_id VARCHAR(128) PRIMARY KEY NOT NULL,
-    event_type VARCHAR(64) NOT NULL,
-    expires_at BIGINT NOT NULL,
-    processed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE tenant_pending_deletions (
+    id CHAR(36) PRIMARY KEY NOT NULL,
+    tenant_id VARCHAR(64) NOT NULL,
+    user_uuid CHAR(36),
+    storage_kind VARCHAR(32) NOT NULL,
+    object_key VARCHAR(512) NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE tenant_recovery_bundles (
@@ -39,8 +56,7 @@ CREATE TABLE tenant_recovery_bundles (
     kdf_params_json TEXT NOT NULL,
     wrapped_user_key TEXT NOT NULL,
     wrapped_private_key TEXT,
-    recovery_key_hint VARCHAR(64),
-    escrow_org_uuid CHAR(36),
+    recovery_key_hint VARCHAR(256),
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     revoked_at DATETIME,

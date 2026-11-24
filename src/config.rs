@@ -877,10 +877,14 @@ make_config! {
         tenancy_mode:                   String, false,  def,    "single".to_owned();
         /// Home region |> Region slug owned by this KyVault instance (required when TENANCY_MODE=multi)
         home_region:                    String, false,  def,    String::new();
+        /// Internal management API secret |> Pre-provisioned shared secret (>= 32 chars) authenticating kyvault-worker calls to /internal/tenancy/v1/* (required when TENANCY_MODE=multi)
+        tenancy_internal_api_secret:    Pass,   false,  option;
+        /// Authority freshness cap in seconds |> Bounded between 60 and 900 seconds (15 min cap)
+        tenancy_authority_max_age_secs: i64,    false,  def,    900;
         /// Allow emergency access in multi-tenant mode |> Disabled by default to prevent cross-tenant grants
         tenancy_allow_emergency_access: bool,   false,  def,    false;
-        /// Allow Sends in multi-tenant mode
-        tenancy_allow_sends:            bool,   false,  def,    true;
+        /// Allow Sends in multi-tenant mode |> Always disabled in hosted multi-tenant mode (v1 policy)
+        tenancy_allow_sends:            bool,   false,  def,    false;
         /// Maximum ciphers accepted in a single import request
         tenancy_max_import_ciphers:     usize,  false,  def,    5_000;
         /// Maximum folders accepted in a single import request
@@ -1198,12 +1202,24 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
             if !(db_url.starts_with("postgres://") || db_url.starts_with("postgresql://")) {
                 err!("PostgreSQL `DATABASE_URL` is required when `TENANCY_MODE=multi`");
             }
+            if !cfg.attachments_folder.trim().to_ascii_lowercase().starts_with("s3://") {
+                err!(
+                    "S3 `ATTACHMENTS_FOLDER` (s3://...) is required when `TENANCY_MODE=multi` (no hosted disk fallback)"
+                );
+            }
+            if cfg.tenancy_internal_api_secret.as_deref().map_or(0, |s| s.trim().len()) < 32 {
+                err!("`TENANCY_INTERNAL_API_SECRET` (>= 32 chars) is required when `TENANCY_MODE=multi`");
+            }
+            if !(60..=900).contains(&cfg.tenancy_authority_max_age_secs) {
+                err!("`TENANCY_AUTHORITY_MAX_AGE_SECS` must be between 60 and 900 seconds");
+            }
             let ch = cfg.tenancy_pg_notify_channel.as_str();
             let valid_channel = !ch.is_empty()
                 && ch.len() <= 63
-                && ch.bytes().enumerate().all(|(i, b)| {
-                    b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit())
-                });
+                && ch
+                    .bytes()
+                    .enumerate()
+                    .all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit()));
             if !valid_channel {
                 err!("`TENANCY_PG_NOTIFY_CHANNEL` must be a valid PostgreSQL identifier");
             }
@@ -1769,6 +1785,11 @@ impl Config {
     /// Tests whether multi-tenant KyVault mode is active.
     pub fn is_multi_tenant(&self) -> bool {
         self.tenancy_mode().eq_ignore_ascii_case("multi")
+    }
+
+    /// Tests whether Bitwarden Send is allowed. Unconditionally disabled in hosted multi-tenant mode (v1 policy).
+    pub fn is_sends_allowed(&self) -> bool {
+        !self.is_multi_tenant() && self.sends_allowed()
     }
 
     /// Tests whether the admin token is set to a non-empty value.

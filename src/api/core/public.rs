@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use chrono::Utc;
 use rocket::{
     Request, Route,
+    http::Status,
     request::{FromRequest, Outcome},
     serde::json::Json,
 };
@@ -196,6 +197,12 @@ impl<'r> FromRequest<'r> for PublicToken {
     type Error = &'static str;
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        if CONFIG.is_multi_tenant() {
+            return Outcome::Error((
+                Status::Forbidden,
+                "Organization public API is disabled in hosted multi-tenant mode",
+            ));
+        }
         let headers = request.headers();
         // Get access_token
         let access_token: &str = if let Some(a) = headers.get_one("Authorization") {

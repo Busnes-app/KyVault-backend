@@ -95,7 +95,7 @@ fn vaultwarden_css() -> EtagCached<String> {
         "load_user_scss": true,
         "mail_2fa_enabled": CONFIG._enable_email_2fa(),
         "mail_enabled": CONFIG.mail_enabled(),
-        "sends_allowed": CONFIG.sends_allowed(),
+        "sends_allowed": CONFIG.is_sends_allowed(),
         "remember_2fa_disabled": CONFIG.disable_2fa_remember(),
         "password_hints_allowed": CONFIG.password_hints_allowed(),
         "signup_disabled": CONFIG.is_signup_disabled(),
@@ -235,6 +235,11 @@ async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String, 
         return None;
     };
     if claims.sub != cipher_id || claims.file_id != file_id {
+        return None;
+    }
+
+    // Hosted mode stores attachments in S3 and serves them through presigned URLs only.
+    if CONFIG.is_multi_tenant() {
         return None;
     }
 

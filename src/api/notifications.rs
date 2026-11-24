@@ -167,8 +167,10 @@ async fn websockets_hub<'r>(
         if claims.tid.as_deref() != Some(user_tid) {
             err_code!("Token tenant mismatch", 403)
         }
-        let export_only = claims.export_only.unwrap_or(false);
-        crate::tenancy::check_tenant_active(user_tid, export_only, &conn).await?;
+        if claims.export_only.unwrap_or(false) {
+            err_code!("Export-only sessions cannot connect to notifications", 403)
+        }
+        crate::tenancy::check_tenant_active(user_tid, &conn).await?;
     }
 
     let (mut rx, guard) = {
@@ -177,11 +179,7 @@ async fn websockets_hub<'r>(
         // Add a channel to send messages to this client to the map
         let entry_uuid = uuid::Uuid::new_v4();
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
-        users
-            .map
-            .entry(claims.sub.to_string())
-            .or_default()
-            .push((entry_uuid, user.tenant_id.clone(), tx));
+        users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, user.tenant_id.clone(), tx));
 
         // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
         (rx, WSEntryMapGuard::new(users, claims.sub, entry_uuid, ip.ip))
@@ -408,10 +406,10 @@ pub struct WebSocketUsers {
 
 #[cfg_attr(not(postgresql), allow(dead_code))]
 impl WebSocketUsers {
-    pub fn deliver_local_raw(&self, user_id: &UserId, data: Vec<u8>) {
+    pub fn deliver_local_raw(&self, user_id: &UserId, data: &[u8]) {
         if let Some(user) = self.map.get(user_id.as_ref()).map(|v| v.clone()) {
             for (_, _, sender) in &user {
-                if let Err(e) = sender.try_send(Message::binary(data.clone())) {
+                if let Err(e) = sender.try_send(Message::binary(data.to_vec())) {
                     debug!("Dropping/failing local WS update for {user_id}: {e}");
                 }
             }

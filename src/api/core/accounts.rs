@@ -1527,11 +1527,17 @@ async fn update_api_key(data: Json<PasswordOrOtpData>, rotate: bool, headers: He
 
 #[post("/accounts/api-key", data = "<data>")]
 async fn post_api_key(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("API keys are disabled in hosted multi-tenant mode", 403)
+    }
     update_api_key(data, false, headers, conn).await
 }
 
 #[post("/accounts/rotate-api-key", data = "<data>")]
 async fn rotate_api_key(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("API keys are disabled in hosted multi-tenant mode", 403)
+    }
     update_api_key(data, true, headers, conn).await
 }
 

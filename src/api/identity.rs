@@ -29,9 +29,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError, Organization,
-            OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
-            TwoFactorType, User, UserId,
+            AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError,
+            OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TenantErasedSubject, TwoFactor,
+            TwoFactorIncomplete, TwoFactorType, User, UserId,
         },
     },
     error::MapResult,
@@ -79,6 +79,9 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
 
             password_login(data, &mut user_id, &conn, &client_header.ip).await
         }
+        "client_credentials" if CONFIG.is_multi_tenant() => {
+            err_code!("API key authentication is disabled in hosted multi-tenant mode", 403)
+        }
         "client_credentials" => {
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
             check_is_some(data.client_secret.as_ref(), "client_secret cannot be blank")?;
@@ -98,6 +101,9 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             sso_login(data, &mut user_id, &conn, &client_header.ip).await
         }
         "authorization_code" => err!("SSO sign-in is not available"),
+        "send_access" if !CONFIG.is_sends_allowed() => {
+            err_code!("Bitwarden Send is disabled in hosted multi-tenant mode", 403)
+        }
         "send_access" => {
             crate::ratelimit::check_limit_unauthenticated(&client_header.ip.ip)?;
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
@@ -204,27 +210,38 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
     let (sso_auth, user_infos) = sso::exchange_code(code, code_verifier, conn).await?;
 
     let multi_tenant_id = if CONFIG.is_multi_tenant() {
+        if user_infos.export_only {
+            err_code!("Export-only principals cannot open ordinary vault sessions", 403);
+        }
+        if user_infos.is_staff_admin {
+            err_code!("Platform staff principals cannot sign in to customer vaults", 403);
+        }
+        if TenantErasedSubject::is_erased(&user_infos.issuer, &user_infos.subject, conn).await {
+            err_code!("Account has been permanently erased", 403);
+        }
         let Some(tid) = user_infos.org_id.as_deref().filter(|s| !s.trim().is_empty()) else {
             err_code!("OIDC token is missing required org_id claim", 403);
         };
-        crate::tenancy::check_tenant_active(tid, user_infos.export_only, conn).await?;
+        crate::tenancy::check_tenant_active(tid, conn).await?;
         Some(tid.to_owned())
     } else {
         None
     };
 
     let user_with_sso = match SsoUser::find_by_identifier(&user_infos.identifier, conn).await {
+        None if CONFIG.is_multi_tenant() => {
+            // In multi-tenant mode, NEVER adopt an existing user by email.
+            if User::find_by_mail(&user_infos.email, conn).await.is_some() {
+                error!(
+                    "Multi-tenant SSO login failure ({}): email ({}) already exists without matching OIDC subject",
+                    user_infos.identifier, user_infos.email
+                );
+                err_code!("Account email is already bound to another identity", 403);
+            }
+            None
+        }
         None => match SsoUser::find_by_mail(&user_infos.email, conn).await {
             None => None,
-            Some((user, _))
-                if CONFIG.is_multi_tenant() && user.tenant_id.as_deref() != multi_tenant_id.as_deref() =>
-            {
-                error!(
-                    "Login failure ({}), email ({}) belongs to a different tenant",
-                    user_infos.identifier, user.email
-                );
-                err_code!("Account belongs to a different organization", 403)
-            }
             Some((user, Some(_))) => {
                 error!(
                     "Login failure ({}), existing SSO user ({}) with same email ({})",
@@ -238,8 +255,7 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                 )
             }
             Some((user, None))
-                if !CONFIG.is_multi_tenant()
-                    && user.private_key.is_none()
+                if user.private_key.is_none()
                     && !CONFIG.sso_signups_allowed()
                     && !CONFIG.is_email_domain_allowed(&user.email)
                     && !CONFIG.mail_enabled()
@@ -256,9 +272,7 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                     }
                 )
             }
-            Some((user, None))
-                if !CONFIG.is_multi_tenant() && user.private_key.is_some() && !CONFIG.sso_signups_match_email() =>
-            {
+            Some((user, None)) if user.private_key.is_some() && !CONFIG.sso_signups_match_email() => {
                 error!(
                     "Login failure ({}), existing non SSO user ({}) with same email ({}) and association is disabled",
                     user_infos.identifier, user.uuid, user.email
@@ -329,10 +343,6 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                         event: EventType::UserFailedLogIn
                     }
                 );
-            }
-
-            if CONFIG.is_multi_tenant() && user_infos.export_only {
-                err_code!("Cannot provision new user during export-only grace window", 403);
             }
 
             match user_infos.email_verified {
@@ -636,6 +646,10 @@ async fn authenticated_response(
 }
 
 async fn api_key_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, ip: &ClientIp) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("API key authentication is disabled in hosted multi-tenant mode", 403)
+    }
+
     // Ratelimit the login
     crate::ratelimit::check_limit_login(&ip.ip)?;
 
@@ -682,11 +696,6 @@ async fn user_api_key_login(
                 event: EventType::UserFailedLogIn
             }
         )
-    }
-
-    if CONFIG.is_multi_tenant() {
-        let tid = crate::tenancy::require_user_tenant(&user)?;
-        crate::tenancy::check_tenant_active(tid, false, conn).await?;
     }
 
     // Check API key. Note that API key logins bypass 2FA.
@@ -800,16 +809,6 @@ async fn organization_api_key_login(data: ConnectData, conn: &DbConn, ip: &Clien
     let Some(org_api_key) = OrganizationApiKey::find_by_org_uuid(&org_id, conn).await else {
         err!("Invalid client_id", format!("IP: {}.", ip.ip))
     };
-
-    if CONFIG.is_multi_tenant() {
-        let Some(org) = Organization::find_by_uuid(&org_api_key.org_uuid, conn).await else {
-            err_code!("Organization not found", 403);
-        };
-        let Some(tid) = org.tenant_id.as_deref().filter(|s| !s.is_empty()) else {
-            err_code!("Organization has no tenant binding", 403);
-        };
-        crate::tenancy::check_tenant_active(tid, false, conn).await?;
-    }
 
     // Check API key.
     let client_secret = data.client_secret.as_ref().unwrap();
