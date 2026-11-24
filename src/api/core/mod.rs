@@ -8,6 +8,7 @@ mod folders;
 mod organizations;
 mod public;
 mod sends;
+mod tenancy;
 
 pub use accounts::purge_auth_requests;
 pub use ciphers::{CipherData, CipherSyncData, CipherSyncType, purge_trashed_ciphers};
@@ -47,6 +48,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut two_factor::routes());
     routes.append(&mut sends::routes());
     routes.append(&mut public::routes());
+    routes.append(&mut tenancy::routes());
     routes.append(&mut eq_domains_routes);
     routes.append(&mut hibp_routes);
     routes.append(&mut meta_routes);
