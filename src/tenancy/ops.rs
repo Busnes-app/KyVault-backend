@@ -995,7 +995,12 @@ pub fn cleanup_pending(
                 .or(tenant_pending_deletions::last_error.ne(UPLOAD_IN_FLIGHT_MARKER))
                 .or(tenant_pending_deletions::created_at.le(staging_cutoff)),
         )
-        .order((tenant_pending_deletions::created_at.asc(), tenant_pending_deletions::id.asc()))
+        // Fewest attempts first, so objects that keep failing cannot starve newer cleanup.
+        .order((
+            tenant_pending_deletions::attempts.asc(),
+            tenant_pending_deletions::created_at.asc(),
+            tenant_pending_deletions::id.asc(),
+        ))
         .limit(limit)
         .select((
             tenant_pending_deletions::id,
@@ -2245,6 +2250,35 @@ mod tests {
         let after = tenant(c, "t1");
         assert_eq!(after.storage_ceiling_bytes, 0);
         assert_eq!(after.storage_grant_expires_at, None);
+    }
+
+    #[test]
+    fn failing_cleanup_rotates_behind_newer_jobs() {
+        let c = &mut test_sqlite_conn();
+        active_tenant_in(c, "local", "us-east-1");
+        for (id, at) in [("pd-1", "2025-01-01"), ("pd-2", "2025-01-02"), ("pd-3", "2025-01-03")] {
+            exec(
+                c,
+                &format!(
+                    "INSERT INTO tenant_pending_deletions (id, tenant_id, storage_kind, object_key, attempts, created_at) \
+                     VALUES ('{id}', 'local', 'attachment', 'cells/us-east-1/tenants/local/attachments/c/{id}', 0, '{at} 00:00:00')"
+                ),
+            );
+        }
+        let ids = |c: &mut DbConnInner| -> Vec<String> {
+            cleanup_pending(c, Some(2), &cells(), NOW).unwrap().items.into_iter().map(|i| i.id).collect()
+        };
+        assert_eq!(ids(c), ["pd-1", "pd-2"]);
+        let fail = |id: &str| FailedItem {
+            id: id.to_owned(),
+            error: "object locked".to_owned(),
+        };
+        let req = CompleteRequest {
+            completed_ids: vec![],
+            failed: vec![fail("pd-1"), fail("pd-2")],
+        };
+        cleanup_complete(c, &req, &cells(), NOW).unwrap();
+        assert_eq!(ids(c), ["pd-3", "pd-1"]);
     }
 
     #[test]

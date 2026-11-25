@@ -26,16 +26,27 @@ use crate::{
 };
 
 /// Custom KyIdentity multi-tenant OIDC claims parsed from ID Tokens and UserInfo.
+/// Other providers may use these names with other types, so a mistyped claim never fails the
+/// login: it reads as absent, and `export_only` as restricted.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct KyAdditionalClaims {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub org_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_restricted")]
     pub export_only: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub role: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub roles: Option<Vec<String>>,
+}
+
+fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
+    Ok(serde_json::from_value(<serde_json::Value as serde::Deserialize>::deserialize(d)?).ok())
+}
+
+fn lenient_restricted<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    Ok((!v.is_null()).then(|| v.as_bool().unwrap_or(true)))
 }
 
 impl AdditionalClaims for KyAdditionalClaims {}
@@ -383,5 +394,31 @@ impl<'a, AD: AuthDisplay, P: AuthPrompt, RT: ResponseType> AuthorizationRequestE
             self = self.add_extra_param(key, value);
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KyAdditionalClaims;
+
+    fn parse(v: serde_json::Value) -> KyAdditionalClaims {
+        serde_json::from_value(v).expect("claims never fail to parse")
+    }
+
+    #[test]
+    fn foreign_claim_shapes_do_not_fail_login() {
+        let c = parse(serde_json::json!({"roles": "admin", "role": ["admin"], "org_id": 7, "export_only": "yes"}));
+        assert_eq!((c.roles, c.role, c.org_id), (None, None, None));
+        assert_eq!(c.export_only, Some(true), "a mistyped export_only restricts");
+    }
+
+    #[test]
+    fn ky_claims_still_parse() {
+        let c =
+            parse(serde_json::json!({"roles": ["staff_admin"], "role": "admin", "org_id": "t1", "export_only": false}));
+        assert_eq!(c.roles, Some(vec!["staff_admin".to_owned()]));
+        assert_eq!((c.role.as_deref(), c.org_id.as_deref(), c.export_only), (Some("admin"), Some("t1"), Some(false)));
+        assert_eq!(parse(serde_json::json!({})).export_only, None);
+        assert_eq!(parse(serde_json::json!({"export_only": null, "roles": null})).export_only, None);
     }
 }
