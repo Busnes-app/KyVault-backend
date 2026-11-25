@@ -50,7 +50,7 @@ pub fn routes() -> Vec<Route> {
 
 #[get("/emergency-access/trusted")]
 async fn get_contacts(headers: Headers, conn: DbConn) -> Json<Value> {
-    let emergency_access_list = if CONFIG.emergency_access_allowed() {
+    let emergency_access_list = if CONFIG.is_emergency_access_allowed() {
         EmergencyAccess::find_all_by_grantor_uuid(&headers.user.uuid, &conn).await
     } else {
         Vec::new()
@@ -71,7 +71,7 @@ async fn get_contacts(headers: Headers, conn: DbConn) -> Json<Value> {
 
 #[get("/emergency-access/granted")]
 async fn get_grantees(headers: Headers, conn: DbConn) -> Json<Value> {
-    let emergency_access_list = if CONFIG.emergency_access_allowed() {
+    let emergency_access_list = if CONFIG.is_emergency_access_allowed() {
         EmergencyAccess::find_all_by_grantee_uuid(&headers.user.uuid, &conn).await
     } else {
         Vec::new()
@@ -221,10 +221,6 @@ async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, co
     };
 
     let grantor_user = headers.user;
-
-    if CONFIG.is_multi_tenant() && !CONFIG.tenancy_allow_emergency_access() {
-        err_code!("Emergency access is disabled in multi-tenant mode", 403);
-    }
 
     // avoid setting yourself as emergency contact
     if email == grantor_user.email {
@@ -741,6 +737,8 @@ async fn password_emergency_access(
 
 #[get("/emergency-access/<emer_id>/policies")]
 async fn policies_emergency_access(emer_id: EmergencyAccessId, headers: Headers, conn: DbConn) -> JsonResult {
+    check_emergency_access_enabled()?;
+
     let requesting_user = headers.user;
     let Some(emergency_access) =
         EmergencyAccess::find_by_uuid_and_grantee_uuid(&emer_id, &requesting_user.uuid, &conn).await
@@ -778,7 +776,7 @@ fn is_valid_request(
 }
 
 fn check_emergency_access_enabled() -> EmptyResult {
-    if !CONFIG.emergency_access_allowed() {
+    if !CONFIG.is_emergency_access_allowed() {
         err!("Emergency access is not enabled.")
     }
     Ok(())
@@ -786,7 +784,7 @@ fn check_emergency_access_enabled() -> EmptyResult {
 
 pub async fn emergency_request_timeout_job(pool: DbPool) {
     debug!("Start emergency_request_timeout_job");
-    if !CONFIG.emergency_access_allowed() {
+    if !CONFIG.is_emergency_access_allowed() {
         return;
     }
 
@@ -860,7 +858,7 @@ pub async fn emergency_request_timeout_job(pool: DbPool) {
 
 pub async fn emergency_notification_reminder_job(pool: DbPool) {
     debug!("Start emergency_notification_reminder_job");
-    if !CONFIG.emergency_access_allowed() {
+    if !CONFIG.is_emergency_access_allowed() {
         return;
     }
 

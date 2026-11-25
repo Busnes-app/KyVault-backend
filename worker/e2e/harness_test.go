@@ -674,6 +674,7 @@ func replicaEnv(port string) []string {
 		"AWS_EC2_METADATA_DISABLED=true",
 		"ROCKET_ADDRESS=127.0.0.1", "ROCKET_PORT=" + port,
 		"WEB_VAULT_ENABLED=false", "LOG_LEVEL=info",
+		"JOB_POLL_INTERVAL_MS=200", "EMERGENCY_REQUEST_TIMEOUT_SCHEDULE=* * * * * *",
 	}
 }
 

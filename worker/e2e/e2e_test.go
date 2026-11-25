@@ -441,6 +441,19 @@ func TestLivePostgres(t *testing.T) {
 		if r := createAttachment(t, r1, tokA2, pcA2, size); r.code == 200 {
 			t.Fatal("upload beyond the ceiling was admitted")
 		}
+		// A create whose name fits the grant but whose payload does not leaves no cipher behind.
+		left := g.Ceiling - e.committed(t, orgA) - e.mustTenant(t, orgA).Reserved
+		big, _ := json.Marshal(map[string]any{"collectionIds": []string{}, "cipher": map[string]any{
+			"type": 1, "name": "2.refused|a|b", "encryptedFor": a2.uuid,
+			"login": map[string]any{"password": strings.Repeat("p", int(left)+1)},
+		}})
+		if r := call(t, "POST", r2+"/api/ciphers/create", bearer(tokA2), big); r.code == 200 ||
+			!strings.Contains(string(r.body), "quota exceeded") {
+			t.Fatalf("oversized create: %d %s", r.code, r.body)
+		}
+		if n := e.num(t, "SELECT count(*) FROM ciphers WHERE name = '2.refused|a|b'"); n != 0 {
+			t.Fatalf("refused create left %d cipher rows", n)
+		}
 		var att struct {
 			AttachmentID string `json:"attachmentId"`
 		}
@@ -624,6 +637,39 @@ func TestLivePostgres(t *testing.T) {
 		}
 		if r := e.webhook(t, "user.deleted", id, ev); r.code != 200 || !strings.Contains(string(r.body), "duplicate") {
 			t.Fatalf("webhook replay: %d %s", r.code, r.body)
+		}
+	})
+
+	t.Run("5b hosted emergency access off for existing grants", func(t *testing.T) {
+		// Grants that predate the policy: confirmed, past-due recovery, approved view.
+		grant := func(id string, status, days int) {
+			e.exec(t, `INSERT INTO emergency_access (uuid, grantor_uuid, grantee_uuid, email, key_encrypted, atype, status,
+				wait_time_days, recovery_initiated_at, updated_at, created_at)
+				VALUES ($1, $2, $3, NULL, 'k', 0, $4, $5, now() - interval '3 days', now(), now())`,
+				id, a1.uuid, a2.uuid, status, days)
+		}
+		const confirmed, initiated, approved = "ea000000-0000-4000-8000-000000000001",
+			"ea000000-0000-4000-8000-000000000002", "ea000000-0000-4000-8000-000000000003"
+		grant(confirmed, 2, 1)
+		grant(initiated, 3, 1)
+		grant(approved, 4, 1)
+		defer e.exec(t, "DELETE FROM emergency_access WHERE grantor_uuid = $1", a1.uuid)
+
+		tok := e.accessToken(t, a2)
+		for _, path := range []string{confirmed + "/initiate", approved + "/view", approved + "/policies"} {
+			method := "POST"
+			if strings.HasSuffix(path, "/policies") {
+				method = "GET"
+			}
+			r := call(t, method, r1+"/api/emergency-access/"+path, bearer(tok), nil)
+			if r.code == 200 || !strings.Contains(string(r.body), "Emergency access is not enabled") {
+				t.Fatalf("%s: %d %s", path, r.code, r.body)
+			}
+		}
+		// The timeout job runs every second here; it must not auto-approve the past-due request.
+		time.Sleep(3 * time.Second)
+		if s := e.num(t, "SELECT status FROM emergency_access WHERE uuid = $1", initiated); s != 3 {
+			t.Fatalf("timeout job changed a hosted grant to status %d", s)
 		}
 	})
 

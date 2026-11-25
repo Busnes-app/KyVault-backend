@@ -356,17 +356,12 @@ async fn post_ciphers_create(
         err_code!("Invalid user cipher", Status::UnprocessableEntity.code);
     }
 
-    // This check is usually only needed in update_cipher_from_data(), but we
-    // need it here as well to avoid creating an empty cipher in the call to
-    // cipher.save() below.
-    enforce_personal_ownership_policy(Some(&data.cipher), &headers, &conn).await?;
-
     crate::tenancy::check_cipher_quota(&headers.user, 1, &conn).await?;
 
+    // Nothing is written until the request validates, so a refused create leaves no row behind.
     let mut cipher = Cipher::new(data.cipher.r#type, data.cipher.name.clone());
     cipher.user_uuid = Some(headers.user.uuid.clone());
-    cipher.tenant_id = headers.user.tenant_id.clone();
-    cipher.save(&conn).await?;
+    cipher.tenant_id.clone_from(&headers.user.tenant_id);
 
     // When cloning a cipher, the Bitwarden clients seem to set this field
     // based on the cipher being cloned (when creating a new cipher, it's set
@@ -376,11 +371,7 @@ async fn post_ciphers_create(
     // or otherwise), we can just ignore this field entirely.
     data.cipher.last_known_revision_date = None;
 
-    let res = share_cipher_by_uuid(&cipher.uuid, data, &headers, &conn, &nt, None).await;
-    if res.is_err() {
-        cipher.delete(&conn).await?;
-    }
-    res
+    share_cipher(cipher, data, &headers, &conn, &nt, None).await
 }
 
 /// Called when creating a new user-owned cipher.
@@ -457,19 +448,9 @@ pub async fn update_cipher_from_data(
 
     enforce_personal_ownership_policy(Some(&data), headers, conn).await?;
 
-    // Check that the client isn't updating an existing cipher with stale data.
-    // And only perform this check when not importing ciphers, else the date/time check will fail.
-    if ut != UpdateType::None
-        && let Some(dt) = data.last_known_revision_date
-    {
-        match NaiveDateTime::parse_from_str(&dt, "%+") {
-            // ISO 8601 format
-            Err(err) => warn!("Error parsing LastKnownRevisionDate '{}': {err}", dt.escape_debug()),
-            Ok(dt) if cipher.updated_at.signed_duration_since(dt).num_seconds() > 1 => {
-                err!("The client copy of this cipher is out of date. Resync the client and try again.")
-            }
-            Ok(_) => (),
-        }
+    // Only when not importing ciphers, else the date/time check will fail.
+    if ut != UpdateType::None {
+        check_not_stale(cipher, &data)?;
     }
 
     if cipher.organization_uuid.is_some() && cipher.organization_uuid != data.organization_id {
@@ -591,29 +572,58 @@ pub async fn update_cipher_from_data(
         None => cipher.unarchive(&headers.user.uuid, conn).await?,
     }
 
-    if ut != UpdateType::None {
-        // Only log events for organizational ciphers
-        if let Some(org_id) = &cipher.organization_uuid {
-            let event_type = match (&ut, transfer_cipher) {
-                (UpdateType::SyncCipherCreate, true) => EventType::CipherCreated,
-                (UpdateType::SyncCipherUpdate, true) => EventType::CipherShared,
-                (_, _) => EventType::CipherUpdated,
-            };
+    notify_cipher_saved(cipher, ut, transfer_cipher, shared_to_collections, headers, conn, nt).await;
+    Ok(())
+}
 
-            log_event(event_type, &cipher.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
-                .await;
+/// Rejects an update made from a client copy older than the stored cipher.
+fn check_not_stale(cipher: &Cipher, data: &CipherData) -> EmptyResult {
+    let Some(dt) = &data.last_known_revision_date else {
+        return Ok(());
+    };
+    match NaiveDateTime::parse_from_str(dt, "%+") {
+        // ISO 8601 format
+        Err(err) => warn!("Error parsing LastKnownRevisionDate '{}': {err}", dt.escape_debug()),
+        Ok(dt) if cipher.updated_at.signed_duration_since(dt).num_seconds() > 1 => {
+            err!("The client copy of this cipher is out of date. Resync the client and try again.")
         }
-        nt.send_cipher_update(
-            ut,
-            cipher,
-            &cipher.update_users_revision(conn).await,
-            &headers.device,
-            shared_to_collections,
-            conn,
-        )
-        .await;
+        Ok(_) => (),
     }
     Ok(())
+}
+
+async fn notify_cipher_saved(
+    cipher: &Cipher,
+    ut: UpdateType,
+    transfer_cipher: bool,
+    shared_to_collections: Option<Vec<CollectionId>>,
+    headers: &Headers,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+) {
+    if ut == UpdateType::None {
+        return;
+    }
+    // Only log events for organizational ciphers
+    if let Some(org_id) = &cipher.organization_uuid {
+        let event_type = match (&ut, transfer_cipher) {
+            (UpdateType::SyncCipherCreate, true) => EventType::CipherCreated,
+            (UpdateType::SyncCipherUpdate, true) => EventType::CipherShared,
+            (_, _) => EventType::CipherUpdated,
+        };
+
+        log_event(event_type, &cipher.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
+            .await;
+    }
+    nt.send_cipher_update(
+        ut,
+        cipher,
+        &cipher.update_users_revision(conn).await,
+        &headers.device,
+        shared_to_collections,
+        conn,
+    )
+    .await;
 }
 
 #[derive(Deserialize)]
@@ -1154,7 +1164,7 @@ async fn share_cipher_by_uuid(
     nt: &Notify<'_>,
     override_ut: Option<UpdateType>,
 ) -> JsonResult {
-    let mut cipher = if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await {
+    let cipher = if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await {
         if cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await {
             cipher
         } else {
@@ -1171,16 +1181,20 @@ async fn share_cipher_by_uuid(
             "share_cipher_by_uuid",
         )?;
     }
+    share_cipher(cipher, data, headers, conn, nt, override_ut).await
+}
 
-    // `update_cipher_from_data()` rejects this too, but only after the collections below were
-    // already linked. There are no transactions, so that would leave the cipher linked to a
-    // collection of another organization.
-    if cipher.organization_uuid.is_some() && cipher.organization_uuid != data.cipher.organization_id {
-        err!("Organization mismatch. Please resync the client before updating the cipher")
-    }
-
+/// Validates the target collections, saves the cipher, then links it. There are no transactions,
+/// so nothing is written before every check has passed.
+async fn share_cipher(
+    mut cipher: Cipher,
+    data: ShareCipherData,
+    headers: &Headers,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+    override_ut: Option<UpdateType>,
+) -> JsonResult {
     let mut shared_to_collections = vec![];
-    let mut newly_linked_collections = vec![];
 
     if let Some(organization_id) = &data.cipher.organization_id {
         if CONFIG.is_multi_tenant() {
@@ -1193,22 +1207,13 @@ async fn share_cipher_by_uuid(
                 "share_cipher_by_uuid_org",
             )?;
         }
-        let existing_collections: HashSet<CollectionId> =
-            HashSet::from_iter(cipher.get_collections(headers.user.uuid.clone(), conn).await);
         for col_id in &data.collection_ids {
             match Collection::find_by_uuid_and_org(col_id, organization_id, conn).await {
                 None => err!("Invalid collection ID provided"),
-                Some(collection) => {
-                    if collection.is_writable_by_user(&headers.user.uuid, conn).await {
-                        CollectionCipher::save(&cipher.uuid, &collection.uuid, conn).await?;
-                        if !existing_collections.contains(&collection.uuid) {
-                            newly_linked_collections.push(collection.uuid.clone());
-                        }
-                        shared_to_collections.push(collection.uuid);
-                    } else {
-                        err!("No rights to modify the collection")
-                    }
+                Some(collection) if collection.is_writable_by_user(&headers.user.uuid, conn).await => {
+                    shared_to_collections.push(collection.uuid);
                 }
+                Some(_) => err!("No rights to modify the collection"),
             }
         }
     }
@@ -1223,14 +1228,25 @@ async fn share_cipher_by_uuid(
         UpdateType::SyncCipherCreate
     };
 
-    if let Err(e) =
-        update_cipher_from_data(&mut cipher, data.cipher, headers, Some(shared_to_collections), conn, nt, ut).await
-    {
-        for col_id in &newly_linked_collections {
-            CollectionCipher::delete(&cipher.uuid, col_id, conn).await.ok();
-        }
-        return Err(e);
+    if ut != UpdateType::None {
+        check_not_stale(&cipher, &data.cipher)?;
     }
+    // Saved with UpdateType::None so the notification goes out once the collections are linked.
+    let transfer_cipher = cipher.organization_uuid.is_none() && data.cipher.organization_id.is_some();
+    update_cipher_from_data(
+        &mut cipher,
+        data.cipher,
+        headers,
+        Some(shared_to_collections.clone()),
+        conn,
+        nt,
+        UpdateType::None,
+    )
+    .await?;
+    for col_id in &shared_to_collections {
+        CollectionCipher::save(&cipher.uuid, col_id, conn).await?;
+    }
+    notify_cipher_saved(&cipher, ut, transfer_cipher, Some(shared_to_collections), headers, conn, nt).await;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))
 }
@@ -1503,7 +1519,7 @@ async fn save_attachment(
         lease.map_or((None, 0, None), |l| (Some(l.access_epoch), l.reserved_bytes, Some(l.pending_cleanup_id)));
 
     if let Err(e) = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await {
-        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), None, &headers.user, &conn).await;
+        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), attachment.as_ref(), &headers.user, &conn).await;
         return Err(e);
     }
 

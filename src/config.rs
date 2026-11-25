@@ -1791,6 +1791,11 @@ impl Config {
         !self.is_multi_tenant() && self.sends_allowed()
     }
 
+    /// Effective emergency-access policy: hosted mode also needs `TENANCY_ALLOW_EMERGENCY_ACCESS`.
+    pub fn is_emergency_access_allowed(&self) -> bool {
+        self.emergency_access_allowed() && (!self.is_multi_tenant() || self.tenancy_allow_emergency_access())
+    }
+
     /// Tests whether the admin token is set to a non-empty value.
     pub fn is_admin_token_set(&self) -> bool {
         if self.is_multi_tenant() {

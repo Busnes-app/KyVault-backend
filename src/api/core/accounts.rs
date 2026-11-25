@@ -302,7 +302,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
         }
         // Emergency access registration
         (None, Some(accept_emergency_access_id), Some(accept_emergency_access_invite_token), None, None) => {
-            if !CONFIG.emergency_access_allowed() {
+            if !CONFIG.is_emergency_access_allowed() {
                 err!("Emergency access is not enabled.")
             }
 
@@ -370,7 +370,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
                 Membership::accept_user_invitations(&user.uuid, &conn).await?;
                 user
             } else if CONFIG.is_signup_allowed(&email)
-                || (CONFIG.emergency_access_allowed()
+                || (CONFIG.is_emergency_access_allowed()
                     && EmergencyAccess::find_invited_by_grantee_email(&email, &conn).await.is_some())
             {
                 user
@@ -433,7 +433,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     user.save(&conn).await?;
 
     // accept any open emergency access invitations
-    if !CONFIG.mail_enabled() && CONFIG.emergency_access_allowed() {
+    if !CONFIG.mail_enabled() && CONFIG.is_emergency_access_allowed() {
         for mut emergency_invite in EmergencyAccess::find_all_invited_by_grantee_email(&user.email, &conn).await {
             emergency_invite.accept_invite(&user.uuid, &user.email, &conn).await.ok();
         }
