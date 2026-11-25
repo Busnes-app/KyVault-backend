@@ -771,6 +771,8 @@ impl Tenant {
             created_at: naive_ts(now_ts),
         };
         conn.transaction::<(), crate::Error, _>(|conn| {
+            // Takes the tenant row lock first, and flags the usage drop for reporting.
+            mark_storage_dirty(conn, tid).map_res("Error marking tenant storage")?;
             diesel::insert_into(tenant_pending_deletions::table)
                 .values(&row)
                 .execute(conn)

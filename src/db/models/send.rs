@@ -329,8 +329,16 @@ impl Send {
             operator.delete_with(&dir_path).recursive(true).await.ok();
         }
 
+        // Hosted: flag the usage drop so even a suspended tenant reports it.
+        let tid = self.tenant_id.as_deref().filter(|_| CONFIG.is_multi_tenant());
         conn.run(move |conn| {
-            diesel::delete(sends::table.filter(sends::uuid.eq(&self.uuid))).execute(conn).map_res("Error deleting send")
+            conn.transaction(|conn| {
+                if let Some(tid) = tid {
+                    super::mark_storage_dirty(conn, tid)?;
+                }
+                diesel::delete(sends::table.filter(sends::uuid.eq(&self.uuid))).execute(conn).map(drop)
+            })
+            .map_res("Error deleting send")
         })
         .await
     }

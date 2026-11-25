@@ -495,9 +495,11 @@ func TestLivePostgres(t *testing.T) {
 			t.Fatal("fenced upload reached S3")
 		}
 		e.kyid.setOrg(orgA, "active", true, cellA)
+		// The fence's release report (want 0) can be answered after reactivation; wait for real headroom.
 		eventually(t, 15*time.Second, "tenant A grant after reactivation", func() error {
 			r := e.mustTenant(t, orgA)
-			if r.Status != "active" || r.Expires == nil || *r.Expires < time.Now().Unix() {
+			if r.Status != "active" || r.Expires == nil || *r.Expires < time.Now().Unix() ||
+				r.Ceiling-e.committed(t, orgA)-r.Reserved < 600_000 {
 				return fmt.Errorf("%+v", r)
 			}
 			return nil

@@ -3610,8 +3610,10 @@ mod tests {
         v2_setup(c, &["att"], 0);
         let key = v2_att("att").get_file_path_in_cell(Some(&tenant(c, "t1").home_region)).unwrap();
 
+        exec(c, "UPDATE tenants SET storage_dirty = FALSE WHERE id = 't1'");
         Tenant::delete_attachment_queuing_cleanup_inner(c, "t1", &v2_att("att"), &key, NOW).unwrap();
         assert_eq!(attachments::table.find("att").count().get_result::<i64>(c).unwrap(), 0);
+        assert!(tenant(c, "t1").storage_dirty, "a suspended tenant must still report the drop");
         let pending = cleanup_pending(c, None, &cells(), NOW).unwrap().items;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].object_key, key);

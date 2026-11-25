@@ -520,10 +520,16 @@ impl Cipher {
         Attachment::delete_all_by_cipher(&self.uuid, conn).await?;
         Favorite::delete_all_by_cipher(&self.uuid, conn).await?;
 
+        // Hosted: flag the usage drop so even a suspended tenant reports it.
+        let tid = self.tenant_id.as_deref().filter(|_| CONFIG.is_multi_tenant());
         conn.run(move |conn| {
-            diesel::delete(ciphers::table.filter(ciphers::uuid.eq(&self.uuid)))
-                .execute(conn)
-                .map_res("Error deleting cipher")
+            conn.transaction(|conn| {
+                if let Some(tid) = tid {
+                    super::mark_storage_dirty(conn, tid)?;
+                }
+                diesel::delete(ciphers::table.filter(ciphers::uuid.eq(&self.uuid))).execute(conn).map(drop)
+            })
+            .map_res("Error deleting cipher")
         })
         .await
     }

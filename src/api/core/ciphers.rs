@@ -371,7 +371,16 @@ async fn post_ciphers_create(
     // or otherwise), we can just ignore this field entirely.
     data.cipher.last_known_revision_date = None;
 
-    share_cipher(cipher, data, &headers, &conn, &nt, None).await
+    let cipher_id = cipher.uuid.clone();
+    let res = share_cipher(cipher, data, &headers, &conn, &nt, None).await;
+    // A failure after the save (e.g. a collection deleted meanwhile) must not leave the new cipher behind.
+    if res.is_err()
+        && let Some(saved) = Cipher::find_by_uuid(&cipher_id, &conn).await
+        && let Err(e) = saved.delete(&conn).await
+    {
+        error!("Failed to remove cipher {cipher_id} after a failed create: {e:?}");
+    }
+    res
 }
 
 /// Called when creating a new user-owned cipher.
