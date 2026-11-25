@@ -33,6 +33,9 @@ pub struct Attachment {
     pub tenant_id: Option<String>,
 }
 
+/// Upper bound on an encrypted attachment file name or key in hosted mode.
+pub const MAX_METADATA_LEN: usize = 4096;
+
 /// Local methods
 impl Attachment {
     pub const fn new(
@@ -55,6 +58,20 @@ impl Attachment {
     pub fn with_tenant_id(mut self, tenant_id: Option<String>) -> Self {
         self.tenant_id = tenant_id;
         self
+    }
+
+    /// Bytes of the encrypted file name and key, which hosted storage grants count.
+    pub fn metadata_bytes(&self) -> i64 {
+        let len = self.file_name.len().saturating_add(self.akey.as_ref().map_or(0, String::len));
+        i64::try_from(len).unwrap_or(i64::MAX)
+    }
+
+    /// Hosted mode bounds the encrypted file name and key.
+    pub fn check_metadata_limits(&self) -> EmptyResult {
+        if self.file_name.len() > MAX_METADATA_LEN || self.akey.as_ref().is_some_and(|k| k.len() > MAX_METADATA_LEN) {
+            err_code!("Attachment file name or key is too long", 400);
+        }
+        Ok(())
     }
 
     /// Computes the attachment's object key relative to the attachments root.
@@ -157,6 +174,14 @@ impl Attachment {
     pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
         let file_path = self.resolve_file_path(conn).await?;
 
+        // Hosted: queue the object for the cleanup worker in the same transaction that drops the
+        // row, so a crash or storage error can never orphan it.
+        if CONFIG.is_multi_tenant()
+            && let Some(ref tid) = self.tenant_id
+        {
+            return super::Tenant::delete_attachment_queuing_cleanup(tid, self, &file_path, conn).await;
+        }
+
         conn.run(move |conn| {
             crate::util::retry(
                 || diesel::delete(attachments::table.filter(attachments::id.eq(&self.id))).execute(conn),
@@ -173,13 +198,6 @@ impl Attachment {
             if e.kind() == opendal::ErrorKind::NotFound {
                 debug!("File '{file_path}' already deleted.");
             } else {
-                if CONFIG.is_multi_tenant()
-                    && let Some(ref tid) = self.tenant_id
-                    && let Err(queue_err) =
-                        super::Tenant::stage_attachment_cleanup(tid, None, &file_path, false, 0, conn).await
-                {
-                    error!("Failed to queue durable cleanup for deleted attachment {file_path}: {queue_err}");
-                }
                 return Err(e.into());
             }
         }

@@ -169,65 +169,49 @@ pub async fn require_user_tenant_active(user: &User, conn: &DbConn) -> Result<Te
     check_tenant_active(tid, conn).await
 }
 
-/// Transactionally checks tenant active status, authority freshness, and reserved storage growth
-/// grant, reserving `additional_bytes` into `tenants.storage_reserved_bytes`.
-///
-/// Returns `Ok(Some(access_epoch))` in multi-tenant mode so callers can fence late upload
-/// finalization and release reserved bytes on completion or error.
-pub async fn reserve_storage_grant(
+/// Begins a hosted legacy upload: reserves the payload and metadata bytes and stages the
+/// in-flight cleanup row in one transaction. Returns `Ok(None)` in single-tenant mode.
+pub async fn begin_legacy_attachment_upload(
     user: &User,
-    additional_bytes: i64,
+    att: &Attachment,
     conn: &DbConn,
-) -> Result<Option<i64>, crate::Error> {
+) -> Result<Option<crate::db::models::V2UploadLease>, crate::Error> {
     if !CONFIG.is_multi_tenant() {
         return Ok(None);
     }
-    let tenant_id = require_user_tenant(user)?;
-    let served_cells = CONFIG.served_cells();
-    let epoch = Tenant::reserve_storage_grant(
-        tenant_id,
-        additional_bytes,
-        CONFIG.tenancy_authority_max_age_secs(),
-        &served_cells,
-        conn,
-    )
-    .await?;
-    Ok(Some(epoch))
-}
-
-/// Records a durable pending cleanup row for an attachment upload in multi-tenant mode.
-/// When `in_flight` is true, the row is hidden from the cleanup worker until either upload
-/// finalization fails (`activate_pending_deletion`) or the staging grace expires after a crash.
-pub async fn stage_attachment_cleanup(
-    user: &User,
-    object_key: &str,
-    in_flight: bool,
-    reserved_bytes: i64,
-    conn: &DbConn,
-) -> Result<Option<String>, crate::Error> {
-    if !CONFIG.is_multi_tenant() {
-        return Ok(None);
-    }
-    let tenant_id = require_user_tenant(user)?;
-    let id = Tenant::stage_attachment_cleanup(
-        tenant_id,
+    let lease = Tenant::begin_legacy_attachment_upload(
+        require_user_tenant(user)?,
         Some(user.uuid.clone()),
-        object_key,
-        in_flight,
-        reserved_bytes,
+        att,
+        CONFIG.tenancy_authority_max_age_secs(),
+        &CONFIG.served_cells(),
         conn,
     )
     .await?;
-    Ok(Some(id))
+    Ok(Some(lease))
 }
 
-/// Returns a staged upload's reserved bytes and makes its cleanup row visible to the worker now.
-pub async fn activate_pending_deletion(pending_id: Option<&str>, conn: &DbConn) {
+/// Creates an attachment row or updates its file name and key; in multi-tenant mode the growth,
+/// metadata included, is checked against the storage grant in the same transaction.
+pub async fn put_attachment(user: &User, att: &Attachment, conn: &DbConn) -> EmptyResult {
     if !CONFIG.is_multi_tenant() {
-        return;
+        return att.save(conn).await;
     }
-    if let Some(pid) = pending_id {
-        Tenant::activate_pending_deletion(pid, conn).await;
+    Tenant::put_attachment_enforcing_grant(
+        require_user_tenant(user)?,
+        att,
+        CONFIG.tenancy_authority_max_age_secs(),
+        &CONFIG.served_cells(),
+        conn,
+    )
+    .await
+}
+
+/// Abandons a failed hosted upload if it still owns its cleanup row; the cleanup worker deletes
+/// the object. A no-op once the worker has taken the upload over.
+pub async fn abandon_upload(user: &User, pending_id: &str, v2_att: Option<&Attachment>, conn: &DbConn) {
+    if let Ok(tid) = require_user_tenant(user) {
+        Tenant::abandon_upload(tid, pending_id, v2_att, conn).await;
     }
 }
 
@@ -302,16 +286,6 @@ pub async fn finalize_v2_attachment_upload(
         conn,
     )
     .await
-}
-
-/// Releases previously reserved upload bytes in multi-tenant mode.
-pub async fn release_storage_reservation(user: &User, bytes: i64, conn: &DbConn) {
-    if !CONFIG.is_multi_tenant() || bytes <= 0 {
-        return;
-    }
-    if let Ok(tenant_id) = require_user_tenant(user) {
-        Tenant::release_storage_reservation(tenant_id, bytes, conn).await;
-    }
 }
 
 /// Enforces tenant-level active cipher quota in multi-tenant mode.

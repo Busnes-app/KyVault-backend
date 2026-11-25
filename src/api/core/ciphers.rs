@@ -578,7 +578,7 @@ pub async fn update_cipher_from_data(
             saved_att.akey = Some(attachment.key);
             saved_att.file_name = attachment.file_name;
 
-            saved_att.save(conn).await?;
+            crate::tenancy::put_attachment(&headers.user, &saved_att, conn).await?;
         }
     }
 
@@ -1360,19 +1360,11 @@ async fn post_attachment_v2(
         err!("Attachment storage limit exceeded with this file");
     }
 
-    let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, file_size, &conn).await?;
-
     let attachment_id = crypto::generate_attachment_id();
     let attachment =
         Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key))
             .with_tenant_id(headers.user.tenant_id.clone());
-    if let Err(e) =
-        crate::tenancy::save_attachment_releasing(&headers.user, &attachment, file_size, upload_epoch, None, &conn)
-            .await
-    {
-        crate::tenancy::release_storage_reservation(&headers.user, file_size, &conn).await;
-        return Err(e);
-    }
+    crate::tenancy::put_attachment(&headers.user, &attachment, &conn).await?;
     notify_attachment_created(&cipher, &headers, &conn, &nt).await;
 
     let url = format!("/ciphers/{}/attachment/{attachment_id}", cipher.uuid);
@@ -1504,35 +1496,16 @@ async fn save_attachment(
     // For hosted v2 uploads this runs in a single transaction under the tenant lock so concurrent
     // uploads for the same attachment are serialized across replicas and storage admission is
     // computed from the locked current attachment row.
+    let lease = match (&created_attachment, &attachment) {
+        (Some(att), _) => crate::tenancy::begin_legacy_attachment_upload(&headers.user, att, &conn).await?,
+        (None, Some(att)) => crate::tenancy::begin_v2_attachment_upload(&headers.user, att, size, &conn).await?,
+        (None, None) => unreachable!("either created_attachment or attachment is always Some"),
+    };
     let (upload_epoch, held, pending_cleanup_id) =
-        if let (None, Some(att)) = (&created_attachment, &attachment) {
-            if let Some(lease) = crate::tenancy::begin_v2_attachment_upload(&headers.user, att, size, &conn).await? {
-                (Some(lease.access_epoch), lease.reserved_bytes, Some(lease.pending_cleanup_id))
-            } else {
-                (None, 0, None)
-            }
-        } else {
-            let delta_bytes = size.saturating_sub(size_adjust).max(0);
-            let upload_epoch = crate::tenancy::reserve_storage_grant(&headers.user, delta_bytes, &conn).await?;
-            let pending_cleanup_id =
-                match crate::tenancy::stage_attachment_cleanup(&headers.user, &storage_path, true, delta_bytes, &conn)
-                    .await
-                {
-                    Ok(id) => id,
-                    Err(e) => {
-                        crate::tenancy::release_storage_reservation(&headers.user, delta_bytes, &conn).await;
-                        return Err(e);
-                    }
-                };
-            (upload_epoch, delta_bytes, pending_cleanup_id)
-        };
+        lease.map_or((None, 0, None), |l| (Some(l.access_epoch), l.reserved_bytes, Some(l.pending_cleanup_id)));
 
     if let Err(e) = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await {
-        if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
-            operator.delete(&storage_path).await.ok();
-        }
-        // Returns the row's reserved bytes and hands the object to the cleanup worker.
-        crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
+        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), None, &headers.user, &conn).await;
         return Err(e);
     }
 
@@ -1564,13 +1537,7 @@ async fn save_attachment(
     };
 
     if let Err(e) = finalize_res {
-        if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
-            operator.delete(&storage_path).await.ok();
-        }
-        crate::tenancy::activate_pending_deletion(pending_cleanup_id.as_deref(), &conn).await;
-        if let Some(ref att) = attachment {
-            att.delete(&conn).await.ok();
-        }
+        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), attachment.as_ref(), &headers.user, &conn).await;
         return Err(e);
     }
 
@@ -1580,6 +1547,27 @@ async fn save_attachment(
     }
 
     Ok((cipher, conn))
+}
+
+/// Undoes a failed upload. Hosted uploads hand the object to the cleanup worker, and only while
+/// they still own their cleanup row: past that, a retry may own the same key and attachment row.
+async fn abandon_upload(
+    storage_path: &str,
+    pending_cleanup_id: Option<&str>,
+    v2_attachment: Option<&Attachment>,
+    user: &User,
+    conn: &DbConn,
+) {
+    if let Some(pid) = pending_cleanup_id {
+        crate::tenancy::abandon_upload(user, pid, v2_attachment, conn).await;
+        return;
+    }
+    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
+        operator.delete(storage_path).await.ok();
+    }
+    if let Some(att) = v2_attachment {
+        att.delete(conn).await.ok();
+    }
 }
 
 /// Sends the cipher update to the clients and logs the attachment event

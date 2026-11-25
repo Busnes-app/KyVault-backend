@@ -20,6 +20,8 @@ mod two_factor_incomplete;
 mod user;
 
 pub use self::archive::Archive;
+#[cfg(all(test, sqlite))]
+pub use self::attachment::MAX_METADATA_LEN;
 pub use self::attachment::{Attachment, AttachmentId};
 pub use self::auth_request::{AuthRequest, AuthRequestId};
 pub use self::cipher::{Cipher, CipherId, RepromptType};

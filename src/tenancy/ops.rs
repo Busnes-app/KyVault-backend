@@ -1955,7 +1955,7 @@ mod tests {
         active_tenant(c, "t1");
         user(c, "u1", "t1", "sub1");
         cipher(c, "pc", Some("u1"), None, "t1"); // 10 bytes of data
-        attachment(c, "pa", "pc", "t1"); // 100 bytes
+        attachment(c, "pa", "pc", "t1"); // 100 bytes plus a 1-byte name
         diesel::update(tenants::table.find("t1")).set(tenants::storage_reserved_bytes.eq(5)).execute(c).unwrap();
         let prep = |c: &mut DbConnInner| {
             storage_prepare(
@@ -1982,7 +1982,7 @@ mod tests {
                         ceiling_bytes: 5000,
                         ttl_seconds: 3600,
                         pool_bytes: 9000,
-                        org_used_bytes: 116,
+                        org_used_bytes: 117,
                         over_since: None,
                     }],
                 },
@@ -1993,7 +1993,7 @@ mod tests {
         };
         let first = StorageReport {
             org_id: "t1".to_owned(),
-            used_bytes: 116,
+            used_bytes: 117,
             seq: 1,
             want_bytes: 1000,
         };
@@ -2002,7 +2002,7 @@ mod tests {
         // Unapplied report replays the exact seq and bytes even after usage changed.
         attachment(c, "pb", "pc", "t1");
         assert_eq!(prep(c)[0].seq, 1);
-        assert_eq!(prep(c)[0].used_bytes, 116);
+        assert_eq!(prep(c)[0].used_bytes, 117);
 
         // Future-dated sent_at is clamped to now; TTL capped at 900 s.
         assert_eq!(apply(c, "ok", 1, NOW + 10_000).applied, 1);
@@ -2011,7 +2011,7 @@ mod tests {
         assert_eq!((t.storage_ceiling_bytes, t.storage_last_applied_seq, t.storage_pending_seq), (5000, 1, None));
 
         let next = prep(c);
-        assert_eq!((next[0].seq, next[0].used_bytes), (2, 216));
+        assert_eq!((next[0].seq, next[0].used_bytes), (2, 218));
         // Out-of-order and never-issued sequences are ignored.
         assert_eq!(apply(c, "ok", 1, NOW).applied, 0);
         assert_eq!(apply(c, "ok", 99, NOW).applied, 0);
@@ -3051,5 +3051,189 @@ mod tests {
         let retry = begin(c, "att", 1_100).unwrap();
         fin(c, &retry, NOW).unwrap();
         assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 1_100);
+    }
+
+    fn put(c: &mut DbConnInner, att: &Attachment) -> Result<(), Error> {
+        Tenant::put_attachment_enforcing_grant_inner(c, "t1", att, 900, &cells(), NOW)
+    }
+
+    fn expire_grant(c: &mut DbConnInner) {
+        diesel::update(tenants::table.find("t1"))
+            .set(tenants::storage_grant_expires_at.eq(Some(NOW - 1)))
+            .execute(c)
+            .unwrap();
+    }
+
+    fn stored_name(c: &mut DbConnInner, aid: &str) -> String {
+        attachments::table.find(aid).select(attachments::file_name).first(c).unwrap()
+    }
+
+    #[test]
+    fn attachment_metadata_counts_toward_the_storage_grant() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["att"], 50);
+        // Fixture row: 100 payload bytes plus the 1-byte name "f".
+        let before = committed_bytes(c, "t1").unwrap();
+
+        // Creating: payload plus name plus key must fit the headroom.
+        let mut new = v2_att("new");
+        new.file_size = 0;
+        new.file_name = "n".repeat(40);
+        new.akey = Some("k".repeat(11));
+        assert!(put(c, &new).is_err(), "51 metadata bytes exceed 50 bytes of headroom");
+        new.akey = Some("k".repeat(10));
+        put(c, &new).unwrap();
+        assert_eq!(committed_bytes(c, "t1").unwrap(), before + 50);
+
+        // Renaming with an expired grant: growth is refused and the stored record is untouched.
+        expire_grant(c);
+        let mut renamed = v2_att("att");
+        renamed.file_name = "longer-name".to_owned();
+        assert!(put(c, &renamed).is_err());
+        assert_eq!(stored_name(c, "att"), "f");
+        assert_eq!(committed_bytes(c, "t1").unwrap(), before + 50);
+
+        // A rename that does not grow still works, and never rewrites the payload size.
+        renamed.file_name = "g".to_owned();
+        renamed.file_size = 999_999;
+        put(c, &renamed).unwrap();
+        assert_eq!(stored_name(c, "att"), "g");
+        assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 100);
+
+        // Oversized metadata is refused before any grant check.
+        diesel::update(tenants::table.find("t1"))
+            .set((
+                tenants::storage_ceiling_bytes.eq(i64::MAX / 2),
+                tenants::storage_grant_expires_at.eq(Some(NOW + 600)),
+            ))
+            .execute(c)
+            .unwrap();
+        let mut huge = v2_att("huge");
+        huge.file_name = "n".repeat(crate::db::models::MAX_METADATA_LEN + 1);
+        assert!(put(c, &huge).is_err());
+        huge.file_name = "n".to_owned();
+        huge.akey = Some("k".repeat(crate::db::models::MAX_METADATA_LEN + 1));
+        assert!(put(c, &huge).is_err());
+        assert_eq!(attachments::table.find("huge").count().get_result::<i64>(c).unwrap(), 0);
+
+        // An attachment of another cipher cannot be rewritten through this path.
+        let mut moved = v2_att("att");
+        moved.cipher_uuid = CipherId::from("c2".to_owned());
+        assert!(put(c, &moved).is_err());
+    }
+
+    #[test]
+    fn legacy_upload_reserves_and_stages_in_one_transaction() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &[], 1_000);
+        let begin_legacy = |c: &mut DbConnInner, att: &Attachment| {
+            Tenant::begin_legacy_attachment_upload_inner(
+                c,
+                "t1",
+                Some(UserId::from("u1".to_owned())),
+                att,
+                900,
+                &cells(),
+                NOW,
+            )
+        };
+        let staged = |c: &mut DbConnInner| tenant_pending_deletions::table.count().get_result::<i64>(c).unwrap();
+
+        // Refused admission leaves neither a reservation nor a cleanup row.
+        let mut att = v2_att("legacy");
+        att.file_size = 1_000;
+        assert!(begin_legacy(c, &att).is_err(), "1,000 payload bytes plus the 1-byte name exceed the headroom");
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
+        assert_eq!(staged(c), 0);
+
+        // Admission reserves payload plus metadata, and the staged row carries exactly that.
+        att.file_size = 900;
+        att.akey = Some("k".repeat(9));
+        let lease = begin_legacy(c, &att).unwrap();
+        assert_eq!(lease.reserved_bytes, 910);
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 910);
+        let row_bytes: i64 = tenant_pending_deletions::table
+            .find(&lease.pending_cleanup_id)
+            .select(tenant_pending_deletions::reserved_bytes)
+            .first(c)
+            .unwrap();
+        assert_eq!(row_bytes, 910);
+
+        // A crash here is reclaimed through that row.
+        let reclaim = cleanup_pending(c, None, &cells(), NOW + UPLOAD_STAGING_GRACE_SECS + 1).unwrap();
+        assert_eq!(reclaim.items.len(), 1);
+        let done = CompleteRequest {
+            completed_ids: vec![lease.pending_cleanup_id],
+            failed: vec![],
+        };
+        cleanup_complete(c, &done, &cells(), NOW).unwrap();
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn late_failing_upload_leaves_a_retry_alone() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["att"], 5_000);
+        let late = NOW + UPLOAD_STAGING_GRACE_SECS + 1;
+
+        // The slow upload outlives its grace; the worker deletes its object and reports done.
+        let slow = begin(c, "att", 1_100).unwrap();
+        let done = CompleteRequest {
+            completed_ids: vec![cleanup_pending(c, None, &cells(), late).unwrap().items[0].id.clone()],
+            failed: vec![],
+        };
+        cleanup_complete(c, &done, &cells(), late).unwrap();
+
+        // A retry uploads and commits to the same key and row.
+        let retry = begin(c, "att", 1_100).unwrap();
+        Tenant::finalize_v2_attachment_upload_inner(
+            c,
+            "t1",
+            &v2_att("att"),
+            1_100,
+            retry.reserved_bytes,
+            Some(retry.access_epoch),
+            Some(&retry.pending_cleanup_id),
+            NOW,
+        )
+        .unwrap();
+
+        // The slow upload now fails: it no longer owns anything and must not touch the retry.
+        assert!(!Tenant::abandon_upload_inner(c, "t1", &slow.pending_cleanup_id, Some(&v2_att("att"))).unwrap());
+        assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 1_100);
+        assert!(cleanup_pending(c, None, &cells(), late).unwrap().items.is_empty());
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
+    }
+
+    #[test]
+    fn failing_upload_that_still_owns_its_row_hands_the_object_to_cleanup() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["att"], 5_000);
+
+        let lease = begin(c, "att", 1_100).unwrap();
+        assert!(Tenant::abandon_upload_inner(c, "t1", &lease.pending_cleanup_id, Some(&v2_att("att"))).unwrap());
+        assert_eq!(attachments::table.find("att").count().get_result::<i64>(c).unwrap(), 0);
+        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
+        // Visible to the worker at once, not after the grace.
+        assert_eq!(cleanup_pending(c, None, &cells(), NOW).unwrap().items.len(), 1);
+        // A second abandon is a no-op.
+        assert!(!Tenant::abandon_upload_inner(c, "t1", &lease.pending_cleanup_id, None).unwrap());
+    }
+
+    #[test]
+    fn deleting_an_attachment_queues_its_object_with_the_row_delete() {
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["att"], 0);
+        let key = v2_att("att").get_file_path_in_cell(Some(&tenant(c, "t1").home_region)).unwrap();
+
+        Tenant::delete_attachment_queuing_cleanup_inner(c, "t1", &v2_att("att"), &key, NOW).unwrap();
+        assert_eq!(attachments::table.find("att").count().get_result::<i64>(c).unwrap(), 0);
+        let pending = cleanup_pending(c, None, &cells(), NOW).unwrap().items;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].object_key, key);
+
+        // While the delete is queued, no upload may reuse the key.
+        attachment(c, "att", "c1", "t1");
+        assert!(begin(c, "att", 100).is_err());
     }
 }
