@@ -135,11 +135,15 @@ async fn get_tenancy_status(headers: Headers, conn: DbConn) -> JsonResult {
             .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
             .map(|d| d.to_rfc3339()),
         "cipherCount": cipher_count,
-        "maxCiphersPerTenant": CONFIG.tenancy_max_ciphers_per_tenant(),
+        // The limit creation and restore enforce: the tenant's override, else the deployment default.
+        "maxCiphersPerTenant": tenant
+            .as_ref()
+            .and_then(Tenant::max_ciphers_quota)
+            .unwrap_or_else(|| CONFIG.tenancy_max_ciphers_per_tenant()),
         "maxImportCiphers": CONFIG.tenancy_max_import_ciphers(),
         "maxImportFolders": CONFIG.tenancy_max_import_folders(),
         "allowSends": CONFIG.is_sends_allowed(),
-        "allowEmergencyAccess": CONFIG.tenancy_allow_emergency_access(),
+        "allowEmergencyAccess": CONFIG.is_emergency_access_allowed(),
         "recovery": {
             "hasPersonalRecoveryKit": has_personal_kit,
         }
