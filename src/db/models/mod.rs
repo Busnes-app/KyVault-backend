@@ -43,7 +43,7 @@ pub use self::send::{Send, SendFileId, SendId, SendType};
 pub use self::sso_auth::{OIDCAuthenticatedUser, OIDCCodeResponseError, SsoAuth};
 pub use self::tenant::{
     TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion, TenantRecoveryBundle, V2UploadLease,
-    committed_bytes, lock_tenant, release_pending_reservations,
+    committed_bytes, lock_subject, lock_tenant, release_pending_reservations,
 };
 pub use self::two_factor::{TwoFactor, TwoFactorType};
 pub use self::two_factor_duo_context::TwoFactorDuoContext;

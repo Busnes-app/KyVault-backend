@@ -8,15 +8,15 @@ use crate::{
     db::{
         DbConn, DbConnInner,
         schema::{
-            attachments, ciphers, sends, tenant_erased_subjects, tenant_pending_deletions, tenant_recovery_bundles,
-            tenants,
+            attachments, ciphers, sends, sso_users, tenant_erased_subjects, tenant_pending_deletions,
+            tenant_recovery_bundles, tenants, users,
         },
     },
     error::MapResult,
     util::get_uuid,
 };
 
-use super::{Attachment, Cipher, OrganizationId, UserId};
+use super::{Attachment, Cipher, OrganizationId, SsoUser, User, UserId};
 
 pub const TENANT_STATUS_ACTIVE: &str = "active";
 
@@ -1164,18 +1164,65 @@ impl TenantErasedSubject {
     }
 
     pub async fn is_erased(issuer: &str, subject: &str, conn: &DbConn) -> bool {
-        let iss = crate::tenancy::canonical_issuer(issuer).to_owned();
-        let sub = subject.trim().to_owned();
-        conn.run(move |conn| {
+        let (iss, sub) = (issuer.to_owned(), subject.to_owned());
+        conn.run(move |conn| Self::is_erased_tx(conn, &iss, &sub).unwrap_or(false)).await
+    }
+
+    fn is_erased_tx(conn: &mut DbConnInner, issuer: &str, subject: &str) -> QueryResult<bool> {
+        diesel::select(diesel::dsl::exists(
             tenant_erased_subjects::table
-                .filter(tenant_erased_subjects::issuer.eq(iss))
-                .filter(tenant_erased_subjects::subject.eq(sub))
-                .count()
-                .first::<i64>(conn)
-                .unwrap_or(0)
-                > 0
+                .filter(tenant_erased_subjects::issuer.eq(crate::tenancy::canonical_issuer(issuer)))
+                .filter(tenant_erased_subjects::subject.eq(subject.trim())),
+        ))
+        .get_result(conn)
+    }
+
+    /// Creates a hosted SSO user and its subject link in one transaction, under the subject lock
+    /// that erasure takes, so a subject erased mid sign-in is never provisioned again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn provision_sso_user_inner(
+        conn: &mut DbConnInner,
+        user: &User,
+        link: &SsoUser,
+        issuer: &str,
+        subject: &str,
+        served_cells: &[String],
+        now_ts: i64,
+        max_authority_age_secs: i64,
+    ) -> EmptyResult {
+        conn.transaction::<(), crate::Error, _>(|conn| {
+            lock_subject(conn, issuer, subject).map_res("Error locking subject")?;
+            let Some(tenant) =
+                lock_tenant(conn, user.tenant_id.as_deref().unwrap_or_default()).map_res("Error locking tenant")?
+            else {
+                err_code!("Tenant not found or not provisioned in this cell", 403);
+            };
+            crate::tenancy::check_tenant_active_for_cells(&tenant, served_cells, now_ts, max_authority_age_secs)?;
+            if Self::is_erased_tx(conn, issuer, subject).map_res("Error reading erased subjects")? {
+                err_code!("Account has been permanently erased", 403);
+            }
+            diesel::insert_into(users::table).values(user).execute(conn).map(drop).map_res("Error saving user")?;
+            diesel::insert_into(sso_users::table)
+                .values(link)
+                .execute(conn)
+                .map(drop)
+                .map_res("Error saving SSO user")?;
+            Ok(())
         })
-        .await
+    }
+}
+
+/// Transaction-scoped lock on one OIDC subject, shared by hosted sign-up and permanent erasure.
+#[cfg_attr(not(postgresql), allow(unused_variables, reason = "the lock exists only on PostgreSQL"))]
+pub fn lock_subject(conn: &mut DbConnInner, issuer: &str, subject: &str) -> QueryResult<()> {
+    match conn {
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(pg) => diesel::sql_query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind::<diesel::sql_types::Text, _>(crate::tenancy::format_oidc_identifier(issuer, subject))
+            .execute(pg)
+            .map(drop),
+        #[allow(unreachable_patterns, reason = "only reachable when another backend is compiled in")]
+        _ => Ok(()),
     }
 }
 

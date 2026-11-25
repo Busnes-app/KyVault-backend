@@ -12,7 +12,7 @@ use crate::{
         DbConnInner,
         models::{
             Device, TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion, UserId, committed_bytes,
-            lock_tenant, release_pending_reservations,
+            lock_subject, lock_tenant, release_pending_reservations,
         },
         schema::{
             archives, attachments, auth_requests, ciphers, ciphers_collections, collections, collections_groups,
@@ -598,6 +598,8 @@ pub fn erase_user(
     }
     let now_dt = naive(now);
     conn.transaction(|conn| {
+        // Serializes with hosted sign-up, which rechecks the tombstone under this lock.
+        lock_subject(conn, &req.issuer, &req.subject)?;
         let mut kicks = Kicks::default();
         let req_tenant = match req_tid {
             Some(tid) => Some(ensure_tenant_cell_served(conn, tid, served_cells)?),
@@ -2250,6 +2252,43 @@ mod tests {
         let after = tenant(c, "t1");
         assert_eq!(after.storage_ceiling_bytes, 0);
         assert_eq!(after.storage_grant_expires_at, None);
+    }
+
+    #[test]
+    fn erased_subject_cannot_be_provisioned_again() {
+        use crate::db::models::{SsoUser, User};
+        let c = &mut test_sqlite_conn();
+        active_tenant(c, "t1");
+        let provision = |c: &mut DbConnInner, tid: &str| {
+            let mut user = User::new("new@example.com", None);
+            user.tenant_id = Some(tid.to_owned());
+            let link = SsoUser {
+                user_uuid: user.uuid.clone(),
+                identifier: format_oidc_identifier(ISS, "sub-new").into(),
+                tenant_id: user.tenant_id.clone(),
+            };
+            TenantErasedSubject::provision_sso_user_inner(c, &user, &link, ISS, "sub-new", &cells(), NOW, 900)
+        };
+        let count = |c: &mut DbConnInner| {
+            users::table.filter(users::email.eq("new@example.com")).count().get_result::<i64>(c).unwrap()
+        };
+
+        assert!(provision(c, "missing").is_err(), "unknown tenant");
+        provision(c, "t1").unwrap();
+        assert_eq!((count(c), sso_users::table.count().get_result::<i64>(c).unwrap()), (1, 1));
+
+        let req = EraseRequest {
+            issuer: ISS.to_owned(),
+            subject: "sub-new".to_owned(),
+            tenant_id: Some("t1".to_owned()),
+            revision: 1,
+        };
+        assert!(erase_user(c, &req, &cells(), NOW).unwrap().0.user_existed);
+        assert_eq!(count(c), 0);
+
+        let err = provision(c, "t1").unwrap_err();
+        assert!(err.to_string().contains("permanently erased"), "{err}");
+        assert_eq!(count(c), 0, "refused sign-up left no user row");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::{
     api::EmptyResult,
     db::{
         DbConn,
-        models::{Attachment, Tenant, User},
+        models::{Attachment, SsoUser, Tenant, TenantErasedSubject, User},
     },
 };
 
@@ -161,6 +161,34 @@ pub async fn check_tenant_active(tenant_id: &str, conn: &DbConn) -> Result<Tenan
         CONFIG.tenancy_authority_max_age_secs(),
     )?;
     Ok(tenant)
+}
+
+/// Creates a hosted SSO user and its subject link atomically; refused once the subject is erased.
+pub async fn provision_sso_user(
+    user: User,
+    link: SsoUser,
+    issuer: &str,
+    subject: &str,
+    conn: &DbConn,
+) -> Result<(User, SsoUser), crate::Error> {
+    if !crate::util::is_valid_email(&user.email) {
+        err!(format!("User email {} is not a valid email address", user.email.escape_debug()))
+    }
+    let (issuer, subject) = (issuer.to_owned(), subject.to_owned());
+    conn.run(move |conn| {
+        TenantErasedSubject::provision_sso_user_inner(
+            conn,
+            &user,
+            &link,
+            &issuer,
+            &subject,
+            &CONFIG.served_cells(),
+            Utc::now().timestamp(),
+            CONFIG.tenancy_authority_max_age_secs(),
+        )?;
+        Ok((user, link))
+    })
+    .await
 }
 
 /// Convenience wrapper verifying a user is tenant-bound and their tenant is active in a served cell.

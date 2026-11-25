@@ -368,11 +368,24 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
             let mut user = User::new(&user_infos.email, user_infos.user_name.clone());
             user.verified_at = Some(now);
             user.tenant_id = multi_tenant_id.clone();
-            user.save(conn).await?;
+            let (user, sso_user) = if CONFIG.is_multi_tenant() {
+                let link = SsoUser {
+                    user_uuid: user.uuid.clone(),
+                    identifier: user_infos.identifier.clone(),
+                    tenant_id: user.tenant_id.clone(),
+                };
+                let (user, link) =
+                    crate::tenancy::provision_sso_user(user, link, &user_infos.issuer, &user_infos.subject, conn)
+                        .await?;
+                (user, Some(link))
+            } else {
+                user.save(conn).await?;
+                (user, None)
+            };
 
             let device = get_device(&data, conn, &user).await?;
 
-            (user, device, None, None)
+            (user, device, None, sso_user)
         }
         Some((user, _)) if !user.enabled => {
             err!(

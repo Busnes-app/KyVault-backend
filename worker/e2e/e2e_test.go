@@ -673,6 +673,46 @@ func TestLivePostgres(t *testing.T) {
 		}
 	})
 
+	t.Run("5c erasure waits on the subject lock hosted sign-up holds", func(t *testing.T) {
+		ctx := context.Background()
+		held, err := e.db.Acquire(ctx)
+		must(t, err)
+		defer held.Release()
+		const sub = "sub-locked"
+		lockSQL := "SELECT pg_advisory_%s(hashtextextended($1, 0))"
+		_, err = held.Exec(ctx, fmt.Sprintf(lockSQL, "lock"), issuer+"/"+sub)
+		must(t, err)
+
+		body, _ := json.Marshal(map[string]any{"issuer": issuer, "subject": sub, "tenant_id": orgA, "revision": 1})
+		hdr := map[string]string{"Authorization": "Bearer " + internalToken, "Content-Type": "application/json"}
+		done := make(chan resp, 1)
+		go func() {
+			r, err := callErr("POST", r1+"/internal/tenancy/v1/users/erase", hdr, body)
+			if err != nil {
+				r = resp{0, []byte(err.Error())}
+			}
+			done <- r
+		}()
+		select {
+		case r := <-done:
+			t.Fatalf("erase finished while the subject lock was held: %d %s", r.code, r.body)
+		case <-time.After(time.Second):
+		}
+		_, err = held.Exec(ctx, fmt.Sprintf(lockSQL, "unlock"), issuer+"/"+sub)
+		must(t, err)
+		select {
+		case r := <-done:
+			if r.code != 200 {
+				t.Fatalf("erase after unlock: %d %s", r.code, r.body)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("erase still blocked after unlock")
+		}
+		if e.num(t, "SELECT count(*) FROM tenant_erased_subjects WHERE subject = $1", sub) != 1 {
+			t.Fatal("no tombstone recorded")
+		}
+	})
+
 	t.Run("6 user erasure keeps shared org data", func(t *testing.T) {
 		attA1 := e.str(t, "SELECT notes FROM ciphers WHERE uuid = $1", pcA1)
 		keyA1 := attachmentKey(cellA, orgA, pcA1, attA1)
