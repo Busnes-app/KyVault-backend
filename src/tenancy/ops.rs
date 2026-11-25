@@ -160,6 +160,20 @@ fn pending_count(conn: &mut DbConnInner, tenant_id: &str) -> QueryResult<i64> {
     tenant_pending_deletions::table.filter(tenant_pending_deletions::tenant_id.eq(tenant_id)).count().get_result(conn)
 }
 
+/// Whether `purge_begin` has removed the tenant's vault rows. Reconciliation can mark a tenant
+/// `purge_pending` before that runs, so finishing its cleanup jobs alone does not finalize it.
+fn vault_rows_purged(conn: &mut DbConnInner, tenant_id: &str) -> QueryResult<bool> {
+    diesel::select(
+        diesel::dsl::not(diesel::dsl::exists(users::table.filter(users::tenant_id.eq(tenant_id))))
+            .and(diesel::dsl::not(diesel::dsl::exists(
+                organizations::table.filter(organizations::tenant_id.eq(tenant_id)),
+            )))
+            .and(diesel::dsl::not(diesel::dsl::exists(ciphers::table.filter(ciphers::tenant_id.eq(tenant_id)))))
+            .and(diesel::dsl::not(diesel::dsl::exists(sends::table.filter(sends::tenant_id.eq(tenant_id))))),
+    )
+    .get_result(conn)
+}
+
 /// Permanent `(issuer, subject)` tombstone; an existing tombstone is kept unchanged.
 fn record_tombstone(conn: &mut DbConnInner, row: &TenantErasedSubject) -> QueryResult<()> {
     let exists = tenant_erased_subjects::table.find((&row.issuer, &row.subject)).count().get_result::<i64>(conn)? > 0;
@@ -1093,7 +1107,10 @@ pub fn cleanup_complete(
             let Some(t) = lock_tenant(conn, &tid)? else {
                 continue;
             };
-            if (t.status == STATUS_PURGE_PENDING || t.status == STATUS_ERASING) && pending_count(conn, &tid)? == 0 {
+            if (t.status == STATUS_PURGE_PENDING || t.status == STATUS_ERASING)
+                && pending_count(conn, &tid)? == 0
+                && vault_rows_purged(conn, &tid)?
+            {
                 diesel::update(tenants::table.find(&tid))
                     .set((
                         tenants::status.eq(STATUS_DELETED),
@@ -2266,7 +2283,7 @@ mod tests {
 
     #[test]
     fn erased_subject_cannot_be_provisioned_again() {
-        use crate::db::models::{SsoUser, User, update_user_tx};
+        use crate::db::models::{SignInUpdate, SsoUser, User, update_signed_in_user_tx};
         let c = &mut test_sqlite_conn();
         active_tenant(c, "t1");
         let provision = |c: &mut DbConnInner, tid: &str| {
@@ -2290,6 +2307,28 @@ mod tests {
         existing.name = "finished key setup".to_owned();
         TenantErasedSubject::update_sso_user_inner(c, &existing, ISS, "sub-new").unwrap();
 
+        // KyIdentity disables the account and rotates its stamp while a sign-in still holds the old row.
+        let stale = users::table.find(&existing.uuid).first::<User>(c).unwrap();
+        exec(c, "UPDATE users SET enabled = 0, security_stamp = 'revoked' WHERE email = 'new@example.com'");
+        let mut stale_stub = stale;
+        stale_stub.name = "stale".to_owned();
+        assert!(TenantErasedSubject::update_sso_user_inner(c, &stale_stub, ISS, "sub-new").is_err());
+        assert!(update_signed_in_user_tx(c, &stale_stub, &SignInUpdate::RecoveryCodeUsed).is_err());
+        let (enabled, stamp, name): (bool, String, String) = users::table
+            .find(&existing.uuid)
+            .select((users::enabled, users::security_stamp, users::name))
+            .first(c)
+            .unwrap();
+        assert_eq!((enabled, stamp.as_str(), name.as_str()), (false, "revoked", "finished key setup"));
+        // Only a row matching what the sign-in loaded is written, and only its sign-in fields.
+        exec(c, "UPDATE users SET enabled = 1 WHERE email = 'new@example.com'");
+        let mut fresh = users::table.find(&existing.uuid).first::<User>(c).unwrap();
+        fresh.totp_recover = Some("code".to_owned());
+        exec(c, "UPDATE users SET totp_recover = 'code' WHERE email = 'new@example.com'");
+        update_signed_in_user_tx(c, &fresh, &SignInUpdate::RecoveryCodeUsed).unwrap();
+        let recover: Option<String> = users::table.find(&existing.uuid).select(users::totp_recover).first(c).unwrap();
+        assert_eq!(recover, None);
+
         let req = EraseRequest {
             issuer: ISS.to_owned(),
             subject: "sub-new".to_owned(),
@@ -2304,7 +2343,10 @@ mod tests {
         // A stale save from a sign-in that loaded the user before erasure cannot restore it.
         let err = TenantErasedSubject::update_sso_user_inner(c, &existing, ISS, "sub-new").unwrap_err();
         assert!(err.to_string().contains("permanently erased"), "{err}");
-        assert!(update_user_tx(c, &existing).is_err(), "update-only never re-inserts");
+        assert!(
+            update_signed_in_user_tx(c, &fresh, &SignInUpdate::VerifiedStub).is_err(),
+            "update-only never re-inserts"
+        );
         assert_eq!(count(c), 0, "refused sign-ins left no user row");
     }
 
@@ -2325,6 +2367,36 @@ mod tests {
         // Upstream never applies t1 and t2; their pending reports must not take every batch.
         assert_eq!(prepare(c, NOW + 1), ["t3", "t1"]);
         assert_eq!(prepare(c, NOW + 2), ["t2", "t1"]);
+    }
+
+    #[test]
+    fn cleanup_cannot_finalize_a_tenant_before_its_rows_are_purged() {
+        let c = &mut test_sqlite_conn();
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+        exec(c, "UPDATE tenants SET status = 'purge_pending' WHERE id = 't1'"); // as reconciliation does
+        exec(
+            c,
+            "INSERT INTO tenant_pending_deletions (id, tenant_id, storage_kind, object_key, attempts, created_at) \
+             VALUES ('pd-old', 't1', 'attachment', 'cells/us-east-1/tenants/t1/attachments/c/a', 0, '2025-01-01 00:00:00')",
+        );
+        let complete = |c: &mut DbConnInner, ids: Vec<String>| {
+            let req = CompleteRequest {
+                completed_ids: ids,
+                failed: vec![],
+            };
+            cleanup_complete(c, &req, &cells(), NOW).unwrap().finalized_tenant_ids
+        };
+        assert!(complete(c, vec!["pd-old".to_owned()]).is_empty());
+        assert_eq!(tenant(c, "t1").status, STATUS_PURGE_PENDING);
+
+        // The purge still runs, and only its cleanup finalizes the tenant.
+        purge_begin(c, "t1", ISS, &cells(), NOW).unwrap();
+        assert_eq!(users::table.filter(users::tenant_id.eq("t1")).count().get_result::<i64>(c).unwrap(), 0);
+        let ids: Vec<String> =
+            cleanup_pending(c, None, &cells(), NOW).unwrap().items.into_iter().map(|i| i.id).collect();
+        assert_eq!(complete(c, ids), ["t1"]);
+        assert_eq!(tenant(c, "t1").status, STATUS_DELETED);
     }
 
     #[test]

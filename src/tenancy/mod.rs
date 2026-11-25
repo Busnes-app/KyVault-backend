@@ -191,7 +191,7 @@ pub async fn provision_sso_user(
     .await
 }
 
-/// Saves an existing hosted SSO user update-only, refused once the subject is erased.
+/// Records an invited stub's SSO sign-up; refused once the subject is erased or the account changed.
 pub async fn update_sso_user(user: &mut User, issuer: &str, subject: &str, conn: &DbConn) -> EmptyResult {
     user.updated_at = Utc::now().naive_utc();
     let user = &*user;

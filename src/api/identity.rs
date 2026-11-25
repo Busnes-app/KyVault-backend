@@ -985,8 +985,7 @@ async fn twofactor_auth(
             }
 
             // Remove the recovery code, not needed without twofactors
-            user.totp_recover = None;
-            user.update_existing(conn).await?;
+            user.clear_recovery_code(conn).await?;
         }
         _ => err!(
             "Invalid two factor provider",

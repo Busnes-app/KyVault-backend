@@ -336,11 +336,12 @@ impl User {
         })
     }
 
-    /// Saves a user known to exist; fails instead of re-inserting one deleted meanwhile.
-    pub async fn update_existing(&mut self, conn: &DbConn) -> EmptyResult {
+    /// Clears the used 2FA recovery code; refused if the account changed since it was loaded.
+    pub async fn clear_recovery_code(&mut self, conn: &DbConn) -> EmptyResult {
+        self.totp_recover = None;
         self.updated_at = Utc::now().naive_utc();
         let user = &*self;
-        conn.run(move |conn| super::update_user_tx(conn, user)).await
+        conn.run(move |conn| super::update_signed_in_user_tx(conn, user, &super::SignInUpdate::RecoveryCodeUsed)).await
     }
 
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {

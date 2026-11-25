@@ -44,8 +44,8 @@ pub use self::sso_auth::{OIDCAuthenticatedUser, OIDCCodeResponseError, SsoAuth};
 #[cfg(all(test, sqlite))]
 pub use self::tenant::Abandoned;
 pub use self::tenant::{
-    TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion, TenantRecoveryBundle, V2UploadLease,
-    committed_bytes, lock_subject, lock_tenant, release_pending_reservations, update_user_tx,
+    SignInUpdate, TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion, TenantRecoveryBundle,
+    V2UploadLease, committed_bytes, lock_subject, lock_tenant, release_pending_reservations, update_signed_in_user_tx,
 };
 pub use self::two_factor::{TwoFactor, TwoFactorType};
 pub use self::two_factor_duo_context::TwoFactorDuoContext;

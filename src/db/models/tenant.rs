@@ -1237,7 +1237,7 @@ impl TenantErasedSubject {
             if Self::is_erased_tx(conn, issuer, subject).map_res("Error reading erased subjects")? {
                 err_code!("Account has been permanently erased", 403);
             }
-            update_user_tx(conn, user)
+            update_signed_in_user_tx(conn, user, &SignInUpdate::VerifiedStub)
         })
     }
 
@@ -1276,14 +1276,39 @@ impl TenantErasedSubject {
     }
 }
 
-/// Writes an existing user update-only: a user deleted meanwhile is refused, never re-inserted.
-pub fn update_user_tx(conn: &mut DbConnInner, user: &User) -> EmptyResult {
-    let updated: usize = diesel::update(users::table.filter(users::uuid.eq(&user.uuid)))
-        .set(user)
-        .execute(conn)
-        .map_res("Error updating user")?;
+/// A field-specific change a sign-in may make to an existing user.
+pub enum SignInUpdate {
+    /// An invited stub finishes SSO sign-up.
+    VerifiedStub,
+    /// A 2FA recovery code was used up.
+    RecoveryCodeUsed,
+}
+
+/// Applies `change` to `user`, but only while the row is still the one the sign-in loaded: enabled,
+/// with the same security stamp. A user deleted, disabled or revoked meanwhile is refused; no other
+/// column is written, so a stale sign-in never restores state that changed under it.
+pub fn update_signed_in_user_tx(conn: &mut DbConnInner, user: &User, change: &SignInUpdate) -> EmptyResult {
+    let current = || {
+        users::table
+            .filter(users::uuid.eq(&user.uuid))
+            .filter(users::enabled.eq(true))
+            .filter(users::security_stamp.eq(&user.security_stamp))
+    };
+    let updated: usize = match change {
+        SignInUpdate::VerifiedStub => diesel::update(current())
+            .set((
+                users::verified_at.eq(user.verified_at),
+                users::name.eq(&user.name),
+                users::updated_at.eq(user.updated_at),
+            ))
+            .execute(conn),
+        SignInUpdate::RecoveryCodeUsed => diesel::update(current())
+            .set((users::totp_recover.eq(None::<String>), users::updated_at.eq(user.updated_at)))
+            .execute(conn),
+    }
+    .map_res("Error updating user")?;
     if updated == 0 {
-        err_code!("Account no longer exists", 403);
+        err_code!("Account changed during sign-in; sign in again", 403);
     }
     Ok(())
 }
