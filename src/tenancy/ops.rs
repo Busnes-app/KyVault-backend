@@ -2266,7 +2266,7 @@ mod tests {
 
     #[test]
     fn erased_subject_cannot_be_provisioned_again() {
-        use crate::db::models::{SsoUser, User};
+        use crate::db::models::{SsoUser, User, update_user_tx};
         let c = &mut test_sqlite_conn();
         active_tenant(c, "t1");
         let provision = |c: &mut DbConnInner, tid: &str| {
@@ -2286,6 +2286,9 @@ mod tests {
         assert!(provision(c, "missing").is_err(), "unknown tenant");
         provision(c, "t1").unwrap();
         assert_eq!((count(c), sso_users::table.count().get_result::<i64>(c).unwrap()), (1, 1));
+        let mut existing = users::table.filter(users::email.eq("new@example.com")).first::<User>(c).unwrap();
+        existing.name = "finished key setup".to_owned();
+        TenantErasedSubject::update_sso_user_inner(c, &existing, ISS, "sub-new").unwrap();
 
         let req = EraseRequest {
             issuer: ISS.to_owned(),
@@ -2298,7 +2301,11 @@ mod tests {
 
         let err = provision(c, "t1").unwrap_err();
         assert!(err.to_string().contains("permanently erased"), "{err}");
-        assert_eq!(count(c), 0, "refused sign-up left no user row");
+        // A stale save from a sign-in that loaded the user before erasure cannot restore it.
+        let err = TenantErasedSubject::update_sso_user_inner(c, &existing, ISS, "sub-new").unwrap_err();
+        assert!(err.to_string().contains("permanently erased"), "{err}");
+        assert!(update_user_tx(c, &existing).is_err(), "update-only never re-inserts");
+        assert_eq!(count(c), 0, "refused sign-ins left no user row");
     }
 
     #[test]

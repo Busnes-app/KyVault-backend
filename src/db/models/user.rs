@@ -336,6 +336,13 @@ impl User {
         })
     }
 
+    /// Saves a user known to exist; fails instead of re-inserting one deleted meanwhile.
+    pub async fn update_existing(&mut self, conn: &DbConn) -> EmptyResult {
+        self.updated_at = Utc::now().naive_utc();
+        let user = &*self;
+        conn.run(move |conn| super::update_user_tx(conn, user)).await
+    }
+
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
         if !crate::util::is_valid_email(&self.email) {
             err!(format!("User email {} is not a valid email address", self.email.escape_debug()))

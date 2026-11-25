@@ -408,7 +408,11 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                     user.name = user_name.clone();
                 }
 
-                user.save(conn).await?;
+                if CONFIG.is_multi_tenant() {
+                    crate::tenancy::update_sso_user(&mut user, &user_infos.issuer, &user_infos.subject, conn).await?;
+                } else {
+                    user.save(conn).await?;
+                }
             }
 
             if user.email != user_infos.email {
@@ -982,7 +986,7 @@ async fn twofactor_auth(
 
             // Remove the recovery code, not needed without twofactors
             user.totp_recover = None;
-            user.save(conn).await?;
+            user.update_existing(conn).await?;
         }
         _ => err!(
             "Invalid two factor provider",

@@ -191,6 +191,13 @@ pub async fn provision_sso_user(
     .await
 }
 
+/// Saves an existing hosted SSO user update-only, refused once the subject is erased.
+pub async fn update_sso_user(user: &mut User, issuer: &str, subject: &str, conn: &DbConn) -> EmptyResult {
+    user.updated_at = Utc::now().naive_utc();
+    let user = &*user;
+    conn.run(move |conn| TenantErasedSubject::update_sso_user_inner(conn, user, issuer, subject)).await
+}
+
 /// Convenience wrapper verifying a user is tenant-bound and their tenant is active in a served cell.
 pub async fn require_user_tenant_active(user: &User, conn: &DbConn) -> Result<Tenant, crate::Error> {
     let tid = require_user_tenant(user)?;

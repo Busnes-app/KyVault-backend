@@ -1229,6 +1229,18 @@ impl TenantErasedSubject {
         .get_result(conn)
     }
 
+    /// Saves an existing hosted SSO user under the subject lock erasure takes, rechecking the
+    /// tombstone, so a sign-in racing erasure cannot restore the erased user.
+    pub fn update_sso_user_inner(conn: &mut DbConnInner, user: &User, issuer: &str, subject: &str) -> EmptyResult {
+        conn.transaction::<(), crate::Error, _>(|conn| {
+            lock_subject(conn, issuer, subject).map_res("Error locking subject")?;
+            if Self::is_erased_tx(conn, issuer, subject).map_res("Error reading erased subjects")? {
+                err_code!("Account has been permanently erased", 403);
+            }
+            update_user_tx(conn, user)
+        })
+    }
+
     /// Creates a hosted SSO user and its subject link in one transaction, under the subject lock
     /// that erasure takes, so a subject erased mid sign-in is never provisioned again.
     #[allow(clippy::too_many_arguments)]
@@ -1262,6 +1274,18 @@ impl TenantErasedSubject {
             Ok(())
         })
     }
+}
+
+/// Writes an existing user update-only: a user deleted meanwhile is refused, never re-inserted.
+pub fn update_user_tx(conn: &mut DbConnInner, user: &User) -> EmptyResult {
+    let updated: usize = diesel::update(users::table.filter(users::uuid.eq(&user.uuid)))
+        .set(user)
+        .execute(conn)
+        .map_res("Error updating user")?;
+    if updated == 0 {
+        err_code!("Account no longer exists", 403);
+    }
+    Ok(())
 }
 
 /// Transaction-scoped lock on one OIDC subject, shared by hosted sign-up and permanent erasure.
