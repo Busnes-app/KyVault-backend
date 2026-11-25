@@ -12,7 +12,7 @@ use crate::{
         DbConnInner,
         models::{
             Device, TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion, UserId, committed_bytes,
-            lock_subject, lock_tenant, release_pending_reservations,
+            lock_subject, lock_tenant, mark_storage_dirty, release_pending_reservations,
         },
         schema::{
             archives, attachments, auth_requests, ciphers, ciphers_collections, collections, collections_groups,
@@ -634,7 +634,7 @@ pub fn erase_user(
             queued = erase_personal_data(conn, uid, &tenant.home_region, user_tid.as_deref(), &stone_tid, now_dt)?;
             kicks.users.push(UserId::from(uid.clone()));
             // Usage dropped; a tenant that no longer reports (e.g. suspended) must report it once.
-            diesel::update(tenants::table.find(&stone_tid)).set(tenants::storage_dirty.eq(true)).execute(conn)?;
+            mark_storage_dirty(conn, &stone_tid)?;
         }
         Ok((
             EraseResponse {
@@ -1150,13 +1150,16 @@ fn drop_abandoned_v2_rows(conn: &mut DbConnInner, ids: &[&str]) -> QueryResult<(
         if attachment_object_key(&t.home_region, &tid, cid, aid) != key {
             continue;
         }
-        diesel::delete(
+        let dropped = diesel::delete(
             attachments::table
                 .filter(attachments::id.eq(aid))
                 .filter(attachments::cipher_uuid.eq(cid))
                 .filter(attachments::tenant_id.eq(&tid)),
         )
         .execute(conn)?;
+        if dropped > 0 {
+            mark_storage_dirty(conn, &tid)?;
+        }
     }
     Ok(())
 }
@@ -1476,6 +1479,8 @@ pub fn storage_repair_seq(
                 tenants::storage_pending_seq.eq(None::<i64>),
                 tenants::storage_pending_used_bytes.eq(None::<i64>),
                 tenants::storage_seq_stale.eq(false),
+                // The dropped pending report must still be replaced, even for a non-reporting tenant.
+                tenants::storage_dirty.eq(true),
             ))
             .execute(conn)?;
         Ok(RepairSeqResponse {
@@ -2143,6 +2148,7 @@ mod tests {
         assert!(repair(c, 0).is_err());
         let r = repair(c, 42).unwrap();
         assert_eq!((r.storage_report_seq, r.storage_seq_stale), (41, false));
+        assert!(tenant(c, "t1").storage_dirty, "repair re-reports even a non-reporting tenant");
         assert_eq!(prep(c)[0].seq, 42);
 
         assert_eq!(apply(c, "unknown_org", 0, NOW).applied, 0, "an answer must name its report");
@@ -2449,6 +2455,37 @@ mod tests {
         erase_user(c, &req, &cells(), NOW).unwrap();
         assert_eq!(prepare(c), [("t1".to_owned(), 0)]);
         assert!(!tenant(c, "t1").storage_dirty);
+    }
+
+    #[test]
+    fn inactive_tenant_reports_once_after_cleanup_releases_its_reservation() {
+        let c = &mut test_sqlite_conn();
+        active_tenant(c, "t1");
+        exec(
+            c,
+            "UPDATE tenants SET status = 'suspended', storage_last_applied_seq = 3, storage_reserved_bytes = 700 \
+             WHERE id = 't1'",
+        );
+        exec(
+            c,
+            "INSERT INTO tenant_pending_deletions (id, tenant_id, storage_kind, object_key, attempts, created_at, reserved_bytes) \
+             VALUES ('pd-1', 't1', 'attachment', 'cells/us-east-1/tenants/t1/attachments/c/a', 0, '2025-01-01 00:00:00', 700)",
+        );
+        let req = PrepareRequest {
+            want_bytes_default: 1000,
+            limit: 10,
+        };
+        assert!(storage_prepare(c, &req, &cells(), NOW).unwrap().reports.is_empty());
+
+        let done = CompleteRequest {
+            completed_ids: vec!["pd-1".to_owned()],
+            failed: vec![],
+        };
+        cleanup_complete(c, &done, &cells(), NOW).unwrap();
+        let reports = storage_prepare(c, &req, &cells(), NOW).unwrap().reports;
+        assert_eq!(reports.len(), 1);
+        let used = committed_bytes(c, "t1").unwrap();
+        assert_eq!((reports[0].org_id.as_str(), reports[0].used_bytes, reports[0].want_bytes), ("t1", used, 0));
     }
 
     #[test]
@@ -3462,6 +3499,7 @@ mod tests {
         // Neither row advertises a file that is gone, nor keeps counting its declared payload.
         assert_eq!(attachments::table.count().get_result::<i64>(c).unwrap(), 0);
         assert_eq!(committed_bytes(c, "t1").unwrap(), before - 2 * 101);
+        assert!(tenant(c, "t1").storage_dirty, "dropping counted rows is reported");
         // The failed delete is retried, but no row is left for it to reconcile.
         assert_eq!(cleanup_pending(c, None, &cells(), late).unwrap().items.len(), 1);
 

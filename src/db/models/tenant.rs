@@ -692,7 +692,11 @@ impl Tenant {
             if owned {
                 release_pending_reservations(conn, &[pending_id]).map_res("Error releasing reservation")?;
                 if v2 {
-                    diesel::delete(att_row()).execute(conn).map(drop).map_res("Error deleting attachment")?;
+                    let dropped: usize =
+                        diesel::delete(att_row()).execute(conn).map_res("Error deleting attachment")?;
+                    if dropped > 0 {
+                        mark_storage_dirty(conn, tid).map_res("Error marking storage dirty")?;
+                    }
                 }
                 return Ok(Abandoned::Owned);
             }
@@ -938,6 +942,11 @@ fn sum_to_i64(sum: Option<BigDecimal>) -> i64 {
     }
 }
 
+/// Flags a usage change so `storage_prepare` reports the tenant even if it is not otherwise reporting.
+pub fn mark_storage_dirty(conn: &mut DbConnInner, tid: &str) -> QueryResult<()> {
+    diesel::update(tenants::table.find(tid)).set(tenants::storage_dirty.eq(true)).execute(conn).map(drop)
+}
+
 /// What abandoning a failed upload did with its object.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Abandoned {
@@ -1092,8 +1101,12 @@ pub fn release_pending_reservations(conn: &mut DbConnInner, ids: &[&str]) -> Que
             .load(conn)?;
         let total = bytes.into_iter().fold(0i64, i64::saturating_add);
         if total > 0 {
+            // Usage dropped; `storage_dirty` makes even a non-reporting tenant report it.
             diesel::update(tenants::table.find(&tid))
-                .set(tenants::storage_reserved_bytes.eq(t.storage_reserved_bytes.saturating_sub(total).max(0)))
+                .set((
+                    tenants::storage_reserved_bytes.eq(t.storage_reserved_bytes.saturating_sub(total).max(0)),
+                    tenants::storage_dirty.eq(true),
+                ))
                 .execute(conn)?;
         }
         diesel::update(
