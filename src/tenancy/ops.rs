@@ -357,6 +357,7 @@ pub fn reconcile_orgs(
                 t.access_epoch = t.access_epoch.saturating_add(1);
                 t.storage_ceiling_bytes = 0;
                 t.storage_grant_expires_at = None;
+                t.storage_dirty = true;
                 t.updated_at = now_dt;
                 fence_tenant_users(conn, &t.id, now_dt)?;
                 diesel::update(tenants::table.find(&t.id)).set(&t).execute(conn)?;
@@ -406,6 +407,7 @@ pub fn reconcile_orgs(
                 t.access_epoch = t.access_epoch.saturating_add(1);
                 t.storage_ceiling_bytes = 0;
                 t.storage_grant_expires_at = None;
+                t.storage_dirty = true;
                 fence_tenant_users(conn, &t.id, now_dt)?;
                 resp.fenced_tenant_ids.push(t.id.clone());
                 kicks.tenants.push(t.id.clone());
@@ -2251,6 +2253,7 @@ mod tests {
         assert_eq!(t.storage_ceiling_bytes, 0);
         assert_eq!(t.storage_grant_expires_at, None);
         assert_eq!(t.authority_refreshed_at, None);
+        assert!(t.storage_dirty, "a fenced tenant reports its final usage");
         assert_ne!(stamp(c, "u1"), "stamp-u1");
         let rt: String = devices::table.find(("dev-u1", "u1")).select(devices::refresh_token).first(c).unwrap();
         assert_ne!(rt, "rt-u1");
@@ -2455,6 +2458,29 @@ mod tests {
         erase_user(c, &req, &cells(), NOW).unwrap();
         assert_eq!(prepare(c), [("t1".to_owned(), 0)]);
         assert!(!tenant(c, "t1").storage_dirty);
+    }
+
+    #[test]
+    fn suspended_tenant_reports_once_after_its_grant_is_fenced() {
+        let c = &mut test_sqlite_conn();
+        reconcile(c, vec![snap("t1", "active", true, 1)], false, NOW);
+        exec(c, "UPDATE tenants SET storage_last_applied_seq = 3, storage_ceiling_bytes = 0 WHERE id = 't1'");
+        let prepare = |c: &mut DbConnInner| -> Vec<(String, i64)> {
+            let req = PrepareRequest {
+                want_bytes_default: 1000,
+                limit: 10,
+            };
+            storage_prepare(c, &req, &cells(), NOW)
+                .unwrap()
+                .reports
+                .into_iter()
+                .map(|r| (r.org_id, r.want_bytes))
+                .collect()
+        };
+        reconcile(c, vec![snap("t1", "suspended", true, 2)], false, NOW + 1);
+        assert_eq!(prepare(c), [("t1".to_owned(), 0)]);
+        exec(c, "UPDATE tenants SET storage_pending_seq = NULL, storage_pending_used_bytes = NULL WHERE id = 't1'");
+        assert!(prepare(c).is_empty(), "a fenced tenant reports once");
     }
 
     #[test]
