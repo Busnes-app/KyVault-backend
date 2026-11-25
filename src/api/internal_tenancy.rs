@@ -179,7 +179,7 @@ async fn storage_prepare(
     data: Json<ops::PrepareRequest>,
 ) -> ApiResult<Json<ops::PrepareResponse>> {
     let cells = CONFIG.served_cells();
-    Ok(Json(conn.run(move |c| ops::storage_prepare(c, &data, &cells)).await?))
+    Ok(Json(conn.run(move |c| ops::storage_prepare(c, &data, &cells, Utc::now().timestamp())).await?))
 }
 
 #[post("/storage/apply", data = "<data>")]

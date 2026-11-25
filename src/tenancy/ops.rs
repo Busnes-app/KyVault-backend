@@ -1179,17 +1179,21 @@ pub fn storage_prepare(
     conn: &mut DbConnInner,
     req: &PrepareRequest,
     served_cells: &[String],
+    now: i64,
 ) -> OpResult<PrepareResponse> {
     ensure_served_cells_configured(served_cells)?;
     let limit = usize::try_from(req.limit).unwrap_or(1).clamp(1, MAX_BATCH);
     let want_default = req.want_bytes_default.max(0);
 
-    // Soonest-expiring (or missing) grants first so a capped batch rotates through tenants.
+    // Least recently reported first, so a capped batch rotates through every tenant even while
+    // some reports keep failing upstream; then soonest-expiring (or missing) grants.
     let ids: Vec<String> = tenants::table
         .filter(tenants::status.ne_all(TOMBSTONED))
         .filter(tenants::storage_seq_stale.eq(false))
         .filter(tenants::home_region.eq_any(served_cells))
         .order((
+            tenants::storage_prepared_at.is_not_null().asc(),
+            tenants::storage_prepared_at.asc(),
             tenants::storage_grant_expires_at.is_not_null().asc(),
             tenants::storage_grant_expires_at.asc(),
             tenants::id.asc(),
@@ -1216,6 +1220,9 @@ pub fn storage_prepare(
                 0
             };
             if let (Some(seq), Some(used)) = (t.storage_pending_seq, t.storage_pending_used_bytes) {
+                diesel::update(tenants::table.find(&t.id))
+                    .set(tenants::storage_prepared_at.eq(Some(now)))
+                    .execute(conn)?;
                 return Ok(Some(StorageReport {
                     org_id: t.id,
                     used_bytes: used,
@@ -1237,6 +1244,7 @@ pub fn storage_prepare(
                     tenants::storage_report_seq.eq(seq),
                     tenants::storage_pending_seq.eq(Some(seq)),
                     tenants::storage_pending_used_bytes.eq(Some(used)),
+                    tenants::storage_prepared_at.eq(Some(now)),
                 ))
                 .execute(conn)?;
             Ok(Some(StorageReport {
@@ -1444,7 +1452,7 @@ pub fn storage_repair_seq(
 mod tests {
     use super::*;
     use crate::db::{
-        models::{Attachment, AttachmentId, CipherId, V2UploadLease},
+        models::{Abandoned, Attachment, AttachmentId, CipherId, V2UploadLease},
         test_sqlite_conn,
     };
 
@@ -2007,6 +2015,7 @@ mod tests {
                     limit: 500,
                 },
                 &cells(),
+                NOW,
             )
             .unwrap()
             .reports
@@ -2224,6 +2233,7 @@ mod tests {
                 limit: 10,
             },
             &multi_cells,
+            NOW,
         )
         .unwrap();
         if let Some(rep) = prep.reports.iter().find(|r| r.org_id == "t1") {
@@ -2289,6 +2299,25 @@ mod tests {
         let err = provision(c, "t1").unwrap_err();
         assert!(err.to_string().contains("permanently erased"), "{err}");
         assert_eq!(count(c), 0, "refused sign-up left no user row");
+    }
+
+    #[test]
+    fn failing_storage_reports_rotate_behind_other_tenants() {
+        let c = &mut test_sqlite_conn();
+        for t in ["t1", "t2", "t3"] {
+            active_tenant(c, t);
+        }
+        let prepare = |c: &mut DbConnInner, now: i64| -> Vec<String> {
+            let req = PrepareRequest {
+                want_bytes_default: 1000,
+                limit: 2,
+            };
+            storage_prepare(c, &req, &cells(), now).unwrap().reports.into_iter().map(|r| r.org_id).collect()
+        };
+        assert_eq!(prepare(c, NOW), ["t1", "t2"]);
+        // Upstream never applies t1 and t2; their pending reports must not take every batch.
+        assert_eq!(prepare(c, NOW + 1), ["t3", "t1"]);
+        assert_eq!(prepare(c, NOW + 2), ["t2", "t1"]);
     }
 
     #[test]
@@ -2450,6 +2479,7 @@ mod tests {
                 limit: 500,
             },
             &served,
+            NOW,
         )
         .unwrap();
         assert_eq!(prep.reports.iter().map(|r| r.org_id.as_str()).collect::<Vec<_>>(), vec!["local"]);
@@ -3304,8 +3334,17 @@ mod tests {
         // The failed delete is retried, but no row is left for it to reconcile.
         assert_eq!(cleanup_pending(c, None, &cells(), late).unwrap().items.len(), 1);
 
-        // The late uploads can no longer commit or touch anything.
-        assert!(!Tenant::abandon_upload_inner(c, "t1", &done.pending_cleanup_id, Some(&v2_att("done"))).unwrap());
+        // A late write may land after the worker's delete, so its object is queued again; the
+        // failed one is still pending, so it is left to that row. Neither can commit afterwards.
+        let abandon = |c: &mut DbConnInner, l: &V2UploadLease, id: &str| {
+            Tenant::abandon_upload_inner(c, "t1", &l.pending_cleanup_id, &v2_att(id), true, late).unwrap()
+        };
+        assert_eq!(abandon(c, &done, "done"), Abandoned::Requeued);
+        assert_eq!(abandon(c, &failed, "failed"), Abandoned::LeftAlone);
+        let key = v2_att("done").get_file_path_in_cell(Some(&tenant(c, "t1").home_region)).unwrap();
+        let queued: Vec<String> =
+            cleanup_pending(c, None, &cells(), late).unwrap().items.into_iter().map(|i| i.object_key).collect();
+        assert!(queued.contains(&key), "{queued:?}");
         assert!(begin(c, "done", 1_100).is_err());
     }
 
@@ -3357,13 +3396,17 @@ mod tests {
         v2_setup(c, &["att"], 5_000);
 
         let lease = begin(c, "att", 1_100).unwrap();
-        assert!(Tenant::abandon_upload_inner(c, "t1", &lease.pending_cleanup_id, Some(&v2_att("att"))).unwrap());
+        let abandon = |c: &mut DbConnInner| {
+            Tenant::abandon_upload_inner(c, "t1", &lease.pending_cleanup_id, &v2_att("att"), true, NOW).unwrap()
+        };
+        assert_eq!(abandon(c), Abandoned::Owned);
         assert_eq!(attachments::table.find("att").count().get_result::<i64>(c).unwrap(), 0);
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
         // Visible to the worker at once, not after the grace.
         assert_eq!(cleanup_pending(c, None, &cells(), NOW).unwrap().items.len(), 1);
-        // A second abandon is a no-op.
-        assert!(!Tenant::abandon_upload_inner(c, "t1", &lease.pending_cleanup_id, None).unwrap());
+        // A second abandon leaves the already queued row alone.
+        assert_eq!(abandon(c), Abandoned::LeftAlone);
+        assert_eq!(cleanup_pending(c, None, &cells(), NOW).unwrap().items.len(), 1);
     }
 
     #[test]

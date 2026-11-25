@@ -311,6 +311,7 @@ table! {
         updated_at -> Timestamp,
         deleted_at -> Nullable<Timestamp>,
         erased_at -> Nullable<Timestamp>,
+        storage_prepared_at -> Nullable<BigInt>,
     }
 }
 

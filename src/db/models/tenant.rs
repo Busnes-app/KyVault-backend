@@ -70,6 +70,7 @@ pub struct Tenant {
     pub updated_at: NaiveDateTime,
     pub deleted_at: Option<NaiveDateTime>,
     pub erased_at: Option<NaiveDateTime>,
+    pub storage_prepared_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Identifiable, Queryable, Insertable)]
@@ -148,6 +149,7 @@ impl Tenant {
             updated_at: now,
             deleted_at: None,
             erased_at: None,
+            storage_prepared_at: None,
         }
     }
 
@@ -653,53 +655,92 @@ impl Tenant {
         .await
     }
 
-    /// Abandons a failed upload, but only while it still owns its in-flight cleanup row: returns
-    /// the row's reservation, hands the object to the cleanup worker, and deletes `v2_att`'s row.
-    /// Once the worker has taken the row over, a retry may own the object key and attachment row,
-    /// so nothing is touched. Returns whether the upload was still the owner.
+    /// Abandons a failed upload. While it still owns its in-flight cleanup row, it returns the
+    /// reservation, hands the object to the cleanup worker and deletes the v2 row. If the worker
+    /// already reclaimed that row after the grace, the late write may have landed after the worker's
+    /// delete, so the object is queued again, unless a live attachment row or another in-flight
+    /// upload owns its key.
     pub fn abandon_upload_inner(
         conn: &mut DbConnInner,
         tid: &str,
         pending_id: &str,
-        v2_att: Option<&Attachment>,
-    ) -> QueryResult<bool> {
-        conn.transaction(|conn| {
-            lock_tenant(conn, tid)?;
-            let owned = diesel::update(
-                tenant_pending_deletions::table
-                    .filter(tenant_pending_deletions::id.eq(pending_id))
-                    .filter(tenant_pending_deletions::tenant_id.eq(tid))
-                    .filter(
+        att: &Attachment,
+        v2: bool,
+        now_ts: i64,
+    ) -> Result<Abandoned, crate::Error> {
+        conn.transaction::<Abandoned, crate::Error, _>(|conn| {
+            let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
+                return Ok(Abandoned::LeftAlone);
+            };
+            let pending = || tenant_pending_deletions::table.filter(tenant_pending_deletions::tenant_id.eq(tid));
+            let released: usize =
+                diesel::update(pending().filter(tenant_pending_deletions::id.eq(pending_id)).filter(
+                    tenant_pending_deletions::last_error.eq(Some(crate::tenancy::ops::UPLOAD_IN_FLIGHT_MARKER)),
+                ))
+                .set(tenant_pending_deletions::last_error.eq(None::<String>))
+                .execute(conn)
+                .map_res("Error releasing upload row")?;
+            let owned = released > 0;
+            let att_row = || {
+                attachments::table
+                    .filter(attachments::id.eq(&att.id))
+                    .filter(attachments::cipher_uuid.eq(&att.cipher_uuid))
+                    .filter(attachments::tenant_id.eq(tid))
+            };
+            if owned {
+                release_pending_reservations(conn, &[pending_id]).map_res("Error releasing reservation")?;
+                if v2 {
+                    diesel::delete(att_row()).execute(conn).map(drop).map_res("Error deleting attachment")?;
+                }
+                return Ok(Abandoned::Owned);
+            }
+
+            let key = att.get_file_path_in_cell(Some(&tenant.home_region))?;
+            let claimed: bool = diesel::select(
+                diesel::dsl::exists(pending().filter(tenant_pending_deletions::id.eq(pending_id)))
+                    .or(diesel::dsl::exists(att_row()))
+                    .or(diesel::dsl::exists(pending().filter(tenant_pending_deletions::object_key.eq(&key)).filter(
                         tenant_pending_deletions::last_error.eq(Some(crate::tenancy::ops::UPLOAD_IN_FLIGHT_MARKER)),
-                    ),
+                    ))),
             )
-            .set(tenant_pending_deletions::last_error.eq(None::<String>))
-            .execute(conn)?
-                > 0;
-            if !owned {
-                return Ok(false);
+            .get_result(conn)
+            .map_res("Error checking upload ownership")?;
+            if claimed {
+                return Ok(Abandoned::LeftAlone);
             }
-            release_pending_reservations(conn, &[pending_id])?;
-            if let Some(att) = v2_att {
-                diesel::delete(
-                    attachments::table
-                        .filter(attachments::id.eq(&att.id))
-                        .filter(attachments::cipher_uuid.eq(&att.cipher_uuid))
-                        .filter(attachments::tenant_id.eq(tid)),
-                )
-                .execute(conn)?;
-            }
-            Ok(true)
+            let row = TenantPendingDeletion {
+                id: get_uuid(),
+                tenant_id: tid.to_owned(),
+                user_uuid: None,
+                storage_kind: "attachment".to_owned(),
+                object_key: key,
+                attempts: 0,
+                last_error: None,
+                reserved_bytes: 0,
+                created_at: naive_ts(now_ts),
+            };
+            diesel::insert_into(tenant_pending_deletions::table)
+                .values(&row)
+                .execute(conn)
+                .map(drop)
+                .map_res("Error queuing attachment cleanup")?;
+            Ok(Abandoned::Requeued)
         })
     }
 
     /// Abandons a failed hosted upload; see [`Self::abandon_upload_inner`].
-    pub async fn abandon_upload(tenant_id: &str, pending_id: &str, v2_att: Option<&Attachment>, conn: &DbConn) {
+    pub async fn abandon_upload(tenant_id: &str, pending_id: &str, att: &Attachment, v2: bool, conn: &DbConn) {
         let tid = tenant_id.to_owned();
         let pid = pending_id.to_owned();
-        match conn.run(move |conn| Self::abandon_upload_inner(conn, &tid, &pid, v2_att)).await {
-            Ok(true) => {}
-            Ok(false) => warn!("Upload {pending_id} was already handed to cleanup; leaving its object alone"),
+        let res = conn.run(move |conn| Self::abandon_upload_inner(conn, &tid, &pid, att, v2, Utc::now().timestamp()));
+        match res.await {
+            Ok(Abandoned::Owned) => {}
+            Ok(Abandoned::Requeued) => {
+                warn!("Upload {pending_id} finished after cleanup reclaimed it; object queued again");
+            }
+            Ok(Abandoned::LeftAlone) => {
+                warn!("Upload {pending_id} was already handed to cleanup; leaving its object alone");
+            }
             Err(e) => error!("Failed to abandon upload {pending_id}: {e}"),
         }
     }
@@ -893,6 +934,17 @@ fn sum_to_i64(sum: Option<BigDecimal>) -> i64 {
         Some(None) => i64::MAX,
         None => 0,
     }
+}
+
+/// What abandoning a failed upload did with its object.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Abandoned {
+    /// The upload still owned its cleanup row and handed it to the worker.
+    Owned,
+    /// The worker had reclaimed the row; the object was queued again.
+    Requeued,
+    /// Someone else owns the object or will delete it.
+    LeftAlone,
 }
 
 pub fn is_postgresql(conn: &DbConnInner) -> bool {

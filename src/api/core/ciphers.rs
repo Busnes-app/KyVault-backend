@@ -1518,8 +1518,12 @@ async fn save_attachment(
     let (upload_epoch, held, pending_cleanup_id) =
         lease.map_or((None, 0, None), |l| (Some(l.access_epoch), l.reserved_bytes, Some(l.pending_cleanup_id)));
 
+    let Some(uploaded) = created_attachment.as_ref().or(attachment.as_ref()) else {
+        unreachable!("either created_attachment or attachment is always Some")
+    };
+    let is_v2 = attachment.is_some();
     if let Err(e) = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await {
-        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), attachment.as_ref(), &headers.user, &conn).await;
+        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), uploaded, is_v2, &headers.user, &conn).await;
         return Err(e);
     }
 
@@ -1551,7 +1555,7 @@ async fn save_attachment(
     };
 
     if let Err(e) = finalize_res {
-        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), attachment.as_ref(), &headers.user, &conn).await;
+        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), uploaded, is_v2, &headers.user, &conn).await;
         return Err(e);
     }
 
@@ -1563,23 +1567,23 @@ async fn save_attachment(
     Ok((cipher, conn))
 }
 
-/// Undoes a failed upload. Hosted uploads hand the object to the cleanup worker, and only while
-/// they still own their cleanup row: past that, a retry may own the same key and attachment row.
+/// Undoes a failed upload. Hosted uploads hand the object to the cleanup worker.
 async fn abandon_upload(
     storage_path: &str,
     pending_cleanup_id: Option<&str>,
-    v2_attachment: Option<&Attachment>,
+    att: &Attachment,
+    is_v2: bool,
     user: &User,
     conn: &DbConn,
 ) {
     if let Some(pid) = pending_cleanup_id {
-        crate::tenancy::abandon_upload(user, pid, v2_attachment, conn).await;
+        crate::tenancy::abandon_upload(user, pid, att, is_v2, conn).await;
         return;
     }
     if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
         operator.delete(storage_path).await.ok();
     }
-    if let Some(att) = v2_attachment {
+    if is_v2 {
         att.delete(conn).await.ok();
     }
 }

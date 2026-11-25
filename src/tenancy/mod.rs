@@ -237,9 +237,9 @@ pub async fn put_attachment(user: &User, att: &Attachment, conn: &DbConn) -> Emp
 
 /// Abandons a failed hosted upload if it still owns its cleanup row; the cleanup worker deletes
 /// the object. A no-op once the worker has taken the upload over.
-pub async fn abandon_upload(user: &User, pending_id: &str, v2_att: Option<&Attachment>, conn: &DbConn) {
+pub async fn abandon_upload(user: &User, pending_id: &str, att: &Attachment, v2: bool, conn: &DbConn) {
     if let Ok(tid) = require_user_tenant(user) {
-        Tenant::abandon_upload(tid, pending_id, v2_att, conn).await;
+        Tenant::abandon_upload(tid, pending_id, att, v2, conn).await;
     }
 }
 
