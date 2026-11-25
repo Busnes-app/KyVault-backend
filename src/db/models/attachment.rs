@@ -91,10 +91,17 @@ impl Attachment {
     /// Resolves the attachment's object key by looking up its tenant's immutable cell slug when
     /// `tenant_id` is set, or returning the single-tenant relative key otherwise.
     pub async fn resolve_file_path(&self, conn: &DbConn) -> Result<String, crate::Error> {
+        // A tenant's home_region never changes (C4), so one lookup per tenant serves every sync.
+        static CELLS: std::sync::LazyLock<dashmap::DashMap<String, String>> =
+            std::sync::LazyLock::new(dashmap::DashMap::new);
         if let Some(ref tid) = self.tenant_id {
+            if let Some(cell) = CELLS.get(tid) {
+                return self.get_file_path_in_cell(Some(&cell));
+            }
             let Some(tenant) = super::Tenant::find_by_id(tid, conn).await else {
                 err_code!("Tenant not found for attachment path", 403);
             };
+            CELLS.insert(tid.clone(), tenant.home_region.clone());
             self.get_file_path_in_cell(Some(&tenant.home_region))
         } else {
             self.get_file_path_in_cell(None)

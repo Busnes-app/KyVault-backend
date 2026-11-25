@@ -2837,6 +2837,12 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].uuid, k2.uuid);
         assert_eq!(remaining[0].revoked_at, None);
+
+        // Revoking flags the usage drop, so a suspended tenant still reports it.
+        exec(c, "UPDATE tenants SET status = 'suspended', storage_dirty = FALSE WHERE id = 't1'");
+        TenantRecoveryBundle::revoke_personal_kit_inner(c, "t1", &UserId::from("u1".to_owned())).unwrap();
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 0);
+        assert!(tenant(c, "t1").storage_dirty);
     }
 
     #[test]

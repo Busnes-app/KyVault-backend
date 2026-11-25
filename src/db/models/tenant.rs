@@ -1473,11 +1473,11 @@ impl TenantRecoveryBundle {
         .await
     }
 
-    /// Deletes the user's personal recovery kit rows so revoked ciphertext is not retained.
-    pub async fn revoke_personal_kit(tenant_id: &str, user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
-        let tid = tenant_id.to_owned();
-        let uid = user_uuid.clone();
-        conn.run(move |conn| {
+    /// Deletes the user's personal recovery kit rows so revoked ciphertext is not retained, and
+    /// flags the usage drop under the tenant row lock so even a suspended tenant reports it.
+    pub fn revoke_personal_kit_inner(conn: &mut DbConnInner, tid: &str, uid: &UserId) -> EmptyResult {
+        conn.transaction(|conn| {
+            mark_storage_dirty(conn, tid)?;
             diesel::delete(
                 tenant_recovery_bundles::table
                     .filter(tenant_recovery_bundles::tenant_id.eq(tid))
@@ -1485,8 +1485,14 @@ impl TenantRecoveryBundle {
                     .filter(tenant_recovery_bundles::bundle_type.eq(RECOVERY_BUNDLE_KIT)),
             )
             .execute(conn)
-            .map_res("Error revoking recovery bundle")
+            .map(drop)
         })
-        .await
+        .map_res("Error revoking recovery bundle")
+    }
+
+    pub async fn revoke_personal_kit(tenant_id: &str, user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
+        let tid = tenant_id.to_owned();
+        let uid = user_uuid.clone();
+        conn.run(move |conn| Self::revoke_personal_kit_inner(conn, &tid, &uid)).await
     }
 }
