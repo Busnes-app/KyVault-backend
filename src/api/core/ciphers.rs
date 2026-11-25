@@ -553,10 +553,8 @@ pub async fn update_cipher_from_data(
     cipher.password_history = data.password_history.map(|f| f.to_string());
     cipher.reprompt = data.reprompt.filter(|r| *r == RepromptType::None as i32 || *r == RepromptType::Password as i32);
 
-    cipher.save(conn).await?;
-
-    // Modify attachments name and keys when rotating (after cipher.save succeeds so a rejected
-    // storage grant leaves all stored records untouched).
+    // Attachment names and keys change with the cipher key when rotating, so they are saved with it.
+    let mut rotated = Vec::new();
     if let Some(attachments) = data.attachments2 {
         for (id, attachment) in attachments {
             let Some(mut saved_att) = Attachment::find_by_id(&id, conn).await else {
@@ -577,10 +575,10 @@ pub async fn update_cipher_from_data(
 
             saved_att.akey = Some(attachment.key);
             saved_att.file_name = attachment.file_name;
-
-            crate::tenancy::put_attachment(&headers.user, &saved_att, conn).await?;
+            rotated.push(saved_att);
         }
     }
+    cipher.save_with_attachments(&rotated, conn).await?;
 
     cipher.move_to_folder(data.folder_id, &headers.user.uuid, conn).await?;
     cipher.set_favorite(data.favorite, &headers.user.uuid, conn).await?;

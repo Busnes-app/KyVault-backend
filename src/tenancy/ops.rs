@@ -1066,6 +1066,7 @@ pub fn cleanup_complete(
             .distinct()
             .load(conn)?;
         affected.sort();
+        drop_abandoned_v2_rows(conn, &all_ids)?;
         let completed: Vec<&str> = req.completed_ids.iter().map(String::as_str).collect();
         release_pending_reservations(conn, &completed)?;
         resp.deleted = diesel::delete(
@@ -1098,6 +1099,40 @@ pub fn cleanup_complete(
         }
         Ok(resp)
     })
+}
+
+/// A cleanup row the worker reports while it still carries the in-flight marker belongs to an
+/// upload that crashed: the worker deletes its object, so its v2 attachment row goes too. No newer
+/// upload can own that row, since none can start while the cleanup row exists.
+fn drop_abandoned_v2_rows(conn: &mut DbConnInner, ids: &[&str]) -> QueryResult<()> {
+    let rows: Vec<(String, String)> = tenant_pending_deletions::table
+        .filter(tenant_pending_deletions::id.eq_any(ids))
+        .filter(tenant_pending_deletions::storage_kind.eq("attachment"))
+        .filter(tenant_pending_deletions::last_error.eq(UPLOAD_IN_FLIGHT_MARKER))
+        .order(tenant_pending_deletions::tenant_id.asc())
+        .select((tenant_pending_deletions::tenant_id, tenant_pending_deletions::object_key))
+        .load(conn)?;
+    for (tid, key) in rows {
+        let mut parts = key.rsplitn(3, '/');
+        let (Some(aid), Some(cid)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        // Tenant first, as the upload paths lock it before touching attachment rows.
+        let Some(t) = lock_tenant(conn, &tid)? else {
+            continue;
+        };
+        if attachment_object_key(&t.home_region, &tid, cid, aid) != key {
+            continue;
+        }
+        diesel::delete(
+            attachments::table
+                .filter(attachments::id.eq(aid))
+                .filter(attachments::cipher_uuid.eq(cid))
+                .filter(attachments::tenant_id.eq(&tid)),
+        )
+        .execute(conn)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2611,7 +2646,7 @@ mod tests {
             .set((tenants::storage_ceiling_bytes.eq(1000), tenants::storage_grant_expires_at.eq(Some(NOW - 1))))
             .execute(c)
             .unwrap();
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, &served, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, &[], 900, &served, 10, NOW).is_err());
         assert_eq!(ciphers::table.filter(ciphers::tenant_id.eq("t1")).count().get_result::<i64>(c).unwrap(), 0);
         assert_eq!(committed_bytes(c, "t1").unwrap(), 0);
 
@@ -2620,25 +2655,25 @@ mod tests {
             .set((tenants::storage_ceiling_bytes.eq(10), tenants::storage_grant_expires_at.eq(Some(NOW + 300))))
             .execute(c)
             .unwrap();
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, &served, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, &[], 900, &served, 10, NOW).is_err());
         assert_eq!(ciphers::table.filter(ciphers::tenant_id.eq("t1")).count().get_result::<i64>(c).unwrap(), 0);
 
         // 3. Sufficient active grant allows creating the cipher and counts all encrypted fields.
         diesel::update(tenants::table.find("t1")).set(tenants::storage_ceiling_bytes.eq(20)).execute(c).unwrap();
-        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, 900, &served, 10, NOW).unwrap();
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &item, &[], 900, &served, 10, NOW).unwrap();
         assert_eq!(committed_bytes(c, "t1").unwrap(), 14);
 
         // 4. Exhausted grant rejects enlarging data or notes without modifying stored data.
         let mut enlarged = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         enlarged.data = "01234567890123456789".to_owned(); // 4 + 20 = 24 > ceiling 20
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &enlarged, 900, &served, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &enlarged, &[], 900, &served, 10, NOW).is_err());
         let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         assert_eq!(stored.data, "0123456789");
         assert_eq!(committed_bytes(c, "t1").unwrap(), 14);
 
         let mut big_notes = stored;
         big_notes.notes = Some("1234567".to_owned()); // 14 + 7 = 21 > ceiling 20
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &big_notes, 900, &served, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &big_notes, &[], 900, &served, 10, NOW).is_err());
         let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         assert_eq!(stored.notes, None);
 
@@ -2649,7 +2684,7 @@ mod tests {
             .unwrap();
         let mut small_grow = stored;
         small_grow.data = "0123456789X".to_owned(); // +1 byte
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &small_grow, 900, &served, 10, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &small_grow, &[], 900, &served, 10, NOW).is_err());
         let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         assert_eq!(stored.data, "0123456789");
 
@@ -2657,7 +2692,7 @@ mod tests {
         let mut shrunk = stored;
         shrunk.data = "01234".to_owned();
         shrunk.deleted_at = Some(naive(NOW));
-        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &shrunk, 900, &served, 10, NOW).unwrap();
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &shrunk, &[], 900, &served, 10, NOW).unwrap();
         let stored = ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap();
         assert_eq!(stored.data, "01234");
         assert!(stored.deleted_at.is_some());
@@ -2672,12 +2707,12 @@ mod tests {
         second.user_uuid = Some(UserId::from("u1".to_owned()));
         second.tenant_id = Some("t1".to_owned());
         second.data = "abc".to_owned();
-        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &second, 900, &served, 1, NOW).unwrap();
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &second, &[], 900, &served, 1, NOW).unwrap();
 
         // Restoring the trashed first cipher would exceed max_ciphers = 1 -> rejected without mutating it.
         let mut restore = stored;
         restore.deleted_at = None;
-        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &restore, 900, &served, 1, NOW).is_err());
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &restore, &[], 900, &served, 1, NOW).is_err());
         assert!(ciphers::table.find(&item.uuid).first::<Cipher>(c).unwrap().deleted_at.is_some());
     }
 
@@ -3041,16 +3076,16 @@ mod tests {
         assert!(fin(c, &slow, late).is_err());
         assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 100);
 
-        // Once the worker reports the delete, uploads resume and commit normally.
+        // Once the worker reports the delete, the crashed upload's attachment row goes with its
+        // object, so the key is never reused: a retry needs a new attachment.
         let done = CompleteRequest {
             completed_ids: vec![slow.pending_cleanup_id],
             failed: vec![],
         };
         cleanup_complete(c, &done, &cells(), late).unwrap();
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
-        let retry = begin(c, "att", 1_100).unwrap();
-        fin(c, &retry, NOW).unwrap();
-        assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 1_100);
+        assert_eq!(attachments::table.find("att").count().get_result::<i64>(c).unwrap(), 0);
+        assert!(begin(c, "att", 1_100).is_err());
     }
 
     fn put(c: &mut DbConnInner, att: &Attachment) -> Result<(), Error> {
@@ -3171,38 +3206,76 @@ mod tests {
     }
 
     #[test]
-    fn late_failing_upload_leaves_a_retry_alone() {
+    fn crashed_v2_upload_loses_its_row_when_cleanup_reports() {
         let c = &mut test_sqlite_conn();
-        v2_setup(c, &["att"], 5_000);
+        v2_setup(c, &["done", "failed"], 5_000);
+        let before = committed_bytes(c, "t1").unwrap();
         let late = NOW + UPLOAD_STAGING_GRACE_SECS + 1;
 
-        // The slow upload outlives its grace; the worker deletes its object and reports done.
-        let slow = begin(c, "att", 1_100).unwrap();
-        let done = CompleteRequest {
-            completed_ids: vec![cleanup_pending(c, None, &cells(), late).unwrap().items[0].id.clone()],
-            failed: vec![],
+        // Both uploads crash after admission; the worker reclaims them after the grace.
+        let done = begin(c, "done", 1_100).unwrap();
+        let failed = begin(c, "failed", 1_100).unwrap();
+        assert_eq!(cleanup_pending(c, None, &cells(), late).unwrap().items.len(), 2);
+        let report = CompleteRequest {
+            completed_ids: vec![done.pending_cleanup_id.clone()],
+            failed: vec![FailedItem {
+                id: failed.pending_cleanup_id.clone(),
+                error: "storage unavailable".to_owned(),
+            }],
         };
-        cleanup_complete(c, &done, &cells(), late).unwrap();
+        cleanup_complete(c, &report, &cells(), late).unwrap();
 
-        // A retry uploads and commits to the same key and row.
-        let retry = begin(c, "att", 1_100).unwrap();
-        Tenant::finalize_v2_attachment_upload_inner(
-            c,
-            "t1",
-            &v2_att("att"),
-            1_100,
-            retry.reserved_bytes,
-            Some(retry.access_epoch),
-            Some(&retry.pending_cleanup_id),
-            NOW,
-        )
-        .unwrap();
+        // Neither row advertises a file that is gone, nor keeps counting its declared payload.
+        assert_eq!(attachments::table.count().get_result::<i64>(c).unwrap(), 0);
+        assert_eq!(committed_bytes(c, "t1").unwrap(), before - 2 * 101);
+        // The failed delete is retried, but no row is left for it to reconcile.
+        assert_eq!(cleanup_pending(c, None, &cells(), late).unwrap().items.len(), 1);
 
-        // The slow upload now fails: it no longer owns anything and must not touch the retry.
-        assert!(!Tenant::abandon_upload_inner(c, "t1", &slow.pending_cleanup_id, Some(&v2_att("att"))).unwrap());
-        assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 1_100);
-        assert!(cleanup_pending(c, None, &cells(), late).unwrap().items.is_empty());
-        assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
+        // The late uploads can no longer commit or touch anything.
+        assert!(!Tenant::abandon_upload_inner(c, "t1", &done.pending_cleanup_id, Some(&v2_att("done"))).unwrap());
+        assert!(begin(c, "done", 1_100).is_err());
+    }
+
+    #[test]
+    fn rotation_saves_cipher_and_attachment_keys_together() {
+        use crate::db::models::Cipher;
+
+        let c = &mut test_sqlite_conn();
+        v2_setup(c, &["att"], 1);
+        let stored = |c: &mut DbConnInner| {
+            let k: Option<String> = ciphers::table.find("c1").select(ciphers::key).first(c).unwrap();
+            let a: Option<String> = attachments::table.find("att").select(attachments::akey).first(c).unwrap();
+            (k, a)
+        };
+        let before = stored(c);
+
+        let mut rotated = ciphers::table.find("c1").first::<Cipher>(c).unwrap();
+        rotated.key = Some("k".to_owned()); // 1 byte: fits the headroom alone
+        let mut att = v2_att("att");
+        att.akey = Some("new-attachment-key".to_owned());
+
+        // The attachment key's growth exceeds the grant, so neither the cipher nor the key changes.
+        assert!(Tenant::save_cipher_enforcing_grant_inner(c, "t1", &rotated, &[att], 900, &cells(), 10, NOW).is_err());
+        assert_eq!(stored(c), before);
+
+        // With room, both land together and the payload size is untouched.
+        diesel::update(tenants::table.find("t1"))
+            .set(tenants::storage_ceiling_bytes.eq(i64::MAX / 2))
+            .execute(c)
+            .unwrap();
+        let mut att = v2_att("att");
+        att.akey = Some("new-attachment-key".to_owned());
+        att.file_size = 999_999;
+        Tenant::save_cipher_enforcing_grant_inner(c, "t1", &rotated, &[att], 900, &cells(), 10, NOW).unwrap();
+        assert_eq!(stored(c), (Some("k".to_owned()), Some("new-attachment-key".to_owned())));
+        assert_eq!(attachments::table.find("att").select(attachments::file_size).first::<i64>(c).unwrap(), 100);
+
+        // An attachment of another cipher is refused.
+        let mut foreign = v2_att("att");
+        foreign.cipher_uuid = CipherId::from("c2".to_owned());
+        assert!(
+            Tenant::save_cipher_enforcing_grant_inner(c, "t1", &rotated, &[foreign], 900, &cells(), 10, NOW).is_err()
+        );
     }
 
     #[test]

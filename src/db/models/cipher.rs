@@ -453,6 +453,12 @@ impl Cipher {
     }
 
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
+        self.save_with_attachments(&[], conn).await
+    }
+
+    /// Saves the cipher and the file name and key changes of its `attachments` (key rotation).
+    /// Hosted mode writes both in one transaction under one storage-grant check.
+    pub async fn save_with_attachments(&mut self, attachments: &[Attachment], conn: &DbConn) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
 
         if CONFIG.is_multi_tenant() {
@@ -463,6 +469,7 @@ impl Cipher {
             super::Tenant::save_cipher_enforcing_grant(
                 tenant_id,
                 self,
+                attachments,
                 CONFIG.tenancy_authority_max_age_secs(),
                 &served_cells,
                 CONFIG.tenancy_max_ciphers_per_tenant(),
@@ -475,6 +482,14 @@ impl Cipher {
 
         self.update_users_revision(conn).await;
 
+        self.upsert(conn).await?;
+        for att in attachments {
+            att.save(conn).await?;
+        }
+        Ok(())
+    }
+
+    async fn upsert(&self, conn: &DbConn) -> EmptyResult {
         db_run! { conn:
             mysql {
                 diesel::insert_into(ciphers::table)

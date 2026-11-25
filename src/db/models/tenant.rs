@@ -611,55 +611,19 @@ impl Tenant {
         served_cells: &[String],
         now_ts: i64,
     ) -> EmptyResult {
-        if att.tenant_id.as_deref() != Some(tid) {
-            err_code!("Cross-tenant attachment write denied", 403);
-        }
-        if att.file_size < 0 {
-            err_code!("Attachment size can't be negative", 400);
-        }
-        att.check_metadata_limits()?;
         conn.transaction::<(), crate::Error, _>(|conn| {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
                 err_code!("Tenant not found", 403);
             };
             validate_tenant_growth_tx(&tenant, served_cells, now_ts, max_authority_age_secs)?;
-
-            let existing: Option<Attachment> = attachments::table
-                .find(&att.id)
-                .first::<Attachment>(conn)
-                .optional()
-                .map_res("Error loading attachment")?;
-            if let Some(ref old) = existing
-                && (old.tenant_id.as_deref() != Some(tid) || old.cipher_uuid != att.cipher_uuid)
-            {
-                err_code!("Cross-tenant attachment write denied", 403);
-            }
-
-            let growth = match existing {
-                Some(ref old) => att.metadata_bytes().saturating_sub(old.metadata_bytes()),
-                None => att.file_size.saturating_add(att.metadata_bytes()),
-            };
+            let (growth, exists) = attachment_growth_tx(conn, tid, att)?;
             if growth > 0 {
                 let committed = committed_bytes(conn, tid).map_res("Error checking tenant storage")?;
                 if !tenant.can_grow_storage(committed, growth, now_ts) {
                     err_code!("Organization storage quota exceeded or grant expired", 403);
                 }
             }
-
-            if existing.is_some() {
-                // Only the metadata: file_size belongs to the upload path.
-                diesel::update(attachments::table.find(&att.id))
-                    .set((attachments::file_name.eq(&att.file_name), attachments::akey.eq(&att.akey)))
-                    .execute(conn)
-                    .map(drop)
-                    .map_res("Error saving attachment")
-            } else {
-                diesel::insert_into(attachments::table)
-                    .values(att)
-                    .execute(conn)
-                    .map(drop)
-                    .map_res("Error saving attachment")
-            }
+            write_attachment_tx(conn, att, exists)
         })
     }
 
@@ -790,12 +754,15 @@ impl Tenant {
 
     /// Transactionally locks the tenant, validates active status/region/authority freshness,
     /// enforces active cipher count quota on create/restore, checks positive byte deltas against
-    /// the tenant's active storage growth grant, and persists `cipher`. Rejects growth without
+    /// the tenant's active storage growth grant, and persists `cipher` together with the file name
+    /// and key changes in `attachments` (key rotation), so a rotation lands whole or not at all. Rejects growth without
     /// modifying stored data if the grant is expired or exhausted.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_cipher_enforcing_grant_inner(
         conn: &mut DbConnInner,
         tid: &str,
         cipher: &Cipher,
+        attachments: &[Attachment],
         max_authority_age_secs: i64,
         served_cells: &[String],
         default_max_ciphers: i64,
@@ -839,7 +806,16 @@ impl Tenant {
             }
 
             let old_bytes = existing.as_ref().map_or(0, Cipher::storage_bytes);
-            let delta_bytes = cipher.storage_bytes().saturating_sub(old_bytes);
+            let mut delta_bytes = cipher.storage_bytes().saturating_sub(old_bytes);
+            let mut att_exists = Vec::with_capacity(attachments.len());
+            for att in attachments {
+                if att.cipher_uuid != cipher.uuid {
+                    err_code!("Attachment is not owned by the cipher", 400);
+                }
+                let (growth, exists) = attachment_growth_tx(conn, tid, att)?;
+                delta_bytes = delta_bytes.saturating_add(growth);
+                att_exists.push(exists);
+            }
             if delta_bytes > 0 {
                 let committed = committed_bytes(conn, tid).map_res("Error checking tenant storage")?;
                 if !tenant.can_grow_storage(committed, delta_bytes, now_ts) {
@@ -872,6 +848,9 @@ impl Tenant {
             }
             .map(|_| ())
             .map_res("Error saving cipher")?;
+            for (att, exists) in attachments.iter().zip(att_exists) {
+                write_attachment_tx(conn, att, exists)?;
+            }
             Ok(())
         })
     }
@@ -881,6 +860,7 @@ impl Tenant {
     pub async fn save_cipher_enforcing_grant(
         tenant_id: &str,
         cipher: &Cipher,
+        attachments: &[Attachment],
         max_authority_age_secs: i64,
         served_cells: &[String],
         default_max_ciphers: i64,
@@ -896,6 +876,7 @@ impl Tenant {
                 conn,
                 &tid,
                 cipher,
+                attachments,
                 max_authority_age_secs,
                 &cells,
                 default_max_ciphers,
@@ -944,6 +925,40 @@ fn take_upload_row(conn: &mut DbConnInner, tid: &str, pid: &str, now_ts: i64) ->
         err_code!("Upload took too long and was handed to cleanup; retry it", 409);
     }
     Ok(())
+}
+
+/// Validates an attachment write and returns its byte growth and whether the row exists: the
+/// new row's payload plus metadata, or an existing row's metadata delta. Call under the tenant lock.
+fn attachment_growth_tx(conn: &mut DbConnInner, tid: &str, att: &Attachment) -> Result<(i64, bool), crate::Error> {
+    if att.tenant_id.as_deref() != Some(tid) {
+        err_code!("Cross-tenant attachment write denied", 403);
+    }
+    if att.file_size < 0 {
+        err_code!("Attachment size can't be negative", 400);
+    }
+    att.check_metadata_limits()?;
+    let existing: Option<Attachment> =
+        attachments::table.find(&att.id).first::<Attachment>(conn).optional().map_res("Error loading attachment")?;
+    match existing {
+        Some(old) if old.tenant_id.as_deref() != Some(tid) || old.cipher_uuid != att.cipher_uuid => {
+            err_code!("Cross-tenant attachment write denied", 403);
+        }
+        Some(old) => Ok((att.metadata_bytes().saturating_sub(old.metadata_bytes()), true)),
+        None => Ok((att.file_size.saturating_add(att.metadata_bytes()), false)),
+    }
+}
+
+/// Inserts `att`, or updates only its file name and key: file_size belongs to the upload path.
+fn write_attachment_tx(conn: &mut DbConnInner, att: &Attachment, exists: bool) -> EmptyResult {
+    if exists {
+        diesel::update(attachments::table.find(&att.id))
+            .set((attachments::file_name.eq(&att.file_name), attachments::akey.eq(&att.akey)))
+            .execute(conn)
+            .map(drop)
+            .map_res("Error saving attachment")
+    } else {
+        diesel::insert_into(attachments::table).values(att).execute(conn).map(drop).map_res("Error saving attachment")
+    }
 }
 
 fn naive_ts(now_ts: i64) -> NaiveDateTime {
