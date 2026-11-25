@@ -1204,10 +1204,25 @@ pub fn storage_prepare(
 
     // Least recently reported first, so a capped batch rotates through every tenant even while
     // some reports keep failing upstream; then soonest-expiring (or missing) grants.
+    // Only tenants with something to report, mirroring `needs` below, and only one batch of them.
     let ids: Vec<String> = tenants::table
         .filter(tenants::status.ne_all(TOMBSTONED))
         .filter(tenants::storage_seq_stale.eq(false))
         .filter(tenants::home_region.eq_any(served_cells))
+        .filter(
+            tenants::storage_pending_seq
+                .is_not_null()
+                .and(tenants::storage_pending_used_bytes.is_not_null())
+                .or(tenants::app_enabled
+                    .eq(true)
+                    .and(tenants::status.eq(TENANT_STATUS_ACTIVE))
+                    .and(tenants::deleted_at.is_null())
+                    .and(tenants::erased_at.is_null())
+                    .and(tenants::authority_refreshed_at.is_not_null()))
+                .or(tenants::storage_ceiling_bytes.gt(0))
+                .or(tenants::storage_grant_expires_at.is_not_null())
+                .or(tenants::storage_last_applied_seq.eq(0)),
+        )
         .order((
             tenants::storage_prepared_at.is_not_null().asc(),
             tenants::storage_prepared_at.asc(),
@@ -1215,6 +1230,7 @@ pub fn storage_prepare(
             tenants::storage_grant_expires_at.asc(),
             tenants::id.asc(),
         ))
+        .limit(i64::try_from(limit).unwrap_or(i64::MAX))
         .select(tenants::id)
         .load(conn)?;
 

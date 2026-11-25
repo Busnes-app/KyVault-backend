@@ -147,7 +147,8 @@ struct ListenerTls {
 
 /// Rewrites a libpq URL into one `tokio_postgres` parses: it accepts only `disable`, `prefer` and
 /// `require` and no `sslrootcert`, so `verify-ca` and `verify-full` become `require` and their
-/// certificate and hostname checks move into the returned TLS settings.
+/// certificate and hostname checks move into the returned TLS settings. Only `disable` goes
+/// without a TLS connector, so `prefer` (the default) can still negotiate TLS.
 #[cfg(postgresql)]
 fn listener_url(db_url: &str) -> Result<(String, Option<ListenerTls>), String> {
     let mut url = url::Url::parse(db_url).map_err(|e| format!("invalid DATABASE_URL: {e}"))?;
@@ -167,10 +168,16 @@ fn listener_url(db_url: &str) -> Result<(String, Option<ListenerTls>), String> {
         })
         .collect();
     let (wire_mode, tls) = match mode.as_deref() {
-        None => (None, None),
         Some("disable") => (Some("disable"), None),
-        // The listener connects without TLS here, as these modes allow.
-        Some("allow" | "prefer") => (Some("prefer"), None),
+        // libpq's default: try TLS, fall back to plain, verify nothing unless given a root certificate.
+        None | Some("allow" | "prefer") => (
+            Some("prefer"),
+            Some(ListenerTls {
+                verify_ca: root_cert.is_some(),
+                verify_host: false,
+                root_cert,
+            }),
+        ),
         Some("require") => (
             Some("require"),
             Some(ListenerTls {
@@ -367,8 +374,11 @@ mod tests {
         assert_eq!(tls.map(|t| (t.verify_ca, t.verify_host)), Some((true, false)));
         let (_, tls) = check("postgresql://u:p@db/v?sslmode=require");
         assert_eq!(tls.map(|t| t.verify_ca), Some(false));
-        assert_eq!(check("postgresql://u:p@db/v"), ("postgresql://u:p@db/v".to_owned(), None));
-        assert!(check("postgresql://u:p@db/v?sslmode=allow").1.is_none());
+        let (out, tls) = check("postgresql://u:p@db/v");
+        assert_eq!(out, "postgresql://u:p@db/v?sslmode=prefer");
+        assert_eq!(tls.map(|t| (t.verify_ca, t.verify_host)), Some((false, false)), "default still negotiates TLS");
+        assert!(check("postgresql://u:p@db/v?sslmode=allow").1.is_some());
+        assert_eq!(check("postgresql://u:p@db/v?sslmode=disable").1, None);
         assert!(listener_url("postgresql://u:p@db/v?sslmode=bogus").is_err());
     }
 }
