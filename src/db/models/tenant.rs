@@ -71,6 +71,7 @@ pub struct Tenant {
     pub deleted_at: Option<NaiveDateTime>,
     pub erased_at: Option<NaiveDateTime>,
     pub storage_prepared_at: Option<i64>,
+    pub storage_dirty: bool,
 }
 
 #[derive(Clone, Debug, Identifiable, Queryable, Insertable)]
@@ -150,6 +151,7 @@ impl Tenant {
             deleted_at: None,
             erased_at: None,
             storage_prepared_at: None,
+            storage_dirty: false,
         }
     }
 

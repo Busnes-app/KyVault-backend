@@ -633,6 +633,8 @@ pub fn erase_user(
         if let Some((uid, _)) = &found {
             queued = erase_personal_data(conn, uid, &tenant.home_region, user_tid.as_deref(), &stone_tid, now_dt)?;
             kicks.users.push(UserId::from(uid.clone()));
+            // Usage dropped; a tenant that no longer reports (e.g. suspended) must report it once.
+            diesel::update(tenants::table.find(&stone_tid)).set(tenants::storage_dirty.eq(true)).execute(conn)?;
         }
         Ok((
             EraseResponse {
@@ -1221,7 +1223,8 @@ pub fn storage_prepare(
                     .and(tenants::authority_refreshed_at.is_not_null()))
                 .or(tenants::storage_ceiling_bytes.gt(0))
                 .or(tenants::storage_grant_expires_at.is_not_null())
-                .or(tenants::storage_last_applied_seq.eq(0)),
+                .or(tenants::storage_last_applied_seq.eq(0))
+                .or(tenants::storage_dirty.eq(true)),
         )
         .order((
             tenants::storage_prepared_at.is_not_null().asc(),
@@ -1266,7 +1269,8 @@ pub fn storage_prepare(
             let needs = live_and_authorized
                 || t.storage_ceiling_bytes > 0
                 || t.storage_grant_expires_at.is_some()
-                || t.storage_last_applied_seq == 0;
+                || t.storage_last_applied_seq == 0
+                || t.storage_dirty;
             if !needs {
                 return Ok(None);
             }
@@ -1278,6 +1282,7 @@ pub fn storage_prepare(
                     tenants::storage_pending_seq.eq(Some(seq)),
                     tenants::storage_pending_used_bytes.eq(Some(used)),
                     tenants::storage_prepared_at.eq(Some(now)),
+                    tenants::storage_dirty.eq(false),
                 ))
                 .execute(conn)?;
             Ok(Some(StorageReport {
@@ -2413,6 +2418,37 @@ mod tests {
             cleanup_pending(c, None, &cells(), NOW).unwrap().items.into_iter().map(|i| i.id).collect();
         assert_eq!(complete(c, ids), ["t1"]);
         assert_eq!(tenant(c, "t1").status, STATUS_DELETED);
+    }
+
+    #[test]
+    fn inactive_tenant_reports_once_after_erasure_changes_its_usage() {
+        let c = &mut test_sqlite_conn();
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+        exec(c, "UPDATE tenants SET status = 'suspended', storage_last_applied_seq = 3 WHERE id = 't1'");
+        let prepare = |c: &mut DbConnInner| -> Vec<(String, i64)> {
+            let req = PrepareRequest {
+                want_bytes_default: 1000,
+                limit: 10,
+            };
+            storage_prepare(c, &req, &cells(), NOW)
+                .unwrap()
+                .reports
+                .into_iter()
+                .map(|r| (r.org_id, r.want_bytes))
+                .collect()
+        };
+        assert!(prepare(c).is_empty(), "a settled suspended tenant does not report");
+
+        let req = EraseRequest {
+            issuer: ISS.to_owned(),
+            subject: "sub1".to_owned(),
+            tenant_id: Some("t1".to_owned()),
+            revision: 1,
+        };
+        erase_user(c, &req, &cells(), NOW).unwrap();
+        assert_eq!(prepare(c), [("t1".to_owned(), 0)]);
+        assert!(!tenant(c, "t1").storage_dirty);
     }
 
     #[test]
