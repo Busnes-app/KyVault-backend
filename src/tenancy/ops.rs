@@ -1389,10 +1389,11 @@ pub fn storage_apply(
             if is_tombstoned(&t.status) {
                 return Ok(false);
             }
-            // Drop answers to older reports before any variant touches state. An ok may
-            // replay the last applied report; stale and unknown_org must answer the pending one.
+            // Only sequence repair can thaw a stale tenant. Otherwise, an ok may replay the
+            // last applied report; stale and unknown_org must answer the pending one.
             let current = if r.result == "ok" {
-                r.report_seq > 0
+                !t.storage_seq_stale
+                    && r.report_seq > 0
                     && r.seq == r.report_seq
                     && r.report_seq <= t.storage_report_seq
                     && r.report_seq >= t.storage_last_applied_seq
@@ -1426,7 +1427,6 @@ pub fn storage_apply(
                             tenants::storage_pool_bytes.eq(r.pool_bytes.max(0)),
                             tenants::storage_org_used_bytes.eq(r.org_used_bytes.max(0)),
                             tenants::storage_over_since.eq(r.over_since),
-                            tenants::storage_seq_stale.eq(false),
                         ))
                         .execute(conn)?;
                 }
@@ -2161,6 +2161,10 @@ mod tests {
         let t = tenant(c, "t1");
         assert!(t.storage_seq_stale);
         assert_eq!((t.storage_report_seq, t.storage_ceiling_bytes), (4, 5000), "grant kept, seq never reset");
+        assert_eq!(apply(c, "ok", 3, NOW + 1).applied, 0, "an old success cannot clear the stale sequence");
+        let after_replay = tenant(c, "t1");
+        assert!(after_replay.storage_seq_stale);
+        assert_eq!(after_replay.storage_grant_expires_at, t.storage_grant_expires_at);
         assert_eq!(prep(c), vec![], "stale tenants wait for operator repair");
 
         let repair = |c: &mut DbConnInner, next_seq| {
