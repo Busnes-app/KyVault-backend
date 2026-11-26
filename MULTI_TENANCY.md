@@ -47,7 +47,9 @@ Two processes share one PostgreSQL database:
 
 ### Startup refuses to run multi-tenant without
 
-`KY_CELLS` (1–32 unique valid cell slugs `[a-z][a-z0-9-]{0,30}[a-z0-9]`), `SSO_ENABLED=true`
+A build compiled with the opt-in `kye2e` Cargo feature (release builds do not enable
+`kye2e` and refuse `TENANCY_MODE=multi` outright), an `SSO_AUTHORITY` host ending with
+`.test`, `KY_CELLS` (1–32 unique valid cell slugs `[a-z][a-z0-9-]{0,30}[a-z0-9]`), `SSO_ENABLED=true`
 and `SSO_ONLY=true`, `SIGNUPS_ALLOWED=false`, an unset `ADMIN_TOKEN`, a PostgreSQL
 `DATABASE_URL`, an `s3://` `ATTACHMENTS_FOLDER`, `TENANCY_INTERNAL_API_SECRET` of at least
 32 characters, `TENANCY_AUTHORITY_MAX_AGE_SECS` between 60 and 900, a
