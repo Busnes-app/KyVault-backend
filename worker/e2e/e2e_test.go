@@ -584,6 +584,44 @@ func TestLivePostgres(t *testing.T) {
 			}
 			e.exec(t, "UPDATE ciphers SET notes = $1 WHERE uuid = $2", a.AttachmentID, up.cipher)
 		}
+
+		// (g) A hosted import saves as one batch: it all lands, folder links included, or none of it.
+		tokImp := e.accessToken(t, a2)
+		item := func(name string, password int) map[string]any {
+			return map[string]any{"type": 1, "name": name, "encryptedFor": a2.uuid,
+				"login": map[string]any{"password": strings.Repeat("p", password)}}
+		}
+		imp, _ := json.Marshal(map[string]any{
+			"folders":             []map[string]any{{"name": "2.import-f|a|b"}},
+			"folderRelationships": []map[string]any{{"key": 1, "value": 0}},
+			"ciphers":             []map[string]any{item("2.import-0|a|b", 8), item("2.import-1|a|b", 8), item("2.import-2|a|b", 8)},
+		})
+		eventually(t, 10*time.Second, "grant for import", func() error {
+			if r := call(t, "POST", r1+"/api/ciphers/import", bearer(tokImp), imp); r.code != 200 {
+				return fmt.Errorf("%d %s", r.code, r.body)
+			}
+			return nil
+		})
+		if n := e.num(t, "SELECT count(*) FROM ciphers WHERE name LIKE '2.import-%' AND user_uuid = $1", a2.uuid); n != 3 {
+			t.Fatalf("import landed %d of 3 ciphers", n)
+		}
+		if n := e.num(t, `SELECT count(*) FROM folders_ciphers fc JOIN ciphers c ON c.uuid = fc.cipher_uuid
+			WHERE c.name = '2.import-1|a|b'`); n != 1 {
+			t.Fatalf("imported folder link: %d", n)
+		}
+		gi := e.mustTenant(t, orgA)
+		room := gi.Ceiling - e.committed(t, orgA) - gi.Reserved
+		over, _ := json.Marshal(map[string]any{
+			"folders": []any{}, "folderRelationships": []any{},
+			"ciphers": []map[string]any{item("2.over-0|a|b", 8), item("2.over-1|a|b", int(room))},
+		})
+		if r := call(t, "POST", r2+"/api/ciphers/import", bearer(tokImp), over); r.code == 200 ||
+			!strings.Contains(string(r.body), "quota exceeded") {
+			t.Fatalf("import over the grant: %d %s", r.code, r.body)
+		}
+		if n := e.num(t, "SELECT count(*) FROM ciphers WHERE name LIKE '2.over-%'"); n != 0 {
+			t.Fatalf("refused import left %d cipher rows", n)
+		}
 	})
 
 	t.Run("5 back-channel logout and webhook claim after success", func(t *testing.T) {

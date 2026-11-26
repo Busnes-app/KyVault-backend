@@ -817,7 +817,32 @@ impl Tenant {
         default_max_ciphers: i64,
         now_ts: i64,
     ) -> EmptyResult {
-        if cipher.tenant_id.as_deref() != Some(tid) {
+        Self::save_ciphers_enforcing_grant_inner(
+            conn,
+            tid,
+            std::slice::from_ref(cipher),
+            attachments,
+            max_authority_age_secs,
+            served_cells,
+            default_max_ciphers,
+            now_ts,
+        )
+    }
+
+    /// Batch form of `save_cipher_enforcing_grant_inner`: one lock, one usage scan and one quota
+    /// count for every cipher, all saved or none (hosted imports).
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_ciphers_enforcing_grant_inner(
+        conn: &mut DbConnInner,
+        tid: &str,
+        ciphers: &[Cipher],
+        attachments: &[Attachment],
+        max_authority_age_secs: i64,
+        served_cells: &[String],
+        default_max_ciphers: i64,
+        now_ts: i64,
+    ) -> EmptyResult {
+        if ciphers.iter().any(|c| c.tenant_id.as_deref() != Some(tid)) {
             err_code!("Cross-tenant cipher write denied", 403);
         }
         conn.transaction::<(), crate::Error, _>(|conn| {
@@ -826,20 +851,26 @@ impl Tenant {
             };
             validate_tenant_growth_tx(&tenant, served_cells, now_ts, max_authority_age_secs)?;
 
-            let existing: Option<Cipher> = ciphers::table
-                .find(&cipher.uuid)
-                .first::<Cipher>(conn)
-                .optional()
-                .map_res("Error loading existing cipher")?;
-            if let Some(ref old) = existing
-                && old.tenant_id.as_deref() != Some(tid)
-            {
-                err_code!("Cross-tenant cipher write denied", 403);
+            let mut delta_bytes = 0i64;
+            let mut activating = 0i64;
+            for cipher in ciphers {
+                let existing: Option<Cipher> = ciphers::table
+                    .find(&cipher.uuid)
+                    .first::<Cipher>(conn)
+                    .optional()
+                    .map_res("Error loading existing cipher")?;
+                if let Some(ref old) = existing
+                    && old.tenant_id.as_deref() != Some(tid)
+                {
+                    err_code!("Cross-tenant cipher write denied", 403);
+                }
+                if cipher.deleted_at.is_none() && existing.as_ref().is_none_or(|old| old.deleted_at.is_some()) {
+                    activating += 1;
+                }
+                let old_bytes = existing.as_ref().map_or(0, Cipher::storage_bytes);
+                delta_bytes = delta_bytes.saturating_add(cipher.storage_bytes().saturating_sub(old_bytes));
             }
-
-            let activates_cipher =
-                cipher.deleted_at.is_none() && existing.as_ref().is_none_or(|old| old.deleted_at.is_some());
-            if activates_cipher {
+            if activating > 0 {
                 let max_ciphers = tenant.max_ciphers_quota().unwrap_or(default_max_ciphers);
                 if max_ciphers > 0 {
                     let active_count: i64 = ciphers::table
@@ -848,17 +879,15 @@ impl Tenant {
                         .count()
                         .first::<i64>(conn)
                         .map_res("Error counting tenant ciphers")?;
-                    if active_count >= max_ciphers {
+                    if active_count.saturating_add(activating) > max_ciphers {
                         err_code!(format!("Organization cipher quota exceeded (limit: {max_ciphers})"), 403);
                     }
                 }
             }
 
-            let old_bytes = existing.as_ref().map_or(0, Cipher::storage_bytes);
-            let mut delta_bytes = cipher.storage_bytes().saturating_sub(old_bytes);
             let mut att_exists = Vec::with_capacity(attachments.len());
             for att in attachments {
-                if att.cipher_uuid != cipher.uuid {
+                if !ciphers.iter().any(|c| c.uuid == att.cipher_uuid) {
                     err_code!("Attachment is not owned by the cipher", 400);
                 }
                 let (growth, exists) = attachment_growth_tx(conn, tid, att)?;
@@ -872,31 +901,9 @@ impl Tenant {
                 }
             }
 
-            match conn {
-                #[cfg(mysql)]
-                DbConnInner::Mysql(c) => diesel::insert_into(ciphers::table)
-                    .values(cipher)
-                    .on_conflict(diesel::dsl::DuplicatedKeys)
-                    .do_update()
-                    .set(cipher)
-                    .execute(c),
-                #[cfg(postgresql)]
-                DbConnInner::Postgresql(c) => diesel::insert_into(ciphers::table)
-                    .values(cipher)
-                    .on_conflict(ciphers::uuid)
-                    .do_update()
-                    .set(cipher)
-                    .execute(c),
-                #[cfg(sqlite)]
-                DbConnInner::Sqlite(c) => diesel::insert_into(ciphers::table)
-                    .values(cipher)
-                    .on_conflict(ciphers::uuid)
-                    .do_update()
-                    .set(cipher)
-                    .execute(c),
+            for cipher in ciphers {
+                upsert_cipher_tx(conn, cipher)?;
             }
-            .map(|_| ())
-            .map_res("Error saving cipher")?;
             for (att, exists) in attachments.iter().zip(att_exists) {
                 write_attachment_tx(conn, att, exists)?;
             }
@@ -904,11 +911,11 @@ impl Tenant {
         })
     }
 
-    /// Persists a cipher in hosted multi-tenant mode under the PostgreSQL tenant lock, enforcing
+    /// Persists ciphers in hosted multi-tenant mode under the PostgreSQL tenant lock, enforcing
     /// both active cipher quota and storage grant admission atomically.
-    pub async fn save_cipher_enforcing_grant(
+    pub async fn save_ciphers_enforcing_grant(
         tenant_id: &str,
-        cipher: &Cipher,
+        ciphers: &[Cipher],
         attachments: &[Attachment],
         max_authority_age_secs: i64,
         served_cells: &[String],
@@ -921,10 +928,10 @@ impl Tenant {
             if !is_postgresql(conn) {
                 err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
             }
-            Self::save_cipher_enforcing_grant_inner(
+            Self::save_ciphers_enforcing_grant_inner(
                 conn,
                 &tid,
-                cipher,
+                ciphers,
                 attachments,
                 max_authority_age_secs,
                 &cells,
@@ -934,6 +941,34 @@ impl Tenant {
         })
         .await
     }
+}
+
+fn upsert_cipher_tx(conn: &mut DbConnInner, cipher: &Cipher) -> EmptyResult {
+    match conn {
+        #[cfg(mysql)]
+        DbConnInner::Mysql(c) => diesel::insert_into(ciphers::table)
+            .values(cipher)
+            .on_conflict(diesel::dsl::DuplicatedKeys)
+            .do_update()
+            .set(cipher)
+            .execute(c),
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(c) => diesel::insert_into(ciphers::table)
+            .values(cipher)
+            .on_conflict(ciphers::uuid)
+            .do_update()
+            .set(cipher)
+            .execute(c),
+        #[cfg(sqlite)]
+        DbConnInner::Sqlite(c) => diesel::insert_into(ciphers::table)
+            .values(cipher)
+            .on_conflict(ciphers::uuid)
+            .do_update()
+            .set(cipher)
+            .execute(c),
+    }
+    .map(drop)
+    .map_res("Error saving cipher")
 }
 
 fn sum_to_i64(sum: Option<BigDecimal>) -> i64 {
@@ -1150,11 +1185,18 @@ fn octet_sum_sql(conn: &DbConnInner, cols: &[&str]) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub static USAGE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Committed tenant storage per Design §11 P3: attachment payloads with their encrypted file name
 /// and key, file Send payloads, encrypted cipher data (trash included) and active recovery-kit
 /// envelopes. Pending upload reservations live in `tenants.storage_reserved_bytes` and are added
 /// by callers.
 pub fn committed_bytes(conn: &mut DbConnInner, tenant_id: &str) -> QueryResult<i64> {
+    #[cfg(test)]
+    USAGE_SCANS.with(|n| n.set(n.get() + 1));
     use diesel::{dsl::sql, sql_types::BigInt};
 
     let att: Option<BigDecimal> = attachments::table

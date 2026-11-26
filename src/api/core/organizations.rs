@@ -1780,7 +1780,7 @@ async fn bulk_public_keys(
 }
 
 use super::ciphers::CipherData;
-use super::ciphers::update_cipher_from_data;
+use super::ciphers::{import_ciphers_hosted, update_cipher_from_data};
 
 // The import endpoint only ever uses the name/id/external_id of a collection.
 // Bitwarden's own server ignores `groups`/`users` here too, so do not make them
@@ -1875,29 +1875,36 @@ async fn post_org_import(
     crate::tenancy::check_cipher_quota(&headers.user, i64::try_from(data.ciphers.len()).unwrap_or(i64::MAX), &conn)
         .await?;
 
-    let mut ciphers: Vec<CipherId> = Vec::with_capacity(data.ciphers.len());
+    let mut items = Vec::with_capacity(data.ciphers.len());
     for mut cipher_data in data.ciphers {
         // Always clear folder_id's via an organization import
         cipher_data.folder_id = None;
         // Replace the client-provided, unvalidated organizationId with the real target org
         cipher_data.organization_id = Some(org_id.clone());
-        let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-        cipher.tenant_id = headers.user.tenant_id.clone();
-        let res = update_cipher_from_data(
-            &mut cipher,
-            cipher_data,
-            &headers,
-            Some(collections.clone()),
-            &conn,
-            &nt,
-            UpdateType::None,
-        )
-        .await;
-        if CONFIG.is_multi_tenant() {
-            res?;
-        }
-        ciphers.push(cipher.uuid);
+        items.push(cipher_data);
     }
+    let ciphers: Vec<CipherId> = if CONFIG.is_multi_tenant() {
+        import_ciphers_hosted(items, &headers, Some(collections.clone()), &conn, &nt).await?
+    } else {
+        let mut ids = Vec::with_capacity(items.len());
+        for cipher_data in items {
+            let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+            // Single-tenant keeps upstream's behaviour of skipping items that fail.
+            update_cipher_from_data(
+                &mut cipher,
+                cipher_data,
+                &headers,
+                Some(collections.clone()),
+                &conn,
+                &nt,
+                UpdateType::None,
+            )
+            .await
+            .ok();
+            ids.push(cipher.uuid);
+        }
+        ids
+    };
 
     // Assign the collections
     for (cipher_index, col_index) in relations {

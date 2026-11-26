@@ -183,6 +183,14 @@ fn record_tombstone(conn: &mut DbConnInner, row: &TenantErasedSubject) -> QueryR
     Ok(())
 }
 
+fn tombstone_tenant(conn: &mut DbConnInner, issuer: &str, subject: &str) -> QueryResult<Option<String>> {
+    tenant_erased_subjects::table
+        .find((canonical_issuer(issuer), subject.trim()))
+        .select(tenant_erased_subjects::tenant_id)
+        .first(conn)
+        .optional()
+}
+
 fn tombstone(issuer: &str, subject: &str, tenant_id: &str, revision: i64, now: NaiveDateTime) -> TenantErasedSubject {
     TenantErasedSubject {
         issuer: canonical_issuer(issuer).to_owned(),
@@ -626,7 +634,12 @@ pub fn erase_user(
         let tenant = match (&found, &req_tenant) {
             (Some((_, Some(utid))), _) => ensure_tenant_cell_served(conn, utid, served_cells)?,
             (None, Some(t)) => t.clone(),
-            (Some((_, None)), _) | (None, None) => return Err(cell_not_served_err()),
+            // A retry after the user is gone: the tombstone names the tenant.
+            (None, None) => match tombstone_tenant(conn, &req.issuer, &req.subject)? {
+                Some(tid) => ensure_tenant_cell_served(conn, &tid, served_cells)?,
+                None => return Err(cell_not_served_err()),
+            },
+            (Some((_, None)), _) => return Err(cell_not_served_err()),
         };
         let stone_tid = tenant.id.clone();
         record_tombstone(conn, &tombstone(&req.issuer, &req.subject, &stone_tid, req.revision, now_dt))?;
@@ -1921,6 +1934,20 @@ mod tests {
         let (r, _) = erase_user(c, &req, &cells(), NOW).unwrap();
         assert!(!r.user_existed && r.tombstone_recorded);
         assert_eq!(r.pending_deletions_queued, 0);
+
+        // A retry without tenant_id (worker timed out) finds the tenant through the tombstone.
+        let retry = EraseRequest {
+            tenant_id: None,
+            ..req
+        };
+        let (r, _) = erase_user(c, &retry, &cells(), NOW).unwrap();
+        assert!(!r.user_existed && r.tombstone_recorded);
+        // An unknown subject with no tenant is still refused.
+        let unknown = EraseRequest {
+            subject: "never-seen".to_owned(),
+            ..retry
+        };
+        assert!(erase_user(c, &unknown, &cells(), NOW).is_err());
     }
 
     #[test]
@@ -2928,6 +2955,45 @@ mod tests {
         Tenant::save_attachment_releasing_inner(c, "t1", &att_ok, 128, Some(1), Some("pd-ok"), NOW).unwrap();
         assert_eq!(tenant(c, "t1").storage_reserved_bytes, 0);
         assert!(tenant_pending_deletions::table.find("pd-ok").first::<TenantPendingDeletion>(c).is_err());
+    }
+
+    #[test]
+    fn hosted_import_batch_scans_usage_once_and_lands_whole() {
+        use crate::db::models::{Cipher, USAGE_SCANS, committed_bytes};
+
+        let c = &mut test_sqlite_conn();
+        let served = cells();
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+        diesel::update(tenants::table.find("t1"))
+            .set((tenants::storage_ceiling_bytes.eq(1_000_000), tenants::storage_grant_expires_at.eq(Some(NOW + 300))))
+            .execute(c)
+            .unwrap();
+        let batch = |n: usize, data_len: usize| -> Vec<Cipher> {
+            (0..n)
+                .map(|_| {
+                    let mut item = Cipher::new(1, "name".to_owned());
+                    item.user_uuid = Some(UserId::from("u1".to_owned()));
+                    item.tenant_id = Some("t1".to_owned());
+                    item.data = "x".repeat(data_len);
+                    item
+                })
+                .collect()
+        };
+        let save = |c: &mut DbConnInner, items: &[Cipher], max: i64| {
+            Tenant::save_ciphers_enforcing_grant_inner(c, "t1", items, &[], 900, &served, max, NOW)
+        };
+
+        let before = USAGE_SCANS.with(std::cell::Cell::get);
+        save(c, &batch(200, 10), 1000).unwrap();
+        assert_eq!(USAGE_SCANS.with(std::cell::Cell::get) - before, 1, "one usage scan for the whole import");
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 200 * 14);
+
+        // Over the grant as a whole, though each item fits alone: nothing lands.
+        assert!(save(c, &batch(100, 10_000), 1000).is_err());
+        // Over the cipher quota as a whole: nothing lands.
+        assert!(save(c, &batch(801, 1), 1000).is_err());
+        assert_eq!(ciphers::table.count().get_result::<i64>(c).unwrap(), 200);
     }
 
     #[test]

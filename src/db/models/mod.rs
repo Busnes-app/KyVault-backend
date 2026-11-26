@@ -42,7 +42,7 @@ pub use self::organization::{
 pub use self::send::{Send, SendFileId, SendId, SendType};
 pub use self::sso_auth::{OIDCAuthenticatedUser, OIDCCodeResponseError, SsoAuth};
 #[cfg(all(test, sqlite))]
-pub use self::tenant::Abandoned;
+pub use self::tenant::{Abandoned, USAGE_SCANS};
 pub use self::tenant::{
     SignInUpdate, TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion, TenantRecoveryBundle,
     V2UploadLease, committed_bytes, lock_subject, lock_tenant, mark_storage_dirty, release_pending_reservations,

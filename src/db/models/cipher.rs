@@ -456,6 +456,33 @@ impl Cipher {
         self.save_with_attachments(&[], conn).await
     }
 
+    /// Hosted only: saves one owner's new ciphers under one tenant lock and one usage scan.
+    pub async fn save_hosted_batch(ciphers: &mut [Cipher], conn: &DbConn) -> EmptyResult {
+        let Some(owner_tenant) = ciphers.first().map(|c| c.tenant_id.clone()) else {
+            return Ok(());
+        };
+        let Some(tenant_id) = owner_tenant else {
+            err_code!("Cipher is missing tenant ownership", 403);
+        };
+        let now = Utc::now().naive_utc();
+        for c in ciphers.iter_mut() {
+            c.updated_at = now;
+        }
+        super::Tenant::save_ciphers_enforcing_grant(
+            &tenant_id,
+            ciphers,
+            &[],
+            CONFIG.tenancy_authority_max_age_secs(),
+            &CONFIG.served_cells(),
+            CONFIG.tenancy_max_ciphers_per_tenant(),
+            conn,
+        )
+        .await?;
+        // Every cipher in the batch has the same owner, so one revision bump covers them all.
+        ciphers[0].update_users_revision(conn).await;
+        Ok(())
+    }
+
     /// Saves the cipher and the file name and key changes of its `attachments` (key rotation).
     /// Hosted mode writes both in one transaction under one storage-grant check.
     pub async fn save_with_attachments(&mut self, attachments: &[Attachment], conn: &DbConn) -> EmptyResult {
@@ -466,9 +493,9 @@ impl Cipher {
                 err_code!("Cipher is missing tenant ownership", 403);
             };
             let served_cells = CONFIG.served_cells();
-            super::Tenant::save_cipher_enforcing_grant(
+            super::Tenant::save_ciphers_enforcing_grant(
                 tenant_id,
-                self,
+                std::slice::from_ref(self),
                 attachments,
                 CONFIG.tenancy_authority_max_age_secs(),
                 &served_cells,

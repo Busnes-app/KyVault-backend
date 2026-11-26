@@ -441,6 +441,29 @@ pub async fn update_cipher_from_data(
     nt: &Notify<'_>,
     ut: UpdateType,
 ) -> EmptyResult {
+    let follow_up = apply_cipher_data(cipher, data, headers, shared_to_collections.as_ref(), conn, ut).await?;
+    cipher.save_with_attachments(&follow_up.rotated, conn).await?;
+    finish_cipher_save(cipher, follow_up, headers, shared_to_collections, conn, nt, ut).await
+}
+
+/// What is left to do for a cipher once `apply_cipher_data` has filled it and its row is saved.
+struct CipherFollowUp {
+    rotated: Vec<Attachment>,
+    folder_id: Option<FolderId>,
+    favorite: Option<bool>,
+    archived_date: Option<String>,
+    transfer_cipher: bool,
+}
+
+/// Validates `data` and applies it to `cipher` without writing the cipher row.
+async fn apply_cipher_data(
+    cipher: &mut Cipher,
+    data: CipherData,
+    headers: &Headers,
+    shared_to_collections: Option<&Vec<CollectionId>>,
+    conn: &DbConn,
+    ut: UpdateType,
+) -> ApiResult<CipherFollowUp> {
     // Cleanup cipher data, like removing the 'Response' key.
     // This key is somewhere generated during Javascript so no way for us this fix this.
     // Also, upstream only retrieves keys they actually want to store, and thus skip the 'Response' key.
@@ -483,7 +506,7 @@ pub async fn update_cipher_from_data(
                 // A non-empty list of collections implies the caller already validated the user's write
                 // access to them, so we can move the cipher into the organization on that basis.
                 // Write access to the cipher itself only counts when it already belongs to this organization.
-                if shared_to_collections.as_ref().is_some_and(|cols| !cols.is_empty())
+                if shared_to_collections.is_some_and(|cols| !cols.is_empty())
                     || member.has_full_access()
                     || (!transfer_cipher && cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await)
                 {
@@ -568,12 +591,28 @@ pub async fn update_cipher_from_data(
             rotated.push(saved_att);
         }
     }
-    cipher.save_with_attachments(&rotated, conn).await?;
+    Ok(CipherFollowUp {
+        rotated,
+        folder_id: data.folder_id,
+        favorite: data.favorite,
+        archived_date: data.archived_date,
+        transfer_cipher,
+    })
+}
 
-    cipher.move_to_folder(data.folder_id, &headers.user.uuid, conn).await?;
-    cipher.set_favorite(data.favorite, &headers.user.uuid, conn).await?;
+async fn finish_cipher_save(
+    cipher: &Cipher,
+    follow_up: CipherFollowUp,
+    headers: &Headers,
+    shared_to_collections: Option<Vec<CollectionId>>,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+    ut: UpdateType,
+) -> EmptyResult {
+    cipher.move_to_folder(follow_up.folder_id, &headers.user.uuid, conn).await?;
+    cipher.set_favorite(follow_up.favorite, &headers.user.uuid, conn).await?;
 
-    match data.archived_date {
+    match follow_up.archived_date {
         Some(dt_str) => match NaiveDateTime::parse_from_str(&dt_str, "%+") {
             Ok(dt) => cipher.set_archived_at(dt, &headers.user.uuid, conn).await?,
             Err(err) => warn!("Error parsing ArchivedDate '{}': {err}", dt_str.escape_debug()),
@@ -581,8 +620,37 @@ pub async fn update_cipher_from_data(
         None => cipher.unarchive(&headers.user.uuid, conn).await?,
     }
 
-    notify_cipher_saved(cipher, ut, transfer_cipher, shared_to_collections, headers, conn, nt).await;
+    notify_cipher_saved(cipher, ut, follow_up.transfer_cipher, shared_to_collections, headers, conn, nt).await;
     Ok(())
+}
+
+/// Hosted imports: applies every item first, then saves all of them under one tenant lock and one
+/// usage scan (a per-item save rescans the whole tenant), then sets folders and favorites.
+pub async fn import_ciphers_hosted(
+    items: Vec<CipherData>,
+    headers: &Headers,
+    shared_to_collections: Option<Vec<CollectionId>>,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+) -> ApiResult<Vec<CipherId>> {
+    let mut ciphers = Vec::with_capacity(items.len());
+    let mut follow_ups = Vec::with_capacity(items.len());
+    for data in items {
+        let mut cipher = Cipher::new(data.r#type, data.name.clone());
+        cipher.tenant_id.clone_from(&headers.user.tenant_id);
+        let follow_up =
+            apply_cipher_data(&mut cipher, data, headers, shared_to_collections.as_ref(), conn, UpdateType::None)
+                .await?;
+        // A new cipher owns no attachments, so `follow_up.rotated` is empty.
+        ciphers.push(cipher);
+        follow_ups.push(follow_up);
+    }
+    Cipher::save_hosted_batch(&mut ciphers, conn).await?;
+    for (cipher, follow_up) in ciphers.iter().zip(follow_ups) {
+        finish_cipher_save(cipher, follow_up, headers, shared_to_collections.clone(), conn, nt, UpdateType::None)
+            .await?;
+    }
+    Ok(ciphers.into_iter().map(|c| c.uuid).collect())
 }
 
 /// Rejects an update made from a client copy older than the stored cipher.
@@ -691,16 +759,22 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
     }
 
     // Read and create the ciphers
+    let mut items = Vec::with_capacity(data.ciphers.len());
     for (index, mut cipher_data) in data.ciphers.into_iter().enumerate() {
         let folder_id = relations_map.get(&index).and_then(|i| folders.get(*i).cloned());
         cipher_data.folder_id = folder_id;
         // A personal import always creates personal ciphers, the organization ID is ignored instead of rejected
         // Upstream: https://github.com/bitwarden/server/blob/b06b81c1fb33ce9c9872b96397ba2b4d879b66af/src/Api/Tools/Controllers/ImportCiphersController.cs#L58
         cipher_data.organization_id = None;
-
-        let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-        cipher.tenant_id = headers.user.tenant_id.clone();
-        update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+        items.push(cipher_data);
+    }
+    if CONFIG.is_multi_tenant() {
+        import_ciphers_hosted(items, &headers, None, &conn, &nt).await?;
+    } else {
+        for cipher_data in items {
+            let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+            update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+        }
     }
 
     let mut user = headers.user;
