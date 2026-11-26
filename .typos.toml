@@ -26,5 +26,7 @@ extend-ignore-re = [
     # Bitwarden SDK identifier, misspelled upstream (bitwarden/sdk-internal crates/bitwarden-crypto/src/keys/)
     "(?i)rotateable",
     # Ignore Punycode/IDN tests
-    "xn--.+"
+    "xn--.+",
+    # Busnes.app brand name
+    "(?i)busnes"
 ]
