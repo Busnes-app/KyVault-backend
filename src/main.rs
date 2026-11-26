@@ -61,6 +61,7 @@ mod ratelimit;
 mod sso;
 mod sso_client;
 mod storage;
+mod tenancy;
 mod util;
 
 use crate::api::{
@@ -88,6 +89,7 @@ async fn main() -> Result<(), Error> {
     create_dir(&CONFIG.tmp_folder(), "tmp folder");
 
     let pool = create_db_pool().await;
+    tenancy::pubsub::start_pg_notify_loop();
     schedule_jobs(pool.clone());
     db::models::TwoFactor::migrate_u2f_to_webauthn(&pool.get().await.unwrap()).await.unwrap();
     db::models::TwoFactor::migrate_credential_to_passkey(&pool.get().await.unwrap()).await.unwrap();
@@ -655,17 +657,25 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
-    let instance = rocket::custom(config)
+    let mut builder = rocket::custom(config)
         .mount([basepath, "/"].concat(), api::web_routes())
         .mount([basepath, "/api"].concat(), api::core_routes())
-        .mount([basepath, "/admin"].concat(), api::admin_routes())
         .mount([basepath, "/events"].concat(), api::core_events_routes())
         .mount([basepath, "/identity"].concat(), api::identity_routes())
         .mount([basepath, "/icons"].concat(), api::icons_routes())
         .mount([basepath, "/notifications"].concat(), api::notifications_routes())
+        // Private worker API: fixed path, not under DOMAIN's base path; 404 unless multi-tenant.
+        .mount("/internal/tenancy/v1", api::internal_tenancy_routes())
         .register([basepath, "/"].concat(), api::web_catchers())
-        .register([basepath, "/api"].concat(), api::core_catchers())
-        .register([basepath, "/admin"].concat(), api::admin_catchers())
+        .register([basepath, "/api"].concat(), api::core_catchers());
+
+    if !CONFIG.is_multi_tenant() {
+        builder = builder
+            .mount([basepath, "/admin"].concat(), api::admin_routes())
+            .register([basepath, "/admin"].concat(), api::admin_catchers());
+    }
+
+    let instance = builder
         .manage(pool)
         .manage(Arc::clone(&WS_USERS))
         .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))

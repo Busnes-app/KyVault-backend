@@ -871,6 +871,32 @@ make_config! {
         sso_debug_tokens:               bool,   true,   def,    false;
     },
 
+    /// Multi-tenant KyVault settings
+    tenancy {
+        /// Tenancy mode |> ("single" or "multi") Enables strict multi-tenant isolation for hosted KyVault deployments
+        tenancy_mode:                   String, false,  def,    "single".to_owned();
+        /// Served cells |> Comma-separated cell slugs served by this KyVault deployment (1..=32 slugs matching ^[a-z][a-z0-9-]{1,31}$, required when TENANCY_MODE=multi)
+        ky_cells:                       String, false,  def,    String::new();
+        /// Internal management API secret |> Pre-provisioned shared secret (>= 32 chars) authenticating kyvault-worker calls to /internal/tenancy/v1/* (required when TENANCY_MODE=multi)
+        tenancy_internal_api_secret:    Pass,   false,  option;
+        /// Authority freshness cap in seconds |> Bounded between 60 and 900 seconds (15 min cap)
+        tenancy_authority_max_age_secs: i64,    false,  def,    900;
+        /// Allow emergency access in multi-tenant mode |> Disabled by default to prevent cross-tenant grants
+        tenancy_allow_emergency_access: bool,   false,  def,    false;
+        /// Allow Sends in multi-tenant mode |> Always disabled in hosted multi-tenant mode (v1 policy)
+        tenancy_allow_sends:            bool,   false,  def,    false;
+        /// Maximum ciphers accepted in a single import request
+        tenancy_max_import_ciphers:     usize,  false,  def,    5_000;
+        /// Maximum folders accepted in a single import request
+        tenancy_max_import_folders:     usize,  false,  def,    500;
+        /// Default maximum active ciphers per tenant (overridable via tenant quotas_json.max_ciphers)
+        tenancy_max_ciphers_per_tenant: i64,    false,  def,    50_000;
+        /// PostgreSQL LISTEN/NOTIFY channel name for multi-replica WebSocket fanout
+        tenancy_pg_notify_channel:      String, false,  def,    "kyvault_notify".to_owned();
+        /// Enable PostgreSQL LISTEN/NOTIFY fanout across replicas
+        tenancy_pg_notify_enabled:      bool,   false,  def,    true;
+    },
+
     /// Yubikey settings
     yubico: _enable_yubico {
         /// Enabled
@@ -1155,6 +1181,45 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         validate_internal_sso_issuer_url(&cfg.sso_authority)?;
         validate_internal_sso_redirect_url(&cfg.sso_callback_path)?;
         validate_sso_master_password_policy(cfg.sso_master_password_policy.as_ref())?;
+    }
+
+    match cfg.tenancy_mode.to_ascii_lowercase().as_str() {
+        "single" => {}
+        "multi" => {
+            if let Err(msg) = crate::tenancy::parse_ky_cells(&cfg.ky_cells) {
+                err!(msg);
+            }
+            if !cfg.sso_enabled || !cfg.sso_only {
+                err!("`SSO_ENABLED=true` and `SSO_ONLY=true` are required when `TENANCY_MODE=multi`");
+            }
+            if cfg.signups_allowed {
+                err!("`SIGNUPS_ALLOWED=false` is required when `TENANCY_MODE=multi`");
+            }
+            if cfg.admin_token.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                err!("`ADMIN_TOKEN` must be unset when `TENANCY_MODE=multi`");
+            }
+            let db_url = cfg.database_url.trim().to_ascii_lowercase();
+            if !(db_url.starts_with("postgres://") || db_url.starts_with("postgresql://")) {
+                err!("PostgreSQL `DATABASE_URL` is required when `TENANCY_MODE=multi`");
+            }
+            if !cfg.attachments_folder.trim().to_ascii_lowercase().starts_with("s3://") {
+                err!(
+                    "S3 `ATTACHMENTS_FOLDER` (s3://...) is required when `TENANCY_MODE=multi` (no hosted disk fallback)"
+                );
+            }
+            if cfg.tenancy_internal_api_secret.as_deref().map_or(0, |s| s.trim().len()) < 32 {
+                err!("`TENANCY_INTERNAL_API_SECRET` (>= 32 chars) is required when `TENANCY_MODE=multi`");
+            }
+            if !(60..=900).contains(&cfg.tenancy_authority_max_age_secs) {
+                err!("`TENANCY_AUTHORITY_MAX_AGE_SECS` must be between 60 and 900 seconds");
+            }
+            if !crate::tenancy::pubsub::is_safe_pg_ident(&cfg.tenancy_pg_notify_channel) {
+                err!("`TENANCY_PG_NOTIFY_CHANNEL` must be 1-63 characters of [a-z0-9_]");
+            }
+        }
+        other => {
+            err!(format!("`TENANCY_MODE` must be 'single' or 'multi', got '{other}'"));
+        }
     }
 
     if cfg._enable_yubico {
@@ -1710,8 +1775,32 @@ impl Config {
         Url::parse(&self.domain()).expect("DOMAIN not a valid URL").domain().is_some()
     }
 
+    /// Tests whether multi-tenant KyVault mode is active.
+    pub fn is_multi_tenant(&self) -> bool {
+        self.tenancy_mode().eq_ignore_ascii_case("multi")
+    }
+
+    /// Returns the sorted, validated list of cell slugs served by this deployment.
+    /// Returns an empty Vec if `KY_CELLS` is unset or invalid (callers fail closed).
+    pub fn served_cells(&self) -> Vec<String> {
+        crate::tenancy::parse_ky_cells(&self.ky_cells()).unwrap_or_default()
+    }
+
+    /// Tests whether Bitwarden Send is allowed. Unconditionally disabled in hosted multi-tenant mode (v1 policy).
+    pub fn is_sends_allowed(&self) -> bool {
+        !self.is_multi_tenant() && self.sends_allowed()
+    }
+
+    /// Effective emergency-access policy: hosted mode also needs `TENANCY_ALLOW_EMERGENCY_ACCESS`.
+    pub fn is_emergency_access_allowed(&self) -> bool {
+        self.emergency_access_allowed() && (!self.is_multi_tenant() || self.tenancy_allow_emergency_access())
+    }
+
     /// Tests whether the admin token is set to a non-empty value.
     pub fn is_admin_token_set(&self) -> bool {
+        if self.is_multi_tenant() {
+            return false;
+        }
         let token = self.admin_token();
 
         token.is_some() && !token.unwrap().trim().is_empty()

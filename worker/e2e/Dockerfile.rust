@@ -1,0 +1,6 @@
+# Build and run image for the live PostgreSQL E2E: the repo toolchain plus libpq and libmysqlclient.
+FROM docker.io/library/rust:1.99.1-slim-trixie
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpq-dev libpq5 default-libmysqlclient-dev pkg-config libssl-dev ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup component add clippy rustfmt

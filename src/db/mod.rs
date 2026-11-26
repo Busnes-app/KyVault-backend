@@ -468,6 +468,24 @@ impl<'r> FromRequest<'r> for DbConn {
     }
 }
 
+/// In-memory SQLite connection with every migration applied and foreign keys enforced.
+#[cfg(all(test, sqlite))]
+pub fn test_sqlite_conn() -> DbConnInner {
+    test_sqlite_conn_at(":memory:")
+}
+
+/// SQLite connection at `url` with migrations applied, foreign keys enforced, and a busy timeout
+/// so multi-thread concurrency tests can share a file-backed database.
+#[cfg(all(test, sqlite))]
+pub fn test_sqlite_conn_at(url: &str) -> DbConnInner {
+    use diesel_migrations::MigrationHarness;
+    let mut conn = diesel::sqlite::SqliteConnection::establish(url).expect("open sqlite");
+    diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut conn).expect("set busy_timeout");
+    conn.run_pending_migrations(sqlite_migrations::MIGRATIONS).expect("run sqlite migrations");
+    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut conn).expect("enable foreign keys");
+    DbConnInner::Sqlite(conn)
+}
+
 // Embed the migrations from the migrations folder into the application
 // This way, the program automatically migrates the database to the latest version
 // https://docs.rs/diesel_migrations/*/diesel_migrations/macro.embed_migrations.html
@@ -532,5 +550,102 @@ mod postgresql_migrations {
 
         connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
+    }
+}
+
+#[cfg(all(test, sqlite))]
+mod migration_tests {
+    use diesel::Connection;
+    use diesel_migrations::MigrationHarness;
+
+    #[test]
+    fn sqlite_latest_migration_reverts_and_reapplies() {
+        let mut conn = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+        conn.run_pending_migrations(super::sqlite_migrations::MIGRATIONS).unwrap();
+        conn.revert_last_migration(super::sqlite_migrations::MIGRATIONS).unwrap();
+        conn.run_pending_migrations(super::sqlite_migrations::MIGRATIONS).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_attachment_rotation_rolls_back_cipher_and_earlier_attachment() {
+        use super::{DbConnInner, DbConnManager, DbPool, schema::attachments};
+        use crate::db::models::{Attachment, AttachmentId, Cipher, User};
+        use diesel::prelude::*;
+
+        let pool = DbPool {
+            pool: Some(
+                super::Pool::builder().max_size(1).build(DbConnManager::new("sqlite://:memory:?mode=memory")).unwrap(),
+            ),
+            semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let conn = pool.get().await.unwrap();
+        conn.run(|conn| {
+            let sqlite = match conn {
+                DbConnInner::Sqlite(sqlite) => sqlite,
+                #[cfg(any(mysql, postgresql))]
+                _ => unreachable!("expected SQLite"),
+            };
+            sqlite.run_pending_migrations(super::sqlite_migrations::MIGRATIONS).unwrap();
+            diesel::sql_query("PRAGMA foreign_keys = ON").execute(conn).unwrap();
+        })
+        .await;
+
+        let mut user = User::new("rotation@example.test", None);
+        user.save(&conn).await.unwrap();
+        let mut cipher = Cipher::new(1, "login".into());
+        cipher.user_uuid = Some(user.uuid);
+        cipher.key = Some("old-cipher-key".into());
+        cipher.save(&conn).await.unwrap();
+
+        let mut first = Attachment::new(
+            AttachmentId("first".into()),
+            cipher.uuid.clone(),
+            "first".into(),
+            1,
+            Some("old-first".into()),
+        );
+        let mut second = Attachment::new(
+            AttachmentId("second".into()),
+            cipher.uuid.clone(),
+            "second".into(),
+            1,
+            Some("old-second".into()),
+        );
+        first.save(&conn).await.unwrap();
+        second.save(&conn).await.unwrap();
+        conn.run(|conn| {
+            diesel::sql_query(
+                "CREATE TRIGGER refuse_second_rotation BEFORE UPDATE ON attachments WHEN OLD.id = 'second' \
+                 BEGIN SELECT RAISE(ABORT, 'test attachment write failed'); END",
+            )
+            .execute(conn)
+            .unwrap();
+        })
+        .await;
+
+        cipher.key = Some("new-cipher-key".into());
+        first.akey = Some("new-first".into());
+        second.akey = Some("new-second".into());
+        let rotated = [first, second];
+        assert!(cipher.save_with_attachments(&rotated, &conn).await.is_err());
+
+        let stored = Cipher::find_by_uuid(&cipher.uuid, &conn).await.unwrap();
+        assert_eq!(stored.key.as_deref(), Some("old-cipher-key"), "failed rotation changed the cipher key");
+        let stored_keys = conn
+            .run(|conn| {
+                attachments::table.order(attachments::id).select(attachments::akey).load::<Option<String>>(conn)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored_keys, [Some("old-first".into()), Some("old-second".into())]);
+
+        conn.run(|conn| diesel::sql_query("DROP TRIGGER refuse_second_rotation").execute(conn).unwrap()).await;
+        cipher.save_with_attachments(&rotated, &conn).await.unwrap();
+        let stored = Cipher::find_by_uuid(&cipher.uuid, &conn).await.unwrap();
+        assert_eq!(stored.key.as_deref(), Some("new-cipher-key"));
+        for attachment in &rotated {
+            let stored = Attachment::find_by_id(&attachment.id, &conn).await.unwrap();
+            assert_eq!(stored.akey, attachment.akey);
+        }
     }
 }

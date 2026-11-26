@@ -13,12 +13,15 @@ mod org_policy;
 mod organization;
 mod send;
 mod sso_auth;
+mod tenant;
 mod two_factor;
 mod two_factor_duo_context;
 mod two_factor_incomplete;
 mod user;
 
 pub use self::archive::Archive;
+#[cfg(all(test, sqlite))]
+pub use self::attachment::MAX_METADATA_LEN;
 pub use self::attachment::{Attachment, AttachmentId};
 pub use self::auth_request::{AuthRequest, AuthRequestId};
 pub use self::cipher::{Cipher, CipherId, RepromptType};
@@ -38,7 +41,14 @@ pub use self::organization::{
 };
 pub use self::send::{Send, SendFileId, SendId, SendType};
 pub use self::sso_auth::{OIDCAuthenticatedUser, OIDCCodeResponseError, SsoAuth};
+#[cfg(all(test, sqlite))]
+pub use self::tenant::{Abandoned, USAGE_SCANS};
+pub use self::tenant::{
+    HostedBatchExtras, SignInUpdate, TENANT_STATUS_ACTIVE, Tenant, TenantErasedSubject, TenantPendingDeletion,
+    TenantRecoveryBundle, V2UploadLease, committed_bytes, link_collections_tx, lock_subject, lock_tenant,
+    mark_storage_dirty, release_pending_reservations, update_signed_in_user_tx, upsert_cipher_tx,
+};
 pub use self::two_factor::{TwoFactor, TwoFactorType};
 pub use self::two_factor_duo_context::TwoFactorDuoContext;
 pub use self::two_factor_incomplete::TwoFactorIncomplete;
-pub use self::user::{Invitation, KeyId, SsoUser, User, UserId, UserKdfType, UserStampException};
+pub use self::user::{Invitation, KeyId, SsoUser, User, UserId, UserKdfType, UserPatch, UserStampException};

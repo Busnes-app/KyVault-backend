@@ -16,7 +16,7 @@ use crate::{
         DbConn, DbPool,
         models::{
             Cipher, EMERGENCY_ACCESS_TIMEOUT_RANGE, EmergencyAccess, EmergencyAccessId, EmergencyAccessStatus,
-            EmergencyAccessType, Invitation, Membership, MembershipType, OrgPolicy, TwoFactor, User, UserId,
+            EmergencyAccessType, Invitation, Membership, MembershipType, OrgPolicy, SsoUser, TwoFactor, User, UserId,
         },
     },
     mail,
@@ -50,7 +50,7 @@ pub fn routes() -> Vec<Route> {
 
 #[get("/emergency-access/trusted")]
 async fn get_contacts(headers: Headers, conn: DbConn) -> Json<Value> {
-    let emergency_access_list = if CONFIG.emergency_access_allowed() {
+    let emergency_access_list = if CONFIG.is_emergency_access_allowed() {
         EmergencyAccess::find_all_by_grantor_uuid(&headers.user.uuid, &conn).await
     } else {
         Vec::new()
@@ -71,7 +71,7 @@ async fn get_contacts(headers: Headers, conn: DbConn) -> Json<Value> {
 
 #[get("/emergency-access/granted")]
 async fn get_grantees(headers: Headers, conn: DbConn) -> Json<Value> {
-    let emergency_access_list = if CONFIG.emergency_access_allowed() {
+    let emergency_access_list = if CONFIG.is_emergency_access_allowed() {
         EmergencyAccess::find_all_by_grantee_uuid(&headers.user.uuid, &conn).await
     } else {
         Vec::new()
@@ -227,8 +227,11 @@ async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, co
         err!("You can not set yourself as an emergency contact.")
     }
 
-    let (grantee_user, new_user) = match User::find_by_mail(&email, &conn).await {
+    let (grantee_user, new_user) = match SsoUser::find_by_mail(&email, &conn).await {
         None => {
+            if CONFIG.is_multi_tenant() {
+                err!(format!("Grantee user does not exist in this organization: {}", email.escape_debug()))
+            }
             if !CONFIG.invitations_allowed() {
                 err!(format!("Grantee user does not exist: {}", email.escape_debug()))
             }
@@ -243,11 +246,24 @@ async fn send_invite(data: Json<EmergencyAccessInviteData>, headers: Headers, co
             }
 
             let mut user = User::new(&email, None);
+            user.tenant_id = grantor_user.tenant_id.clone();
             user.save(&conn).await?;
             (user, true)
         }
-        Some(user) if user.password_hash.is_empty() => (user, true),
-        Some(user) => (user, false),
+        Some((user, sso_user)) => {
+            if CONFIG.is_multi_tenant() {
+                crate::tenancy::ensure_same_tenant(
+                    grantor_user.tenant_id.as_deref(),
+                    user.tenant_id.as_deref(),
+                    "emergency_access::send_invite",
+                )?;
+                if sso_user.is_none() {
+                    err!(format!("Grantee user is not a verified SSO member: {}", email.escape_debug()))
+                }
+            }
+            let is_new = user.password_hash.is_empty();
+            (user, is_new)
+        }
     };
 
     if EmergencyAccess::find_by_grantor_uuid_and_grantee_uuid_or_email(
@@ -702,8 +718,22 @@ async fn password_emergency_access(
         };
 
     // change grantor_user password
+    let expected_stamp = grantor_user.security_stamp.clone();
+    let expected_enabled = CONFIG.is_multi_tenant().then_some(true);
     grantor_user.set_password(&new_master_password_hash, Some(new_key), true, None, &conn).await?;
-    grantor_user.save(&conn).await?;
+    grantor_user
+        .update_if_unchanged(
+            &expected_stamp,
+            expected_enabled,
+            crate::db::models::UserPatch {
+                password_hash: Some(grantor_user.password_hash.clone()),
+                akey: Some(grantor_user.akey.clone()),
+                security_stamp: Some(grantor_user.security_stamp.clone()),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await?;
 
     // Disable TwoFactor providers since they will otherwise block logins
     TwoFactor::delete_all_by_user(&grantor_user.uuid, &conn).await?;
@@ -721,6 +751,8 @@ async fn password_emergency_access(
 
 #[get("/emergency-access/<emer_id>/policies")]
 async fn policies_emergency_access(emer_id: EmergencyAccessId, headers: Headers, conn: DbConn) -> JsonResult {
+    check_emergency_access_enabled()?;
+
     let requesting_user = headers.user;
     let Some(emergency_access) =
         EmergencyAccess::find_by_uuid_and_grantee_uuid(&emer_id, &requesting_user.uuid, &conn).await
@@ -758,7 +790,7 @@ fn is_valid_request(
 }
 
 fn check_emergency_access_enabled() -> EmptyResult {
-    if !CONFIG.emergency_access_allowed() {
+    if !CONFIG.is_emergency_access_allowed() {
         err!("Emergency access is not enabled.")
     }
     Ok(())
@@ -766,7 +798,7 @@ fn check_emergency_access_enabled() -> EmptyResult {
 
 pub async fn emergency_request_timeout_job(pool: DbPool) {
     debug!("Start emergency_request_timeout_job");
-    if !CONFIG.emergency_access_allowed() {
+    if !CONFIG.is_emergency_access_allowed() {
         return;
     }
 
@@ -840,7 +872,7 @@ pub async fn emergency_request_timeout_job(pool: DbPool) {
 
 pub async fn emergency_notification_reminder_job(pool: DbPool) {
     debug!("Start emergency_notification_reminder_job");
-    if !CONFIG.emergency_access_allowed() {
+    if !CONFIG.is_emergency_access_allowed() {
         return;
     }
 

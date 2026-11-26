@@ -5,6 +5,7 @@ table! {
         file_name -> Text,
         file_size -> BigInt,
         akey -> Nullable<Text>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -24,6 +25,7 @@ table! {
         password_history -> Nullable<Text>,
         deleted_at -> Nullable<Timestamp>,
         reprompt -> Nullable<Integer>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -127,6 +129,7 @@ table! {
         billing_email -> Text,
         private_key -> Nullable<Text>,
         public_key -> Nullable<Text>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -151,6 +154,7 @@ table! {
         deletion_date -> Timestamp,
         disabled -> Bool,
         hide_email -> Nullable<Bool>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -219,6 +223,7 @@ table! {
         avatar_color -> Nullable<Text>,
         external_id -> Nullable<Text>,
         key_id -> Nullable<Text>,
+        tenant_id -> Nullable<Text>,
     }
 }
 
@@ -276,6 +281,79 @@ table! {
     sso_users (user_uuid) {
         user_uuid -> Text,
         identifier -> Text,
+        tenant_id -> Nullable<Text>,
+    }
+}
+
+table! {
+    tenants (id) {
+        id -> Text,
+        status -> Text,
+        home_region -> Text,
+        app_enabled -> Bool,
+        revision -> BigInt,
+        quotas_json -> Text,
+        storage_pool_bytes -> BigInt,
+        storage_ceiling_bytes -> BigInt,
+        storage_reserved_bytes -> BigInt,
+        storage_grant_expires_at -> Nullable<BigInt>,
+        storage_org_used_bytes -> BigInt,
+        storage_over_since -> Nullable<BigInt>,
+        storage_report_seq -> BigInt,
+        storage_last_applied_seq -> BigInt,
+        storage_pending_seq -> Nullable<BigInt>,
+        storage_pending_used_bytes -> Nullable<BigInt>,
+        storage_seq_stale -> Bool,
+        authority_refreshed_at -> Nullable<BigInt>,
+        access_epoch -> BigInt,
+        primary_org_uuid -> Nullable<Text>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+        deleted_at -> Nullable<Timestamp>,
+        erased_at -> Nullable<Timestamp>,
+        storage_prepared_at -> Nullable<BigInt>,
+        storage_dirty -> Bool,
+    }
+}
+
+table! {
+    tenant_erased_subjects (issuer, subject) {
+        issuer -> Text,
+        subject -> Text,
+        tenant_id -> Text,
+        revision -> BigInt,
+        erased_at -> Timestamp,
+    }
+}
+
+table! {
+    tenant_pending_deletions (id) {
+        id -> Text,
+        tenant_id -> Text,
+        user_uuid -> Nullable<Text>,
+        storage_kind -> Text,
+        object_key -> Text,
+        attempts -> Integer,
+        last_error -> Nullable<Text>,
+        created_at -> Timestamp,
+        reserved_bytes -> BigInt,
+    }
+}
+
+table! {
+    tenant_recovery_bundles (uuid) {
+        uuid -> Text,
+        tenant_id -> Text,
+        user_uuid -> Text,
+        bundle_type -> Text,
+        version -> Integer,
+        kdf_params_json -> Text,
+        wrapped_user_key -> Text,
+        wrapped_private_key -> Nullable<Text>,
+        recovery_key_hint -> Nullable<Text>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+        revoked_at -> Nullable<Timestamp>,
     }
 }
 
@@ -384,6 +462,7 @@ joinable!(collections_groups -> groups (groups_uuid));
 joinable!(event -> users_organizations (uuid));
 joinable!(auth_requests -> users (user_uuid));
 joinable!(sso_users -> users (user_uuid));
+joinable!(tenant_recovery_bundles -> users (user_uuid));
 
 allow_tables_to_appear_in_same_query!(
     archives,
@@ -392,6 +471,7 @@ allow_tables_to_appear_in_same_query!(
     ciphers_collections,
     collections,
     devices,
+    favorites,
     folders,
     folders_ciphers,
     invitations,
@@ -399,6 +479,10 @@ allow_tables_to_appear_in_same_query!(
     organizations,
     sends,
     sso_users,
+    tenants,
+    tenant_erased_subjects,
+    tenant_pending_deletions,
+    tenant_recovery_bundles,
     twofactor,
     users,
     users_collections,
@@ -410,4 +494,5 @@ allow_tables_to_appear_in_same_query!(
     collections_groups,
     event,
     auth_requests,
+    twofactor_incomplete,
 );

@@ -8,7 +8,7 @@ use crate::{
     api::EmptyResult,
     crypto,
     db::{
-        DbConn,
+        DbConn, DbConnInner,
         models::DeviceId,
         schema::{invitations, sso_users, twofactor_incomplete, users},
     },
@@ -72,6 +72,83 @@ pub struct User {
     pub external_id: Option<String>, // Todo: Needs to be removed in the future, this is not used anymore.
 
     pub key_id: Option<KeyId>,
+    pub tenant_id: Option<String>,
+}
+
+/// Targeted column-level patch for updating an existing `users` row.
+///
+/// Intentionally omits `uuid`, `enabled`, `tenant_id`, and `created_at` so account/settings
+/// handlers can never re-enable a deactivated user, alter tenant binding, or clobber unrelated
+/// columns updated concurrently (e.g. `name` from `sync_user`).
+#[derive(Default, AsChangeset)]
+#[allow(clippy::option_option, reason = "diesel: None skips the column, Some(None) writes NULL")]
+#[diesel(table_name = users)]
+pub struct UserPatch {
+    pub updated_at: Option<NaiveDateTime>,
+    pub verified_at: Option<Option<NaiveDateTime>>,
+    pub last_verifying_at: Option<Option<NaiveDateTime>>,
+    pub login_verify_count: Option<i32>,
+    pub email: Option<String>,
+    pub email_new: Option<Option<String>>,
+    pub email_new_token: Option<Option<String>>,
+    pub name: Option<String>,
+    pub password_hash: Option<Vec<u8>>,
+    pub salt: Option<Vec<u8>>,
+    pub password_iterations: Option<i32>,
+    pub password_hint: Option<Option<String>>,
+    pub akey: Option<String>,
+    pub private_key: Option<Option<String>>,
+    pub public_key: Option<Option<String>>,
+    pub totp_recover: Option<Option<String>>,
+    pub security_stamp: Option<String>,
+    pub stamp_exception: Option<Option<String>>,
+    pub equivalent_domains: Option<String>,
+    pub excluded_globals: Option<String>,
+    pub client_kdf_type: Option<i32>,
+    pub client_kdf_iter: Option<i32>,
+    pub client_kdf_memory: Option<Option<i32>>,
+    pub client_kdf_parallelism: Option<Option<i32>>,
+    pub api_key: Option<Option<String>>,
+    pub avatar_color: Option<Option<String>>,
+    pub key_id: Option<Option<KeyId>>,
+}
+
+/// Applies `patch` via an `UPDATE`-only statement gated on `(uuid, security_stamp)` and
+/// optionally `enabled`. Returns 401 if 0 rows matched (meaning the user was concurrently
+/// logged out, disabled, or erased). Never inserts.
+pub fn update_existing_user_tx(
+    conn: &mut DbConnInner,
+    user_uuid: &UserId,
+    expected_stamp: &str,
+    expected_enabled: Option<bool>,
+    patch: &UserPatch,
+) -> EmptyResult {
+    if let Some(ref email) = patch.email
+        && !crate::util::is_valid_email(email)
+    {
+        err!(format!("User email {} is not a valid email address", email.escape_debug()))
+    }
+    let updated: usize = match expected_enabled {
+        Some(enabled) => diesel::update(
+            users::table
+                .filter(users::uuid.eq(user_uuid))
+                .filter(users::enabled.eq(enabled))
+                .filter(users::security_stamp.eq(expected_stamp)),
+        )
+        .set(patch)
+        .execute(conn)
+        .map_res("Error updating user")?,
+        None => diesel::update(
+            users::table.filter(users::uuid.eq(user_uuid)).filter(users::security_stamp.eq(expected_stamp)),
+        )
+        .set(patch)
+        .execute(conn)
+        .map_res("Error updating user")?,
+    };
+    if updated == 0 {
+        err_code!("Account session is no longer valid", 401);
+    }
+    Ok(())
 }
 
 #[derive(Identifiable, Queryable, Insertable)]
@@ -87,6 +164,7 @@ pub struct Invitation {
 pub struct SsoUser {
     pub user_uuid: UserId,
     pub identifier: OIDCIdentifier,
+    pub tenant_id: Option<String>,
 }
 
 pub enum UserKdfType {
@@ -159,6 +237,7 @@ impl User {
             external_id: None, // Todo: Needs to be removed in the future, this is not used anymore.
 
             key_id: None,
+            tenant_id: None,
         }
     }
 
@@ -333,7 +412,60 @@ impl User {
         })
     }
 
+    /// Clears the used 2FA recovery code; refused if the account changed since it was loaded.
+    pub async fn clear_recovery_code(&mut self, conn: &DbConn) -> EmptyResult {
+        self.totp_recover = None;
+        self.updated_at = Utc::now().naive_utc();
+        let user = &*self;
+        conn.run(move |conn| super::update_signed_in_user_tx(conn, user, &super::SignInUpdate::RecoveryCodeUsed)).await
+    }
+
+    /// Applies `patch` to an existing, currently-enabled user row only if `security_stamp`
+    /// still equals `expected_stamp`. Never inserts a deleted row and never writes `enabled`
+    /// or `tenant_id`.
+    pub async fn update_active(&mut self, expected_stamp: &str, patch: UserPatch, conn: &DbConn) -> EmptyResult {
+        self.update_if_unchanged(expected_stamp, Some(true), patch, conn).await
+    }
+
+    /// Applies `patch` to an existing user row only if `security_stamp` (and optionally
+    /// `enabled`) still match what the handler observed. Never inserts a deleted row and never
+    /// writes `enabled` or `tenant_id`.
+    pub async fn update_if_unchanged(
+        &mut self,
+        expected_stamp: &str,
+        expected_enabled: Option<bool>,
+        mut patch: UserPatch,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        let now = Utc::now().naive_utc();
+        self.updated_at = now;
+        patch.updated_at = Some(now);
+        let uuid = self.uuid.clone();
+        let expected_stamp = expected_stamp.to_owned();
+        conn.run(move |conn| update_existing_user_tx(conn, &uuid, &expected_stamp, expected_enabled, &patch)).await
+    }
+
+    /// Clears an expired `stamp_exception` without touching `enabled`, `security_stamp`, or
+    /// resurrecting a deleted user.
+    pub async fn clear_stamp_exception(&mut self, conn: &DbConn) -> EmptyResult {
+        self.reset_stamp_exception();
+        let expected_stamp = self.security_stamp.clone();
+        self.update_if_unchanged(
+            &expected_stamp,
+            None,
+            UserPatch {
+                stamp_exception: Some(None),
+                ..Default::default()
+            },
+            conn,
+        )
+        .await
+    }
+
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
+        if CONFIG.is_multi_tenant() {
+            err_code!("Direct user upsert is disabled in multi-tenant mode", 500);
+        }
         if !crate::util::is_valid_email(&self.email) {
             err!(format!("User email {} is not a valid email address", self.email.escape_debug()))
         }

@@ -18,7 +18,7 @@ use crate::{
             Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUser, Device,
             EventType, FillAssistPolicyData, Group, GroupId, GroupUser, Invitation, Membership, MembershipId,
             MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey,
-            OrganizationId, TwoFactor, TwoFactorType, User, UserId,
+            OrganizationId, SsoUser, TwoFactor, TwoFactorType, User, UserId,
         },
     },
     mail,
@@ -186,6 +186,9 @@ struct BulkMembershipIds {
 
 #[post("/organizations", data = "<data>")]
 async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organizations are provisioned by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if !CONFIG.is_org_creation_allowed(&headers.user.email) {
         err!("User not allowed to create organizations")
     }
@@ -202,7 +205,8 @@ async fn create_organization(headers: Headers, data: Json<OrgData>, conn: DbConn
         (None, None)
     };
 
-    let org = Organization::new(data.name, &data.billing_email, private_key, public_key);
+    let mut org = Organization::new(data.name, &data.billing_email, private_key, public_key);
+    org.tenant_id = headers.user.tenant_id.clone();
     let mut member = Membership::new(headers.user.uuid, org.uuid.clone(), None);
     let collection = Collection::new(org.uuid.clone(), data.collection_name, None);
 
@@ -225,6 +229,9 @@ async fn delete_organization(
     headers: OwnerHeaders,
     conn: DbConn,
 ) -> EmptyResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organizations are managed by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -240,6 +247,9 @@ async fn delete_organization(
 
 #[post("/organizations/<org_id>/leave")]
 async fn leave_organization(org_id: OrganizationId, headers: OrgMemberHeaders, conn: DbConn) -> EmptyResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organization membership is managed by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if headers.membership.status != MembershipStatus::Confirmed as i32 {
         err!("You need to be a Member of the Organization to call this endpoint")
     }
@@ -284,6 +294,9 @@ async fn put_organization(
     data: Json<OrganizationUpdateData>,
     conn: DbConn,
 ) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organizations are managed by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -1001,6 +1014,9 @@ async fn send_invite(
     headers: AdminHeaders,
     conn: DbConn,
 ) -> EmptyResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Organization invitations are managed by KyIdentity in hosted multi-tenant mode", 403)
+    }
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
     }
@@ -1033,8 +1049,11 @@ async fn send_invite(
     let mut user_created: bool;
     for email in &data.emails {
         let mut member_status = MembershipStatus::Invited as i32;
-        let user = match User::find_by_mail(email, &conn).await {
+        let user = match SsoUser::find_by_mail(email, &conn).await {
             None => {
+                if CONFIG.is_multi_tenant() {
+                    err!(format!("User does not exist in this organization: {}", email.escape_debug()))
+                }
                 if !CONFIG.invitations_allowed() {
                     err!(format!("User does not exist: {}", email.escape_debug()))
                 }
@@ -1048,11 +1067,23 @@ async fn send_invite(
                 }
 
                 let mut new_user = User::new(email, None);
+                new_user.tenant_id = headers.user.tenant_id.clone();
                 new_user.save(&conn).await?;
                 user_created = true;
                 new_user
             }
-            Some(user) => {
+            Some((user, sso_user)) => {
+                if CONFIG.is_multi_tenant() {
+                    crate::tenancy::ensure_same_tenant(
+                        headers.user.tenant_id.as_deref(),
+                        user.tenant_id.as_deref(),
+                        "send_invite",
+                    )?;
+                    if sso_user.is_none() {
+                        err!(format!("User is not a verified SSO member: {}", email.escape_debug()))
+                    }
+                }
+
                 if Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await.is_some() {
                     err!(format!("User already in organization: {}", email.escape_debug()))
                 }
@@ -1749,7 +1780,7 @@ async fn bulk_public_keys(
 }
 
 use super::ciphers::CipherData;
-use super::ciphers::update_cipher_from_data;
+use super::ciphers::{import_ciphers_hosted, update_cipher_from_data};
 
 // The import endpoint only ever uses the name/id/external_id of a collection.
 // Bitwarden's own server ignores `groups`/`users` here too, so do not make them
@@ -1802,11 +1833,15 @@ async fn post_org_import(
     // Bitwarden does not process the import if there is one item invalid.
     // Since we check for the size of the encrypted note length, we need to do that here to pre-validate it.
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
+    crate::tenancy::check_import_limits(data.ciphers.len(), data.collections.len())?;
+    crate::tenancy::check_cipher_quota(&headers.user, i64::try_from(data.ciphers.len()).unwrap_or(i64::MAX), &conn)
+        .await?;
     Cipher::validate_cipher_data(&data.ciphers)?;
 
     let existing_collections: HashMap<CollectionId, Collection> =
         Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
     let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
+    let mut pending_collections: Vec<Collection> = Vec::new();
     for col in data.collections {
         let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
         let collection_uuid = if let Some(collection) = existing {
@@ -1824,8 +1859,15 @@ async fn post_org_import(
                 err!(Compact, "The current user isn't allowed to create new collections")
             }
             let new_collection = Collection::new(org_id.clone(), col.name, col.external_id);
-            new_collection.save(&conn).await?;
-            new_collection.uuid
+            let uuid = new_collection.uuid.clone();
+            if CONFIG.is_multi_tenant() {
+                // Stage new collections for the atomic tenant-locked import transaction so a failed
+                // quota/grant/batch check leaves no orphaned collections behind.
+                pending_collections.push(new_collection);
+            } else {
+                new_collection.save(&conn).await?;
+            }
+            uuid
         };
 
         collections.push(collection_uuid);
@@ -1840,13 +1882,40 @@ async fn post_org_import(
 
     let headers: Headers = headers.into();
 
-    let mut ciphers: Vec<CipherId> = Vec::with_capacity(data.ciphers.len());
+    let mut items = Vec::with_capacity(data.ciphers.len());
     for mut cipher_data in data.ciphers {
         // Always clear folder_id's via an organization import
         cipher_data.folder_id = None;
         // Replace the client-provided, unvalidated organizationId with the real target org
         cipher_data.organization_id = Some(org_id.clone());
+        items.push(cipher_data);
+    }
+    if CONFIG.is_multi_tenant() {
+        let mut links = Vec::with_capacity(relations.len());
+        for (cipher_index, col_index) in relations {
+            let Some(col_id) = collections.get(col_index) else {
+                err!(Compact, "Invalid collection relationship")
+            };
+            links.push((cipher_index, col_id.clone()));
+        }
+        import_ciphers_hosted(
+            items,
+            Vec::new(),
+            pending_collections,
+            &links,
+            &headers,
+            Some(collections.clone()),
+            &conn,
+            &nt,
+        )
+        .await?;
+        let mut user = headers.user;
+        return user.update_revision(&conn).await;
+    }
+    let mut ciphers: Vec<CipherId> = Vec::with_capacity(items.len());
+    for cipher_data in items {
         let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+        // Single-tenant keeps upstream's behaviour of skipping items that fail.
         update_cipher_from_data(
             &mut cipher,
             cipher_data,
@@ -1959,6 +2028,16 @@ async fn list_policies_token(org_id: OrganizationId, token: &str, conn: DbConn) 
 
     if invite.org_id != org_id {
         err!("Token doesn't match request organization");
+    }
+
+    if CONFIG.is_multi_tenant() {
+        let Some(org) = Organization::find_by_uuid(&org_id, &conn).await else {
+            err_code!("Organization not found", 403);
+        };
+        let Some(tid) = org.tenant_id.as_deref().filter(|s| !s.trim().is_empty()) else {
+            err_code!("Organization is not bound to a tenant", 403);
+        };
+        crate::tenancy::check_tenant_active(tid, &conn).await?;
     }
 
     // exit early when we have been invited via /admin panel
@@ -2960,6 +3039,9 @@ async fn recover_account(
         err!(format!("Error sending user reset password email: {e:#?}"));
     }
 
+    let expected_stamp = user.security_stamp.clone();
+    let expected_enabled = CONFIG.is_multi_tenant().then_some(true);
+    let has_new_password = new_password.is_some();
     if let Some((new_master_password_hash, new_key)) = new_password {
         user.set_password(&new_master_password_hash, Some(new_key), true, None, &conn).await?;
     }
@@ -2973,7 +3055,18 @@ async fn recover_account(
         }
     }
 
-    user.save(&conn).await?;
+    user.update_if_unchanged(
+        &expected_stamp,
+        expected_enabled,
+        crate::db::models::UserPatch {
+            password_hash: has_new_password.then(|| user.password_hash.clone()),
+            akey: has_new_password.then(|| user.akey.clone()),
+            security_stamp: has_new_password.then(|| user.security_stamp.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await?;
 
     nt.send_logout(&user, None, &conn).await;
 

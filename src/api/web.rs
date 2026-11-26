@@ -91,11 +91,11 @@ fn vaultwarden_css() -> EtagCached<String> {
     // Else, there is either no cache, or reload_templates is true and we need to rebuild the CSS
     let css_options = json!({
         "email_change_allowed": CONFIG.email_change_allowed(),
-        "emergency_access_allowed": CONFIG.emergency_access_allowed(),
+        "emergency_access_allowed": CONFIG.is_emergency_access_allowed(),
         "load_user_scss": true,
         "mail_2fa_enabled": CONFIG._enable_email_2fa(),
         "mail_enabled": CONFIG.mail_enabled(),
-        "sends_allowed": CONFIG.sends_allowed(),
+        "sends_allowed": CONFIG.is_sends_allowed(),
         "remember_2fa_disabled": CONFIG.disable_2fa_remember(),
         "password_hints_allowed": CONFIG.password_hints_allowed(),
         "signup_disabled": CONFIG.is_signup_disabled(),
@@ -230,7 +230,7 @@ async fn web_files(p: PathBuf) -> Cached<Option<NamedFile>> {
 }
 
 #[get("/attachments/<cipher_id>/<file_id>?<token>")]
-async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String) -> Option<NamedFile> {
+async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String, conn: DbConn) -> Option<NamedFile> {
     let Ok(claims) = decode_file_download(&token) else {
         return None;
     };
@@ -238,7 +238,17 @@ async fn attachments(cipher_id: CipherId, file_id: AttachmentId, token: String) 
         return None;
     }
 
-    NamedFile::open(Path::new(&CONFIG.attachments_folder()).join(cipher_id.as_ref()).join(file_id.as_ref())).await.ok()
+    // Hosted mode stores attachments in S3 and serves them through presigned URLs only.
+    if CONFIG.is_multi_tenant() {
+        return None;
+    }
+
+    let rel_path = match crate::db::models::Attachment::find_by_id(&file_id, &conn).await {
+        Some(att) => att.resolve_file_path(&conn).await.ok()?,
+        None => format!("{cipher_id}/{file_id}"),
+    };
+
+    NamedFile::open(Path::new(&CONFIG.attachments_folder()).join(rel_path)).await.ok()
 }
 
 // We use DbConn here to let the alive healthcheck also verify the database connection.

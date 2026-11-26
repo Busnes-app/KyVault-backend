@@ -61,6 +61,7 @@ pub struct Cipher {
     pub password_history: Option<String>,
     pub deleted_at: Option<NaiveDateTime>,
     pub reprompt: Option<i32>,
+    pub tenant_id: Option<String>,
 }
 
 pub enum RepromptType {
@@ -93,7 +94,23 @@ impl Cipher {
             password_history: None,
             deleted_at: None,
             reprompt: None,
+            tenant_id: None,
         }
+    }
+
+    /// Total UTF-8 byte length of the cipher's encrypted payload columns counted in
+    /// `tenant::committed_bytes`.
+    pub fn storage_bytes(&self) -> i64 {
+        let opt_len = |s: &Option<String>| s.as_deref().map_or(0, str::len);
+        let total = self
+            .name
+            .len()
+            .saturating_add(opt_len(&self.notes))
+            .saturating_add(opt_len(&self.fields))
+            .saturating_add(self.data.len())
+            .saturating_add(opt_len(&self.password_history))
+            .saturating_add(opt_len(&self.key));
+        i64::try_from(total).unwrap_or(i64::MAX)
     }
 
     pub fn validate_cipher_data(cipher_data: &[CipherData]) -> EmptyResult {
@@ -161,7 +178,7 @@ impl Cipher {
             {
                 let mut attachments_json_vec = vec![];
                 for attachment in attachments {
-                    attachments_json_vec.push(attachment.to_json(host).await?);
+                    attachments_json_vec.push(attachment.to_json(host, conn).await?);
                 }
                 attachments_json = Value::Array(attachments_json_vec);
             }
@@ -170,7 +187,7 @@ impl Cipher {
             if !attachments.is_empty() {
                 let mut attachments_json_vec = vec![];
                 for attachment in attachments {
-                    attachments_json_vec.push(attachment.to_json(host).await?);
+                    attachments_json_vec.push(attachment.to_json(host, conn).await?);
                 }
                 attachments_json = Value::Array(attachments_json_vec);
             }
@@ -436,29 +453,98 @@ impl Cipher {
     }
 
     pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
-        self.update_users_revision(conn).await;
-        self.updated_at = Utc::now().naive_utc();
+        self.save_with_attachments(&[], conn).await
+    }
 
-        db_run! { conn:
-            mysql {
-                diesel::insert_into(ciphers::table)
-                    .values(&*self)
-                    .on_conflict(diesel::dsl::DuplicatedKeys)
-                    .do_update()
-                    .set(&*self)
-                    .execute(conn)
-                    .map_res("Error saving cipher")
-            }
-            postgresql, sqlite {
-                diesel::insert_into(ciphers::table)
-                    .values(&*self)
-                    .on_conflict(ciphers::uuid)
-                    .do_update()
-                    .set(&*self)
-                    .execute(conn)
-                    .map_res("Error saving cipher")
-            }
+    /// Hosted only: saves one owner's new ciphers together with any newly staged folders,
+    /// collections, folder links, and collection links under one tenant lock and one usage scan.
+    pub async fn save_hosted_batch(
+        tenant_id: &str,
+        ciphers: &mut [Cipher],
+        folders: &mut [super::Folder],
+        collections: &[super::Collection],
+        folder_links: &[(CipherId, FolderId)],
+        collection_links: &[(CipherId, CollectionId)],
+        conn: &DbConn,
+    ) -> EmptyResult {
+        if ciphers.is_empty() && folders.is_empty() && collections.is_empty() {
+            return Ok(());
         }
+        let now = Utc::now().naive_utc();
+        for c in ciphers.iter_mut() {
+            c.updated_at = now;
+        }
+        for f in folders.iter_mut() {
+            f.updated_at = now;
+        }
+        super::Tenant::save_hosted_import(
+            tenant_id,
+            ciphers,
+            &[],
+            super::HostedBatchExtras {
+                folders,
+                collections,
+                folder_links,
+                collection_links,
+            },
+            conn,
+        )
+        .await?;
+        // Every cipher in the batch has the same owner, so one revision bump covers them all.
+        if let Some(first) = ciphers.first() {
+            first.update_users_revision(conn).await;
+        }
+        for collection in collections {
+            collection.update_users_revision(conn).await;
+        }
+        Ok(())
+    }
+
+    /// Saves the cipher and the file name and key changes of its `attachments` (key rotation).
+    pub async fn save_with_attachments(&mut self, attachments: &[Attachment], conn: &DbConn) -> EmptyResult {
+        self.save_linked(attachments, &[], conn).await
+    }
+
+    /// Saves the cipher, attachment changes, and collection links in one transaction.
+    pub async fn save_linked(
+        &mut self,
+        attachments: &[Attachment],
+        collections: &[CollectionId],
+        conn: &DbConn,
+    ) -> EmptyResult {
+        self.updated_at = Utc::now().naive_utc();
+        let links: Vec<(CipherId, CollectionId)> = collections.iter().map(|c| (self.uuid.clone(), c.clone())).collect();
+
+        if CONFIG.is_multi_tenant() {
+            let Some(tenant_id) = self.tenant_id.as_deref() else {
+                err_code!("Cipher is missing tenant ownership", 403);
+            };
+            super::Tenant::save_ciphers_enforcing_grant(
+                tenant_id,
+                std::slice::from_ref(self),
+                attachments,
+                &links,
+                conn,
+            )
+            .await?;
+            self.update_users_revision(conn).await;
+            return Ok(());
+        }
+
+        let cipher = &*self;
+        conn.run(move |conn| {
+            conn.transaction::<(), crate::Error, _>(|conn| {
+                super::upsert_cipher_tx(conn, cipher)?;
+                super::link_collections_tx(conn, &links)?;
+                for attachment in attachments {
+                    attachment.upsert_on_conn(conn)?;
+                }
+                Ok(())
+            })
+        })
+        .await?;
+        self.update_users_revision(conn).await;
+        Ok(())
     }
 
     pub async fn delete(&self, conn: &DbConn) -> EmptyResult {
@@ -469,10 +555,16 @@ impl Cipher {
         Attachment::delete_all_by_cipher(&self.uuid, conn).await?;
         Favorite::delete_all_by_cipher(&self.uuid, conn).await?;
 
+        // Hosted: flag the usage drop so even a suspended tenant reports it.
+        let tid = self.tenant_id.as_deref().filter(|_| CONFIG.is_multi_tenant());
         conn.run(move |conn| {
-            diesel::delete(ciphers::table.filter(ciphers::uuid.eq(&self.uuid)))
-                .execute(conn)
-                .map_res("Error deleting cipher")
+            conn.transaction(|conn| {
+                if let Some(tid) = tid {
+                    super::mark_storage_dirty(conn, tid)?;
+                }
+                diesel::delete(ciphers::table.filter(ciphers::uuid.eq(&self.uuid))).execute(conn).map(drop)
+            })
+            .map_res("Error deleting cipher")
         })
         .await
     }

@@ -87,8 +87,9 @@ impl Drop for WSEntryMapGuard {
     fn drop(&mut self) {
         info!("Closing WS connection from {}", self.addr);
         if let Some(mut entry) = self.users.map.get_mut(self.user_uuid.as_ref()) {
-            entry.retain(|(uuid, _)| uuid != &self.entry_uuid);
+            entry.retain(|(uuid, _, _)| uuid != &self.entry_uuid);
         }
+        self.users.map.remove_if(self.user_uuid.as_ref(), |_, senders| senders.is_empty());
     }
 }
 
@@ -128,11 +129,12 @@ impl Drop for WSAnonymousEntryMapGuard {
 
 #[expect(tail_expr_drop_order)]
 #[get("/hub?<data..>")]
-fn websockets_hub<'r>(
+async fn websockets_hub<'r>(
     ws: WebSocket,
     data: WsAccessToken,
     ip: ClientIp,
     header_token: WsAccessTokenHeader,
+    conn: DbConn,
 ) -> Result<rocket_ws::Stream!['r], Error> {
     info!("Accepting Rocket WS connection from {}", ip.ip);
 
@@ -148,13 +150,36 @@ fn websockets_hub<'r>(
         err_code!("Invalid token", 401)
     };
 
+    if Device::find_by_uuid_and_user(&claims.device, &claims.sub, &conn).await.is_none() {
+        err_code!("Invalid device id", 401)
+    }
+
+    let Some(user) = User::find_by_uuid(&claims.sub, &conn).await else {
+        err_code!("User not found", 401)
+    };
+
+    if !user.enabled || user.security_stamp != claims.sstamp {
+        err_code!("Session is no longer valid", 401)
+    }
+
+    if CONFIG.is_multi_tenant() {
+        let user_tid = crate::tenancy::require_user_tenant(&user)?;
+        if claims.tid.as_deref() != Some(user_tid) {
+            err_code!("Token tenant mismatch", 403)
+        }
+        if claims.export_only.unwrap_or(false) {
+            err_code!("Export-only sessions cannot connect to notifications", 403)
+        }
+        crate::tenancy::check_tenant_active(user_tid, &conn).await?;
+    }
+
     let (mut rx, guard) = {
         let users = Arc::clone(&WS_USERS);
 
         // Add a channel to send messages to this client to the map
         let entry_uuid = uuid::Uuid::new_v4();
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
-        users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, tx));
+        users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, user.tenant_id.clone(), tx));
 
         // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
         (rx, WSEntryMapGuard::new(users, claims.sub, entry_uuid, ip.ip))
@@ -372,22 +397,63 @@ static INITIAL_MESSAGE: InitialMessage<'static> = InitialMessage {
     version: 1,
 };
 
-// We attach the UUID to the sender so we can differentiate them when we need to remove them from the Vec
-type UserSenders = (uuid::Uuid, Sender<Message>);
+// We attach the UUID and optional tenant_id to the sender so we can remove individual connections or evict a whole tenant
+type UserSenders = (uuid::Uuid, Option<String>, Sender<Message>);
 #[derive(Clone)]
 pub struct WebSocketUsers {
     map: Arc<dashmap::DashMap<String, Vec<UserSenders>>>,
 }
 
+#[cfg_attr(not(postgresql), allow(dead_code))]
 impl WebSocketUsers {
+    pub fn deliver_local_raw(&self, user_id: &UserId, data: &[u8]) {
+        if let Some(user) = self.map.get(user_id.as_ref()).map(|v| v.clone()) {
+            for (_, _, sender) in &user {
+                if let Err(e) = sender.try_send(Message::binary(data.to_vec())) {
+                    debug!("Dropping/failing local WS update for {user_id}: {e}");
+                }
+            }
+        }
+    }
+
+    pub fn kick_local_user(&self, user_id: &UserId) {
+        if let Some((_, senders)) = self.map.remove(user_id.as_ref()) {
+            let logout_frame = create_update(
+                vec![
+                    ("UserId".into(), user_id.to_string().into()),
+                    ("Date".into(), serialize_date(Utc::now().naive_utc())),
+                ],
+                UpdateType::LogOut,
+                None,
+            );
+            for (_, _, sender) in senders {
+                drop(sender.try_send(Message::binary(logout_frame.clone())));
+                // Dropping `sender` immediately closes the client stream via rx.recv() == None
+            }
+        }
+    }
+
+    pub fn kick_local_tenant(&self, tenant_id: &str) {
+        let mut user_keys_to_kick = Vec::new();
+        for entry in self.map.iter() {
+            if entry.value().iter().any(|(_, tid, _)| tid.as_deref() == Some(tenant_id)) {
+                user_keys_to_kick.push(entry.key().clone());
+            }
+        }
+        for key in user_keys_to_kick {
+            self.kick_local_user(&UserId::from(key));
+        }
+    }
+
     async fn send_update(&self, user_id: &UserId, data: &[u8]) {
         if let Some(user) = self.map.get(user_id.as_ref()).map(|v| v.clone()) {
-            for (_, sender) in &user {
+            for (_, _, sender) in &user {
                 if let Err(e) = sender.send(Message::binary(data)).await {
                     error!("Error sending WS update {e}");
                 }
             }
         }
+        crate::tenancy::pubsub::publish_ws_frame(user_id, data);
     }
 
     // NOTE: The last modified date needs to be updated before calling these methods
@@ -425,6 +491,7 @@ impl WebSocketUsers {
 
         if CONFIG.enable_websocket() {
             self.send_update(&user.uuid, &data).await;
+            crate::tenancy::pubsub::publish_user_logout(&user.uuid);
         }
 
         if CONFIG.push_enabled() {
@@ -584,9 +651,11 @@ impl WebSocketUsers {
     }
 }
 
+type AnonymousSender = (uuid::Uuid, Sender<Message>);
+
 #[derive(Clone)]
 pub struct AnonymousWebSocketSubscriptions {
-    map: Arc<dashmap::DashMap<String, Vec<UserSenders>>>,
+    map: Arc<dashmap::DashMap<String, Vec<AnonymousSender>>>,
     connections: Arc<dashmap::DashMap<IpAddr, u32>>,
 }
 

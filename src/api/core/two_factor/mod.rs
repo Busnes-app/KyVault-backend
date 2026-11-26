@@ -116,9 +116,19 @@ async fn get_recover(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbCo
 
 async fn generate_recover_code(user: &mut User, conn: &DbConn) {
     if user.totp_recover.is_none() {
+        let expected_stamp = user.security_stamp.clone();
         let totp_recover = crypto::encode_random_bytes::<20>(&BASE32);
         user.totp_recover = Some(totp_recover);
-        user.save(conn).await.ok();
+        user.update_active(
+            &expected_stamp,
+            crate::db::models::UserPatch {
+                totp_recover: Some(user.totp_recover.clone()),
+                ..Default::default()
+            },
+            conn,
+        )
+        .await
+        .ok();
     }
 }
 

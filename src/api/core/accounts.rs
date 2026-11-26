@@ -23,7 +23,7 @@ use crate::{
             AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
             EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, KeyId, Membership,
             MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId,
-            UserKdfType,
+            UserKdfType, UserPatch,
         },
     },
     mail,
@@ -268,6 +268,9 @@ async fn is_email_2fa_required(member_id: Option<MembershipId>, conn: &DbConn) -
 }
 
 pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("Direct registration is disabled in multi-tenant mode; sign in with SSO", 403);
+    }
     let data: RegisterData = data.into_inner();
     let email = data.email.to_lowercase();
 
@@ -299,7 +302,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
         }
         // Emergency access registration
         (None, Some(accept_emergency_access_id), Some(accept_emergency_access_invite_token), None, None) => {
-            if !CONFIG.emergency_access_allowed() {
+            if !CONFIG.is_emergency_access_allowed() {
                 err!("Emergency access is not enabled.")
             }
 
@@ -367,7 +370,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
                 Membership::accept_user_invitations(&user.uuid, &conn).await?;
                 user
             } else if CONFIG.is_signup_allowed(&email)
-                || (CONFIG.emergency_access_allowed()
+                || (CONFIG.is_emergency_access_allowed()
                     && EmergencyAccess::find_invited_by_grantee_email(&email, &conn).await.is_some())
             {
                 user
@@ -430,7 +433,7 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     user.save(&conn).await?;
 
     // accept any open emergency access invitations
-    if !CONFIG.mail_enabled() && CONFIG.emergency_access_allowed() {
+    if !CONFIG.mail_enabled() && CONFIG.is_emergency_access_allowed() {
         for mut emergency_invite in EmergencyAccess::find_all_invited_by_grantee_email(&user.email, &conn).await {
             emergency_invite.accept_invite(&user.uuid, &user.email, &conn).await.ok();
         }
@@ -467,6 +470,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     .await?;
     user.password_hint = password_hint;
 
+    let has_keys = data.keys.is_some();
     if let Some(keys) = data.keys {
         user.private_key = Some(keys.encrypted_private_key);
         user.public_key = Some(keys.public_key);
@@ -495,7 +499,25 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
 
     log_user_event(EventType::UserChangedPassword, &user.uuid, headers.device.atype, &headers.ip.ip, &conn).await;
 
-    user.save(&conn).await?;
+    let expected_stamp = user.security_stamp.clone();
+    user.update_active(
+        &expected_stamp,
+        UserPatch {
+            password_hash: Some(user.password_hash.clone()),
+            password_hint: Some(user.password_hint.clone()),
+            akey: Some(user.akey.clone()),
+            stamp_exception: Some(user.stamp_exception.clone()),
+            client_kdf_type: Some(user.client_kdf_type),
+            client_kdf_iter: Some(user.client_kdf_iter),
+            client_kdf_memory: Some(user.client_kdf_memory),
+            client_kdf_parallelism: Some(user.client_kdf_parallelism),
+            private_key: has_keys.then(|| user.private_key.clone()),
+            public_key: has_keys.then(|| user.public_key.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await?;
 
     Ok(Json(json!({
       "object": "set-password",
@@ -530,9 +552,18 @@ async fn post_profile(data: Json<ProfileData>, headers: Headers, conn: DbConn) -
     }
 
     let mut user = headers.user;
+    let expected_stamp = user.security_stamp.clone();
     user.name = data.name;
 
-    user.save(&conn).await?;
+    user.update_active(
+        &expected_stamp,
+        UserPatch {
+            name: Some(user.name.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await?;
     Ok(Json(user.to_json(&conn).await))
 }
 
@@ -556,19 +587,36 @@ async fn put_avatar(data: Json<AvatarData>, headers: Headers, conn: DbConn) -> J
     }
 
     let mut user = headers.user;
+    let expected_stamp = user.security_stamp.clone();
     user.avatar_color = data.avatar_color;
 
-    user.save(&conn).await?;
+    user.update_active(
+        &expected_stamp,
+        UserPatch {
+            avatar_color: Some(user.avatar_color.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await?;
     Ok(Json(user.to_json(&conn).await))
 }
 
 #[get("/users/<user_id>/public-key")]
-async fn get_public_keys(user_id: UserId, _headers: Headers, conn: DbConn) -> JsonResult {
+async fn get_public_keys(user_id: UserId, headers: Headers, conn: DbConn) -> JsonResult {
     let user = match User::find_by_uuid(&user_id, &conn).await {
         Some(user) if user.public_key.is_some() => user,
         Some(_) => err_code!("User has no public_key", Status::NotFound.code),
         None => err_code!("User doesn't exist", Status::NotFound.code),
     };
+
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::ensure_same_tenant(
+            headers.user.tenant_id.as_deref(),
+            user.tenant_id.as_deref(),
+            "get_public_keys",
+        )?;
+    }
 
     Ok(Json(json!({
         "userId": user.uuid,
@@ -605,10 +653,20 @@ async fn post_keys(data: Json<KeysData>, headers: Headers, conn: DbConn) -> Json
         err!("User has existing keypair")
     }
 
+    let expected_stamp = user.security_stamp.clone();
     user.private_key = Some(data.encrypted_private_key);
     user.public_key = Some(data.public_key);
 
-    user.save(&conn).await?;
+    user.update_active(
+        &expected_stamp,
+        UserPatch {
+            private_key: Some(user.private_key.clone()),
+            public_key: Some(user.public_key.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await?;
 
     Ok(Json(json!({
         "privateKey": user.private_key,
@@ -659,6 +717,7 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
         };
 
     let mut user = user;
+    let expected_stamp = user.security_stamp.clone();
 
     user.password_hint = clean_password_hint(data.master_password_hint.as_ref());
     enforce_password_hint_setting(user.password_hint.as_ref())?;
@@ -677,12 +736,27 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
     )
     .await?;
 
-    let save_result = user.save(&conn).await;
+    let save_result = user
+        .update_active(
+            &expected_stamp,
+            UserPatch {
+                password_hint: Some(user.password_hint.clone()),
+                password_hash: Some(user.password_hash.clone()),
+                akey: Some(user.akey.clone()),
+                security_stamp: Some(user.security_stamp.clone()),
+                stamp_exception: Some(user.stamp_exception.clone()),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await;
 
     // Prevent logging out the client where the user requested this endpoint from.
     // If you do logout the user it will causes issues at the client side.
     // Adding the device uuid will prevent this.
-    nt.send_logout(&user, Some(&headers.device), &conn).await;
+    if save_result.is_ok() {
+        nt.send_logout(&user, Some(&headers.device), &conn).await;
+    }
 
     save_result
 }
@@ -774,6 +848,7 @@ async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, conn: DbConn, nt:
     data.authentication_data.check(&headers.user, &data.unlock_data)?;
 
     let mut user = headers.user;
+    let expected_stamp = user.security_stamp.clone();
 
     set_kdf_data(&mut user, &data.unlock_data.kdf)?;
 
@@ -785,9 +860,26 @@ async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, conn: DbConn, nt:
         &conn,
     )
     .await?;
-    let save_result = user.save(&conn).await;
+    let save_result = user
+        .update_active(
+            &expected_stamp,
+            UserPatch {
+                client_kdf_type: Some(user.client_kdf_type),
+                client_kdf_iter: Some(user.client_kdf_iter),
+                client_kdf_memory: Some(user.client_kdf_memory),
+                client_kdf_parallelism: Some(user.client_kdf_parallelism),
+                password_hash: Some(user.password_hash.clone()),
+                akey: Some(user.akey.clone()),
+                security_stamp: Some(user.security_stamp.clone()),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await;
 
-    nt.send_logout(&user, Some(&headers.device), &conn).await;
+    if save_result.is_ok() {
+        nt.send_logout(&user, Some(&headers.device), &conn).await;
+    }
 
     save_result
 }
@@ -1043,6 +1135,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
 
     // Update user data
     let mut user = headers.user;
+    let expected_stamp = user.security_stamp.clone();
 
     user.private_key = Some(data.account_keys.user_key_encrypted_account_private_key);
     user.set_password(
@@ -1054,12 +1147,26 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
     )
     .await?;
 
-    let save_result = user.save(&conn).await;
+    let save_result = user
+        .update_active(
+            &expected_stamp,
+            UserPatch {
+                private_key: Some(user.private_key.clone()),
+                password_hash: Some(user.password_hash.clone()),
+                akey: Some(user.akey.clone()),
+                security_stamp: Some(user.security_stamp.clone()),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await;
 
     // Prevent logging out the client where the user requested this endpoint from.
     // If you do logout the user it will causes issues at the client side.
     // Adding the device uuid will prevent this.
-    nt.send_logout(&user, Some(&headers.device), &conn).await;
+    if save_result.is_ok() {
+        nt.send_logout(&user, Some(&headers.device), &conn).await;
+    }
 
     save_result
 }
@@ -1077,8 +1184,17 @@ async fn post_user_key(data: Json<KeyIdData>, headers: Headers, conn: DbConn) ->
         err_code!("Unexpected data", Status::UnprocessableEntity.code);
     }
 
+    let expected_stamp = user.security_stamp.clone();
     user.key_id = Some(data.into_inner().user_key_id);
-    user.save(&conn).await
+    user.update_active(
+        &expected_stamp,
+        UserPatch {
+            key_id: Some(user.key_id.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await
 }
 
 #[post("/accounts/security-stamp", data = "<data>")]
@@ -1088,12 +1204,23 @@ async fn post_sstamp(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbCo
 
     data.validate(&user, true, &conn).await?;
 
+    let expected_stamp = user.security_stamp.clone();
     user.reset_security_stamp(&conn).await?;
-    let save_result = user.save(&conn).await;
+    let save_result = user
+        .update_active(
+            &expected_stamp,
+            UserPatch {
+                security_stamp: Some(user.security_stamp.clone()),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await;
 
-    nt.send_logout(&user, None, &conn).await;
-
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
+    if save_result.is_ok() {
+        nt.send_logout(&user, None, &conn).await;
+        Device::delete_all_by_user(&user.uuid, &conn).await?;
+    }
 
     save_result
 }
@@ -1155,9 +1282,19 @@ async fn post_email_token(data: Json<EmailTokenData>, headers: Headers, conn: Db
         );
     }
 
+    let expected_stamp = user.security_stamp.clone();
     user.email_new = Some(data.new_email);
     user.email_new_token = Some(token);
-    user.save(&conn).await
+    user.update_active(
+        &expected_stamp,
+        UserPatch {
+            email_new: Some(user.email_new.clone()),
+            email_new_token: Some(user.email_new_token.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1210,15 +1347,33 @@ async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn,
         user.verified_at = None;
     }
 
+    let expected_stamp = user.security_stamp.clone();
     user.email = data.new_email;
     user.email_new = None;
     user.email_new_token = None;
 
     user.set_password(&data.new_master_password_hash, Some(data.key), true, None, &conn).await?;
 
-    let save_result = user.save(&conn).await;
+    let save_result = user
+        .update_active(
+            &expected_stamp,
+            UserPatch {
+                verified_at: Some(user.verified_at),
+                email: Some(user.email.clone()),
+                email_new: Some(None),
+                email_new_token: Some(None),
+                password_hash: Some(user.password_hash.clone()),
+                akey: Some(user.akey.clone()),
+                security_stamp: Some(user.security_stamp.clone()),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await;
 
-    nt.send_logout(&user, None, &conn).await;
+    if save_result.is_ok() {
+        nt.send_logout(&user, None, &conn).await;
+    }
 
     save_result
 }
@@ -1259,10 +1414,26 @@ async fn post_verify_email_token(data: Json<VerifyEmailTokenData>, conn: DbConn)
     if claims.sub != *user.uuid {
         err!("Invalid claim");
     }
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::require_user_tenant_active(&user, &conn).await?;
+    }
+    let expected_stamp = user.security_stamp.clone();
     user.verified_at = Some(Utc::now().naive_utc());
     user.last_verifying_at = None;
     user.login_verify_count = 0;
-    if let Err(e) = user.save(&conn).await {
+    if let Err(e) = user
+        .update_active(
+            &expected_stamp,
+            UserPatch {
+                verified_at: Some(user.verified_at),
+                last_verifying_at: Some(None),
+                login_verify_count: Some(0),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await
+    {
         error!("Error saving email verification: {e:#?}");
     }
 
@@ -1318,6 +1489,9 @@ async fn post_delete_recover_token(data: Json<DeleteRecoverTokenData>, conn: DbC
 
     if claims.sub != *user.uuid {
         err!("Invalid claim");
+    }
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::require_user_tenant_active(&user, &conn).await?;
     }
 
     // The devices are deleted together with the user, so check for push devices beforehand
@@ -1475,10 +1649,22 @@ struct SecretVerificationRequest {
 // Change the KDF Iterations if necessary
 pub async fn kdf_upgrade(user: &mut User, pwd_hash: &str, conn: &DbConn) -> ApiResult<()> {
     if user.password_iterations < CONFIG.password_iterations() {
+        let expected_stamp = user.security_stamp.clone();
         user.password_iterations = CONFIG.password_iterations();
         user.set_password(pwd_hash, None, false, None, conn).await?;
 
-        if let Err(e) = user.save(conn).await {
+        if let Err(e) = user
+            .update_active(
+                &expected_stamp,
+                UserPatch {
+                    password_iterations: Some(user.password_iterations),
+                    password_hash: Some(user.password_hash.clone()),
+                    ..Default::default()
+                },
+                conn,
+            )
+            .await
+        {
             error!("Error updating user: {e:#?}");
         }
     }
@@ -1506,8 +1692,17 @@ async fn update_api_key(data: Json<PasswordOrOtpData>, rotate: bool, headers: He
     data.validate(&user, true, &conn).await?;
 
     if rotate || user.api_key.is_none() {
+        let expected_stamp = user.security_stamp.clone();
         user.api_key = Some(crypto::generate_api_key());
-        user.save(&conn).await.expect("Error saving API key");
+        user.update_active(
+            &expected_stamp,
+            UserPatch {
+                api_key: Some(user.api_key.clone()),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await?;
     }
 
     Ok(Json(json!({
@@ -1519,11 +1714,17 @@ async fn update_api_key(data: Json<PasswordOrOtpData>, rotate: bool, headers: He
 
 #[post("/accounts/api-key", data = "<data>")]
 async fn post_api_key(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("API keys are disabled in hosted multi-tenant mode", 403)
+    }
     update_api_key(data, false, headers, conn).await
 }
 
 #[post("/accounts/rotate-api-key", data = "<data>")]
 async fn rotate_api_key(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbConn) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("API keys are disabled in hosted multi-tenant mode", 403)
+    }
     update_api_key(data, true, headers, conn).await
 }
 
@@ -1627,8 +1828,7 @@ async fn put_device_token(device_id: DeviceId, data: Json<PushToken>, headers: H
         return Ok(());
     }
 
-    device.push_token = Some(token);
-    if let Err(e) = device.save(true, &conn).await {
+    if let Err(e) = device.update_push_token(token, &conn).await {
         err!(format!("An error occurred while trying to save the device push token: {e}"));
     }
 
@@ -1700,6 +1900,9 @@ async fn post_auth_request(
     let Some(user) = User::find_by_mail(&data.email, &conn).await else {
         err!("AuthRequest doesn't exist", "User not found")
     };
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::require_user_tenant_active(&user, &conn).await?;
+    }
 
     // Validate device uuid and type
     let device = match Device::find_by_uuid_and_user(&data.device_identifier, &user.uuid, &conn).await {
@@ -1867,6 +2070,12 @@ async fn get_auth_request_response(
         || !auth_request.check_access_code(code)
     {
         err!("AuthRequest doesn't exist", "Invalid device, IP or code")
+    }
+    if CONFIG.is_multi_tenant() {
+        let Some(user) = User::find_by_uuid(&auth_request.user_uuid, &conn).await else {
+            err_code!("AuthRequest user not found", 403);
+        };
+        crate::tenancy::require_user_tenant_active(&user, &conn).await?;
     }
 
     let response_date_utc = auth_request.response_date.map(|response_date| format_date(&response_date));

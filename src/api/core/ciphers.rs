@@ -356,14 +356,12 @@ async fn post_ciphers_create(
         err_code!("Invalid user cipher", Status::UnprocessableEntity.code);
     }
 
-    // This check is usually only needed in update_cipher_from_data(), but we
-    // need it here as well to avoid creating an empty cipher in the call to
-    // cipher.save() below.
-    enforce_personal_ownership_policy(Some(&data.cipher), &headers, &conn).await?;
+    crate::tenancy::check_cipher_quota(&headers.user, 1, &conn).await?;
 
+    // Nothing is written until the request validates, so a refused create leaves no row behind.
     let mut cipher = Cipher::new(data.cipher.r#type, data.cipher.name.clone());
     cipher.user_uuid = Some(headers.user.uuid.clone());
-    cipher.save(&conn).await?;
+    cipher.tenant_id.clone_from(&headers.user.tenant_id);
 
     // When cloning a cipher, the Bitwarden clients seem to set this field
     // based on the cipher being cloned (when creating a new cipher, it's set
@@ -373,9 +371,14 @@ async fn post_ciphers_create(
     // or otherwise), we can just ignore this field entirely.
     data.cipher.last_known_revision_date = None;
 
-    let res = share_cipher_by_uuid(&cipher.uuid, data, &headers, &conn, &nt, None).await;
-    if res.is_err() {
-        cipher.delete(&conn).await?;
+    let cipher_id = cipher.uuid.clone();
+    let res = share_cipher(cipher, data, &headers, &conn, &nt, None).await;
+    // Personal metadata is saved after the cipher transaction and can still fail.
+    if res.is_err()
+        && let Some(saved) = Cipher::find_by_uuid(&cipher_id, &conn).await
+        && let Err(e) = saved.delete(&conn).await
+    {
+        error!("Failed to remove cipher {cipher_id} after a failed create: {e:?}");
     }
     res
 }
@@ -402,7 +405,10 @@ async fn post_ciphers(data: Json<CipherData>, headers: Headers, conn: DbConn, nt
     // needed when creating a new cipher, so just ignore it unconditionally.
     data.last_known_revision_date = None;
 
+    crate::tenancy::check_cipher_quota(&headers.user, 1, &conn).await?;
+
     let mut cipher = Cipher::new(data.r#type, data.name.clone());
+    cipher.tenant_id = headers.user.tenant_id.clone();
     update_cipher_from_data(&mut cipher, data, &headers, None, &conn, &nt, UpdateType::SyncCipherCreate).await?;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, &conn).await?))
@@ -435,6 +441,30 @@ pub async fn update_cipher_from_data(
     nt: &Notify<'_>,
     ut: UpdateType,
 ) -> EmptyResult {
+    let follow_up = apply_cipher_data(cipher, data, headers, shared_to_collections.as_ref(), &[], conn, ut).await?;
+    cipher.save_with_attachments(&follow_up.rotated, conn).await?;
+    finish_cipher_save(cipher, follow_up, headers, shared_to_collections, false, conn, nt, ut).await
+}
+
+/// What is left to do for a cipher once `apply_cipher_data` has filled it and its row is saved.
+struct CipherFollowUp {
+    rotated: Vec<Attachment>,
+    folder_id: Option<FolderId>,
+    favorite: Option<bool>,
+    archived_date: Option<String>,
+    transfer_cipher: bool,
+}
+
+/// Validates `data` and applies it to `cipher` without writing the cipher row.
+async fn apply_cipher_data(
+    cipher: &mut Cipher,
+    data: CipherData,
+    headers: &Headers,
+    shared_to_collections: Option<&Vec<CollectionId>>,
+    pending_folders: &[Folder],
+    conn: &DbConn,
+    ut: UpdateType,
+) -> ApiResult<CipherFollowUp> {
     // Cleanup cipher data, like removing the 'Response' key.
     // This key is somewhere generated during Javascript so no way for us this fix this.
     // Also, upstream only retrieves keys they actually want to store, and thus skip the 'Response' key.
@@ -451,19 +481,9 @@ pub async fn update_cipher_from_data(
 
     enforce_personal_ownership_policy(Some(&data), headers, conn).await?;
 
-    // Check that the client isn't updating an existing cipher with stale data.
-    // And only perform this check when not importing ciphers, else the date/time check will fail.
-    if ut != UpdateType::None
-        && let Some(dt) = data.last_known_revision_date
-    {
-        match NaiveDateTime::parse_from_str(&dt, "%+") {
-            // ISO 8601 format
-            Err(err) => warn!("Error parsing LastKnownRevisionDate '{}': {err}", dt.escape_debug()),
-            Ok(dt) if cipher.updated_at.signed_duration_since(dt).num_seconds() > 1 => {
-                err!("The client copy of this cipher is out of date. Resync the client and try again.")
-            }
-            Ok(_) => (),
-        }
+    // Only when not importing ciphers, else the date/time check will fail.
+    if ut != UpdateType::None {
+        check_not_stale(cipher, &data)?;
     }
 
     if cipher.organization_uuid.is_some() && cipher.organization_uuid != data.organization_id {
@@ -487,7 +507,7 @@ pub async fn update_cipher_from_data(
                 // A non-empty list of collections implies the caller already validated the user's write
                 // access to them, so we can move the cipher into the organization on that basis.
                 // Write access to the cipher itself only counts when it already belongs to this organization.
-                if shared_to_collections.as_ref().is_some_and(|cols| !cols.is_empty())
+                if shared_to_collections.is_some_and(|cols| !cols.is_empty())
                     || member.has_full_access()
                     || (!transfer_cipher && cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await)
                 {
@@ -508,35 +528,10 @@ pub async fn update_cipher_from_data(
     }
 
     if let Some(ref folder_id) = data.folder_id
+        && !pending_folders.iter().any(|f| &f.uuid == folder_id && f.user_uuid == headers.user.uuid)
         && Folder::find_by_uuid_and_user(folder_id, &headers.user.uuid, conn).await.is_none()
     {
         err!("Invalid folder", "Folder does not exist or belongs to another user");
-    }
-
-    // Modify attachments name and keys when rotating
-    if let Some(attachments) = data.attachments2 {
-        for (id, attachment) in attachments {
-            let Some(mut saved_att) = Attachment::find_by_id(&id, conn).await else {
-                // Warn and continue here.
-                // A missing attachment means it was removed via an other client.
-                // Also the Desktop Client supports removing attachments and save an update afterwards.
-                // Bitwarden it self ignores these mismatches server side.
-                warn!("Attachment {} doesn't exist", id.escape_debug());
-                continue;
-            };
-
-            if saved_att.cipher_uuid != cipher.uuid {
-                // Warn and break here since cloning ciphers provides attachment data but will not be cloned.
-                // If we error out here it will break the whole cloning and causes empty ciphers to appear.
-                warn!("Attachment is not owned by the cipher");
-                break;
-            }
-
-            saved_att.akey = Some(attachment.key);
-            saved_att.file_name = attachment.file_name;
-
-            saved_att.save(conn).await?;
-        }
     }
 
     let type_data_opt = match data.r#type {
@@ -573,11 +568,57 @@ pub async fn update_cipher_from_data(
     cipher.password_history = data.password_history.map(|f| f.to_string());
     cipher.reprompt = data.reprompt.filter(|r| *r == RepromptType::None as i32 || *r == RepromptType::Password as i32);
 
-    cipher.save(conn).await?;
-    cipher.move_to_folder(data.folder_id, &headers.user.uuid, conn).await?;
-    cipher.set_favorite(data.favorite, &headers.user.uuid, conn).await?;
+    // Attachment names and keys change with the cipher key when rotating, so they are saved with it.
+    let mut rotated = Vec::new();
+    if let Some(attachments) = data.attachments2 {
+        for (id, attachment) in attachments {
+            let Some(mut saved_att) = Attachment::find_by_id(&id, conn).await else {
+                // Warn and continue here.
+                // A missing attachment means it was removed via an other client.
+                // Also the Desktop Client supports removing attachments and save an update afterwards.
+                // Bitwarden it self ignores these mismatches server side.
+                warn!("Attachment {} doesn't exist", id.escape_debug());
+                continue;
+            };
 
-    match data.archived_date {
+            if saved_att.cipher_uuid != cipher.uuid {
+                // Warn and break here since cloning ciphers provides attachment data but will not be cloned.
+                // If we error out here it will break the whole cloning and causes empty ciphers to appear.
+                warn!("Attachment is not owned by the cipher");
+                break;
+            }
+
+            saved_att.akey = Some(attachment.key);
+            saved_att.file_name = attachment.file_name;
+            rotated.push(saved_att);
+        }
+    }
+    Ok(CipherFollowUp {
+        rotated,
+        folder_id: data.folder_id,
+        favorite: data.favorite,
+        archived_date: data.archived_date,
+        transfer_cipher,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_cipher_save(
+    cipher: &Cipher,
+    follow_up: CipherFollowUp,
+    headers: &Headers,
+    shared_to_collections: Option<Vec<CollectionId>>,
+    folder_already_linked: bool,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+    ut: UpdateType,
+) -> EmptyResult {
+    if !folder_already_linked {
+        cipher.move_to_folder(follow_up.folder_id, &headers.user.uuid, conn).await?;
+    }
+    cipher.set_favorite(follow_up.favorite, &headers.user.uuid, conn).await?;
+
+    match follow_up.archived_date {
         Some(dt_str) => match NaiveDateTime::parse_from_str(&dt_str, "%+") {
             Ok(dt) => cipher.set_archived_at(dt, &headers.user.uuid, conn).await?,
             Err(err) => warn!("Error parsing ArchivedDate '{}': {err}", dt_str.escape_debug()),
@@ -585,29 +626,125 @@ pub async fn update_cipher_from_data(
         None => cipher.unarchive(&headers.user.uuid, conn).await?,
     }
 
-    if ut != UpdateType::None {
-        // Only log events for organizational ciphers
-        if let Some(org_id) = &cipher.organization_uuid {
-            let event_type = match (&ut, transfer_cipher) {
-                (UpdateType::SyncCipherCreate, true) => EventType::CipherCreated,
-                (UpdateType::SyncCipherUpdate, true) => EventType::CipherShared,
-                (_, _) => EventType::CipherUpdated,
-            };
+    notify_cipher_saved(cipher, ut, follow_up.transfer_cipher, shared_to_collections, headers, conn, nt).await;
+    Ok(())
+}
 
-            log_event(event_type, &cipher.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
-                .await;
-        }
-        nt.send_cipher_update(
-            ut,
-            cipher,
-            &cipher.update_users_revision(conn).await,
-            &headers.device,
-            shared_to_collections,
+/// Hosted imports: applies every item first, then saves newly staged folders/collections,
+/// ciphers, folder links, and collection links (`links` pairs an item index with a collection)
+/// under one tenant lock and one usage scan, so folders/collections and ciphers land together
+/// or roll back together. Personal metadata is set afterwards.
+#[allow(clippy::too_many_arguments)]
+pub async fn import_ciphers_hosted(
+    items: Vec<CipherData>,
+    mut pending_folders: Vec<Folder>,
+    pending_collections: Vec<Collection>,
+    links: &[(usize, CollectionId)],
+    headers: &Headers,
+    shared_to_collections: Option<Vec<CollectionId>>,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+) -> ApiResult<Vec<CipherId>> {
+    let tenant_id = crate::tenancy::require_user_tenant(&headers.user)?;
+    let mut ciphers = Vec::with_capacity(items.len());
+    let mut follow_ups = Vec::with_capacity(items.len());
+    let mut folder_links = Vec::new();
+    for data in items {
+        let mut cipher = Cipher::new(data.r#type, data.name.clone());
+        cipher.tenant_id.clone_from(&headers.user.tenant_id);
+        let follow_up = apply_cipher_data(
+            &mut cipher,
+            data,
+            headers,
+            shared_to_collections.as_ref(),
+            &pending_folders,
             conn,
+            UpdateType::None,
         )
-        .await;
+        .await?;
+        if let Some(ref folder_id) = follow_up.folder_id {
+            folder_links.push((cipher.uuid.clone(), folder_id.clone()));
+        }
+        // A new cipher owns no attachments, so `follow_up.rotated` is empty.
+        ciphers.push(cipher);
+        follow_ups.push(follow_up);
+    }
+    let mut cipher_links = Vec::with_capacity(links.len());
+    for (index, col_id) in links {
+        let Some(cipher) = ciphers.get(*index) else {
+            err!("Invalid collection relationship")
+        };
+        cipher_links.push((cipher.uuid.clone(), col_id.clone()));
+    }
+    Cipher::save_hosted_batch(
+        tenant_id,
+        &mut ciphers,
+        &mut pending_folders,
+        &pending_collections,
+        &folder_links,
+        &cipher_links,
+        conn,
+    )
+    .await?;
+    let linked_collections: HashSet<_> = cipher_links.iter().map(|(_, collection)| collection).collect();
+    for collection in linked_collections {
+        CollectionCipher::update_users_revision(collection, conn).await;
+    }
+    for (cipher, follow_up) in ciphers.iter().zip(follow_ups) {
+        finish_cipher_save(cipher, follow_up, headers, shared_to_collections.clone(), true, conn, nt, UpdateType::None)
+            .await?;
+    }
+    Ok(ciphers.into_iter().map(|c| c.uuid).collect())
+}
+
+/// Rejects an update made from a client copy older than the stored cipher.
+fn check_not_stale(cipher: &Cipher, data: &CipherData) -> EmptyResult {
+    let Some(dt) = &data.last_known_revision_date else {
+        return Ok(());
+    };
+    match NaiveDateTime::parse_from_str(dt, "%+") {
+        // ISO 8601 format
+        Err(err) => warn!("Error parsing LastKnownRevisionDate '{}': {err}", dt.escape_debug()),
+        Ok(dt) if cipher.updated_at.signed_duration_since(dt).num_seconds() > 1 => {
+            err!("The client copy of this cipher is out of date. Resync the client and try again.")
+        }
+        Ok(_) => (),
     }
     Ok(())
+}
+
+async fn notify_cipher_saved(
+    cipher: &Cipher,
+    ut: UpdateType,
+    transfer_cipher: bool,
+    shared_to_collections: Option<Vec<CollectionId>>,
+    headers: &Headers,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+) {
+    if ut == UpdateType::None {
+        return;
+    }
+    // Only log events for organizational ciphers
+    if let Some(org_id) = &cipher.organization_uuid {
+        let event_type = match (&ut, transfer_cipher) {
+            (UpdateType::SyncCipherCreate, true) => EventType::CipherCreated,
+            (UpdateType::SyncCipherUpdate, true) => EventType::CipherShared,
+            (_, _) => EventType::CipherUpdated,
+        };
+
+        log_event(event_type, &cipher.uuid, org_id, &headers.user.uuid, headers.device.atype, &headers.ip.ip, conn)
+            .await;
+    }
+    nt.send_cipher_update(
+        ut,
+        cipher,
+        &cipher.update_users_revision(conn).await,
+        &headers.device,
+        shared_to_collections,
+        conn,
+    )
+    .await;
 }
 
 #[derive(Deserialize)]
@@ -637,19 +774,30 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
     // Bitwarden does not process the import if there is one item invalid.
     // Since we check for the size of the encrypted note length, we need to do that here to pre-validate it.
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
+    crate::tenancy::check_import_limits(data.ciphers.len(), data.folders.len())?;
+    crate::tenancy::check_cipher_quota(&headers.user, i64::try_from(data.ciphers.len()).unwrap_or(i64::MAX), &conn)
+        .await?;
     Cipher::validate_cipher_data(&data.ciphers)?;
 
     // Read and create the folders
     let existing_folders: HashSet<Option<FolderId>> =
         Folder::find_by_user(&headers.user.uuid, &conn).await.into_iter().map(|f| Some(f.uuid)).collect();
     let mut folders: Vec<FolderId> = Vec::with_capacity(data.folders.len());
+    let mut pending_folders: Vec<Folder> = Vec::new();
     for folder in data.folders {
         let folder_id = if existing_folders.contains(&folder.id) {
             folder.id.unwrap()
         } else {
             let mut new_folder = Folder::new(headers.user.uuid.clone(), folder.name);
-            new_folder.save(&conn).await?;
-            new_folder.uuid
+            let uuid = new_folder.uuid.clone();
+            if CONFIG.is_multi_tenant() {
+                // Stage new folders for the atomic tenant-locked import transaction so a failed
+                // quota/grant/batch check leaves no orphaned folders behind.
+                pending_folders.push(new_folder);
+            } else {
+                new_folder.save(&conn).await?;
+            }
+            uuid
         };
 
         folders.push(folder_id);
@@ -663,15 +811,22 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
     }
 
     // Read and create the ciphers
+    let mut items = Vec::with_capacity(data.ciphers.len());
     for (index, mut cipher_data) in data.ciphers.into_iter().enumerate() {
         let folder_id = relations_map.get(&index).and_then(|i| folders.get(*i).cloned());
         cipher_data.folder_id = folder_id;
         // A personal import always creates personal ciphers, the organization ID is ignored instead of rejected
         // Upstream: https://github.com/bitwarden/server/blob/b06b81c1fb33ce9c9872b96397ba2b4d879b66af/src/Api/Tools/Controllers/ImportCiphersController.cs#L58
         cipher_data.organization_id = None;
-
-        let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-        update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+        items.push(cipher_data);
+    }
+    if CONFIG.is_multi_tenant() {
+        import_ciphers_hosted(items, pending_folders, Vec::new(), &[], &headers, None, &conn, &nt).await?;
+    } else {
+        for cipher_data in items {
+            let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+            update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &conn, &nt, UpdateType::None).await?;
+        }
     }
 
     let mut user = headers.user;
@@ -1144,7 +1299,7 @@ async fn share_cipher_by_uuid(
     nt: &Notify<'_>,
     override_ut: Option<UpdateType>,
 ) -> JsonResult {
-    let mut cipher = if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await {
+    let cipher = if let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await {
         if cipher.is_write_accessible_to_user(&headers.user.uuid, conn).await {
             cipher
         } else {
@@ -1154,27 +1309,46 @@ async fn share_cipher_by_uuid(
         err!("Cipher doesn't exist")
     };
 
-    // `update_cipher_from_data()` rejects this too, but only after the collections below were
-    // already linked. There are no transactions, so that would leave the cipher linked to a
-    // collection of another organization.
-    if cipher.organization_uuid.is_some() && cipher.organization_uuid != data.cipher.organization_id {
-        err!("Organization mismatch. Please resync the client before updating the cipher")
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::ensure_same_tenant(
+            headers.user.tenant_id.as_deref(),
+            cipher.tenant_id.as_deref(),
+            "share_cipher_by_uuid",
+        )?;
     }
+    share_cipher(cipher, data, headers, conn, nt, override_ut).await
+}
 
+/// Validates the target collections, then saves the cipher and its collection links in one
+/// transaction, so a failed share leaves the cipher's ownership and access as they were.
+async fn share_cipher(
+    mut cipher: Cipher,
+    data: ShareCipherData,
+    headers: &Headers,
+    conn: &DbConn,
+    nt: &Notify<'_>,
+    override_ut: Option<UpdateType>,
+) -> JsonResult {
     let mut shared_to_collections = vec![];
 
     if let Some(organization_id) = &data.cipher.organization_id {
+        if CONFIG.is_multi_tenant() {
+            let Some(org) = crate::db::models::Organization::find_by_uuid(organization_id, conn).await else {
+                err!("Organization doesn't exist");
+            };
+            crate::tenancy::ensure_same_tenant(
+                headers.user.tenant_id.as_deref(),
+                org.tenant_id.as_deref(),
+                "share_cipher_by_uuid_org",
+            )?;
+        }
         for col_id in &data.collection_ids {
             match Collection::find_by_uuid_and_org(col_id, organization_id, conn).await {
                 None => err!("Invalid collection ID provided"),
-                Some(collection) => {
-                    if collection.is_writable_by_user(&headers.user.uuid, conn).await {
-                        CollectionCipher::save(&cipher.uuid, &collection.uuid, conn).await?;
-                        shared_to_collections.push(collection.uuid);
-                    } else {
-                        err!("No rights to modify the collection")
-                    }
+                Some(collection) if collection.is_writable_by_user(&headers.user.uuid, conn).await => {
+                    shared_to_collections.push(collection.uuid);
                 }
+                Some(_) => err!("No rights to modify the collection"),
             }
         }
     }
@@ -1189,7 +1363,17 @@ async fn share_cipher_by_uuid(
         UpdateType::SyncCipherCreate
     };
 
-    update_cipher_from_data(&mut cipher, data.cipher, headers, Some(shared_to_collections), conn, nt, ut).await?;
+    if ut != UpdateType::None {
+        check_not_stale(&cipher, &data.cipher)?;
+    }
+    let follow_up =
+        apply_cipher_data(&mut cipher, data.cipher, headers, Some(&shared_to_collections), &[], conn, UpdateType::None)
+            .await?;
+    cipher.save_linked(&follow_up.rotated, &shared_to_collections, conn).await?;
+    let transfer_cipher = follow_up.transfer_cipher;
+    // UpdateType::None: the notification below goes out once, with the collections linked.
+    finish_cipher_save(&cipher, follow_up, headers, None, false, conn, nt, UpdateType::None).await?;
+    notify_cipher_saved(&cipher, ut, transfer_cipher, Some(shared_to_collections), headers, conn, nt).await;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))
 }
@@ -1216,7 +1400,9 @@ async fn get_attachment(
     }
 
     match Attachment::find_by_id(&attachment_id, &conn).await {
-        Some(attachment) if cipher_id == attachment.cipher_uuid => Ok(Json(attachment.to_json(&headers.host).await?)),
+        Some(attachment) if cipher_id == attachment.cipher_uuid => {
+            Ok(Json(attachment.to_json(&headers.host, &conn).await?))
+        }
         Some(_) => err!("Attachment doesn't belong to cipher"),
         None => err!("Attachment doesn't exist"),
     }
@@ -1286,6 +1472,14 @@ async fn post_attachment_v2(
         err!("Cipher doesn't exist")
     };
 
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::ensure_same_tenant(
+            headers.user.tenant_id.as_deref(),
+            cipher.tenant_id.as_deref(),
+            "post_attachment_v2",
+        )?;
+    }
+
     if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await {
         err!("Cipher is not write accessible")
     }
@@ -1309,8 +1503,9 @@ async fn post_attachment_v2(
 
     let attachment_id = crypto::generate_attachment_id();
     let attachment =
-        Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key));
-    attachment.save(&conn).await.expect("Error saving attachment");
+        Attachment::new(attachment_id.clone(), cipher.uuid.clone(), data.file_name, file_size, Some(data.key))
+            .with_tenant_id(headers.user.tenant_id.clone());
+    crate::tenancy::put_attachment(&headers.user, &attachment, &conn).await?;
     notify_attachment_created(&cipher, &headers, &conn, &nt).await;
 
     let url = format!("/ciphers/{}/attachment/{attachment_id}", cipher.uuid);
@@ -1337,13 +1532,13 @@ struct UploadData<'f> {
 /// Saves the data content of an attachment to a file. This is common code
 /// shared between the v2 and legacy attachment APIs.
 ///
-/// When used with the legacy API, this function is responsible for creating
-/// the attachment database record, so `attachment` is None.
-///
 /// When used with the v2 API, post_attachment_v2() has already created the
 /// database record, which is passed in as `attachment`.
+///
+/// When used with the legacy API, this function is responsible for creating
+/// the attachment database record, so `attachment` is None.
 async fn save_attachment(
-    mut attachment: Option<Attachment>,
+    attachment: Option<Attachment>,
     cipher_id: CipherId,
     data: Form<UploadData<'_>>,
     headers: &Headers,
@@ -1363,6 +1558,21 @@ async fn save_attachment(
         err!("Cipher doesn't exist")
     };
 
+    if CONFIG.is_multi_tenant() {
+        crate::tenancy::ensure_same_tenant(
+            headers.user.tenant_id.as_deref(),
+            cipher.tenant_id.as_deref(),
+            "save_attachment_cipher",
+        )?;
+        if let Some(ref att) = attachment {
+            crate::tenancy::ensure_same_tenant(
+                headers.user.tenant_id.as_deref(),
+                att.tenant_id.as_deref(),
+                "save_attachment_att",
+            )?;
+        }
+    }
+
     if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn).await {
         err!("Cipher is not write accessible")
     }
@@ -1380,36 +1590,28 @@ async fn save_attachment(
         err!("Attachment storage limit exceeded with this file");
     }
 
-    let file_id = match &attachment {
-        Some(attachment) => attachment.id.clone(), // v2 API
-        None => crypto::generate_attachment_id(),  // Legacy API
-    };
+    let (storage_path, created_attachment) = if let Some(ref attachment) = attachment {
+        // v2 API: in single-tenant mode validate leeway before writing object storage.
+        // In multi-tenant mode `begin_v2_attachment_upload` validates leeway and computes storage
+        // admission atomically from the locked current attachment row AFTER acquiring the
+        // per-attachment in-flight upload lock (so a concurrent bad-size request cannot delete an
+        // in-flight attachment).
+        if !CONFIG.is_multi_tenant() {
+            const LEEWAY: i64 = 1024 * 1024; // 1 MiB
+            let Some(max_size) = attachment.file_size.checked_add(LEEWAY) else {
+                err!("Invalid attachment size max")
+            };
+            let Some(min_size) = attachment.file_size.checked_sub(LEEWAY) else {
+                err!("Invalid attachment size min")
+            };
 
-    if let Some(attachment) = &mut attachment {
-        // v2 API
-
-        // Check the actual size against the size initially provided by
-        // the client. Upstream allows +/- 1 MiB deviation from this
-        // size, but it's not clear when or why this is needed.
-        const LEEWAY: i64 = 1024 * 1024; // 1 MiB
-        let Some(max_size) = attachment.file_size.checked_add(LEEWAY) else {
-            err!("Invalid attachment size max")
-        };
-        let Some(min_size) = attachment.file_size.checked_sub(LEEWAY) else {
-            err!("Invalid attachment size min")
-        };
-
-        if min_size <= size && size <= max_size {
-            if size != attachment.file_size {
-                // Update the attachment with the actual file size.
-                attachment.file_size = size;
-                attachment.save(&conn).await.expect("Error updating attachment");
+            if !(min_size <= size && size <= max_size) {
+                attachment.delete(&conn).await.ok();
+                err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
             }
-        } else {
-            attachment.delete(&conn).await.ok();
-
-            err!(format!("Attachment size mismatch (expected within [{min_size}, {max_size}], got {size})"));
         }
+        let path = attachment.resolve_file_path(&conn).await?;
+        (path, None)
     } else {
         // Legacy API
 
@@ -1424,12 +1626,65 @@ async fn save_attachment(
         if data.key.is_none() {
             err!("No attachment key provided")
         }
-        let attachment =
-            Attachment::new(file_id.clone(), cipher_id.clone(), encrypted_filename.unwrap(), size, data.key);
-        attachment.save(&conn).await.expect("Error saving attachment");
+        let file_id = crypto::generate_attachment_id();
+        let att = Attachment::new(file_id, cipher_id.clone(), encrypted_filename.unwrap(), size, data.key)
+            .with_tenant_id(headers.user.tenant_id.clone());
+        let path = att.resolve_file_path(&conn).await?;
+        (path, Some(att))
+    };
+
+    // Acquire upload lease (fencing epoch, reserved bytes, durable upload_in_flight cleanup row).
+    // For hosted v2 uploads this runs in a single transaction under the tenant lock so concurrent
+    // uploads for the same attachment are serialized across replicas and storage admission is
+    // computed from the locked current attachment row.
+    let lease = match (&created_attachment, &attachment) {
+        (Some(att), _) => crate::tenancy::begin_legacy_attachment_upload(&headers.user, att, &conn).await?,
+        (None, Some(att)) => crate::tenancy::begin_v2_attachment_upload(&headers.user, att, size, &conn).await?,
+        (None, None) => unreachable!("either created_attachment or attachment is always Some"),
+    };
+    let (upload_epoch, held, pending_cleanup_id) =
+        lease.map_or((None, 0, None), |l| (Some(l.access_epoch), l.reserved_bytes, Some(l.pending_cleanup_id)));
+
+    let Some(uploaded) = created_attachment.as_ref().or(attachment.as_ref()) else {
+        unreachable!("either created_attachment or attachment is always Some")
+    };
+    let is_v2 = attachment.is_some();
+    if let Err(e) = save_temp_file(&PathType::Attachments, &storage_path, data.data, true).await {
+        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), uploaded, is_v2, &headers.user, &conn).await;
+        return Err(e);
     }
 
-    save_temp_file(&PathType::Attachments, &format!("{cipher_id}/{file_id}"), data.data, true).await?;
+    let finalize_res = match (&created_attachment, &attachment) {
+        (Some(att), _) => {
+            crate::tenancy::save_attachment_releasing(
+                &headers.user,
+                att,
+                held,
+                upload_epoch,
+                pending_cleanup_id.as_deref(),
+                &conn,
+            )
+            .await
+        }
+        (None, Some(att)) => {
+            crate::tenancy::finalize_v2_attachment_upload(
+                &headers.user,
+                att,
+                size,
+                held,
+                upload_epoch,
+                pending_cleanup_id.as_deref(),
+                &conn,
+            )
+            .await
+        }
+        (None, None) => unreachable!("either created_attachment or attachment is always Some"),
+    };
+
+    if let Err(e) = finalize_res {
+        abandon_upload(&storage_path, pending_cleanup_id.as_deref(), uploaded, is_v2, &headers.user, &conn).await;
+        return Err(e);
+    }
 
     // With the v2 API, post_attachment_v2() already did this when it created the attachment record
     if attachment.is_none() {
@@ -1437,6 +1692,27 @@ async fn save_attachment(
     }
 
     Ok((cipher, conn))
+}
+
+/// Undoes a failed upload. Hosted uploads hand the object to the cleanup worker.
+async fn abandon_upload(
+    storage_path: &str,
+    pending_cleanup_id: Option<&str>,
+    att: &Attachment,
+    is_v2: bool,
+    user: &User,
+    conn: &DbConn,
+) {
+    if let Some(pid) = pending_cleanup_id {
+        crate::tenancy::abandon_upload(user, pid, att, is_v2, conn).await;
+        return;
+    }
+    if let Ok(operator) = CONFIG.opendal_operator_for_path_type(&PathType::Attachments) {
+        operator.delete(storage_path).await.ok();
+    }
+    if is_v2 {
+        att.delete(conn).await.ok();
+    }
 }
 
 /// Sends the cipher update to the clients and logs the attachment event

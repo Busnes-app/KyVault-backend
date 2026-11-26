@@ -30,8 +30,8 @@ use crate::{
         DbConn,
         models::{
             AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError,
-            OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
-            TwoFactorType, User, UserId,
+            OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TenantErasedSubject, TwoFactor,
+            TwoFactorIncomplete, TwoFactorType, User, UserId, UserPatch,
         },
     },
     error::MapResult,
@@ -66,6 +66,9 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             check_is_some(data.refresh_token.as_ref(), "refresh_token cannot be blank")?;
             refresh_login(data, &conn, &client_header.ip).await
         }
+        "password" if CONFIG.is_multi_tenant() => {
+            err_code!("Password sign-in is disabled in hosted multi-tenant mode; use SSO", 403)
+        }
         "password" if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO sign-in is required"),
         "password" => {
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
@@ -78,6 +81,9 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             check_is_some(data.device_type.as_ref(), "device_type cannot be blank")?;
 
             password_login(data, &mut user_id, &conn, &client_header.ip).await
+        }
+        "client_credentials" if CONFIG.is_multi_tenant() => {
+            err_code!("API key authentication is disabled in hosted multi-tenant mode", 403)
         }
         "client_credentials" => {
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
@@ -98,6 +104,9 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             sso_login(data, &mut user_id, &conn, &client_header.ip).await
         }
         "authorization_code" => err!("SSO sign-in is not available"),
+        "send_access" if !CONFIG.is_sends_allowed() => {
+            err_code!("Bitwarden Send is disabled in hosted multi-tenant mode", 403)
+        }
         "send_access" => {
             crate::ratelimit::check_limit_unauthenticated(&client_header.ip.ip)?;
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
@@ -161,10 +170,7 @@ async fn refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> JsonR
                 format!("Unable to refresh login credentials: {}", err.message())
             )
         }
-        Ok((mut device, auth_tokens)) => {
-            // Save to update `device.updated_at` to track usage and toggle new status
-            device.save(true, conn).await?;
-
+        Ok(auth_tokens) => {
             let result = json!({
                 "refresh_token": auth_tokens.refresh_token(),
                 "access_token": auth_tokens.access_token(),
@@ -202,7 +208,38 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
     };
 
     let (sso_auth, user_infos) = sso::exchange_code(code, code_verifier, conn).await?;
+
+    let multi_tenant_id = if CONFIG.is_multi_tenant() {
+        if user_infos.export_only {
+            err_code!("Export-only principals cannot open ordinary vault sessions", 403);
+        }
+        if user_infos.is_staff_admin {
+            err_code!("Platform staff principals cannot sign in to customer vaults", 403);
+        }
+        if TenantErasedSubject::is_erased(&user_infos.issuer, &user_infos.subject, conn).await {
+            err_code!("Account has been permanently erased", 403);
+        }
+        let Some(tid) = user_infos.org_id.as_deref().filter(|s| !s.trim().is_empty()) else {
+            err_code!("OIDC token is missing required org_id claim", 403);
+        };
+        crate::tenancy::check_tenant_active(tid, conn).await?;
+        Some(tid.to_owned())
+    } else {
+        None
+    };
+
     let user_with_sso = match SsoUser::find_by_identifier(&user_infos.identifier, conn).await {
+        None if CONFIG.is_multi_tenant() => {
+            // In multi-tenant mode, NEVER adopt an existing user by email.
+            if User::find_by_mail(&user_infos.email, conn).await.is_some() {
+                error!(
+                    "Multi-tenant SSO login failure ({}): email ({}) already exists without matching OIDC subject",
+                    user_infos.identifier, user_infos.email
+                );
+                err_code!("Account email is already bound to another identity", 403);
+            }
+            None
+        }
         None => match SsoUser::find_by_mail(&user_infos.email, conn).await {
             None => None,
             Some((user, Some(_))) => {
@@ -275,14 +312,23 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                 _ => Some((user, None)),
             },
         },
-        Some((user, sso_user)) => Some((user, Some(sso_user))),
+        Some((user, sso_user)) => {
+            if CONFIG.is_multi_tenant() && user.tenant_id.as_deref() != multi_tenant_id.as_deref() {
+                error!(
+                    "Cross-tenant SSO login rejected for identifier ({}): user tenant {:?}, token org_id {:?}",
+                    user_infos.identifier, user.tenant_id, multi_tenant_id
+                );
+                err_code!("Cross-tenant login denied", 403);
+            }
+            Some((user, Some(sso_user)))
+        }
     };
 
     let now = Utc::now().naive_utc();
     // Will trigger 2FA flow if needed
     let (user, mut device, twofactor_token, sso_user) = match user_with_sso {
         None => {
-            if !CONFIG.is_sso_signup_allowed(&user_infos.email) {
+            if !CONFIG.is_multi_tenant() && !CONFIG.is_sso_signup_allowed(&user_infos.email) {
                 if CONFIG.signups_domains_whitelist().is_empty() {
                     err!(
                         "Signups are disabled. You will need an invitation",
@@ -318,11 +364,25 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
 
             let mut user = User::new(&user_infos.email, user_infos.user_name.clone());
             user.verified_at = Some(now);
-            user.save(conn).await?;
+            user.tenant_id = multi_tenant_id.clone();
+            let (user, sso_user) = if CONFIG.is_multi_tenant() {
+                let link = SsoUser {
+                    user_uuid: user.uuid.clone(),
+                    identifier: user_infos.identifier.clone(),
+                    tenant_id: user.tenant_id.clone(),
+                };
+                let (user, link) =
+                    crate::tenancy::provision_sso_user(user, link, &user_infos.issuer, &user_infos.subject, conn)
+                        .await?;
+                (user, Some(link))
+            } else {
+                user.save(conn).await?;
+                (user, None)
+            };
 
             let device = get_device(&data, conn, &user).await?;
 
-            (user, device, None, None)
+            (user, device, None, sso_user)
         }
         Some((user, _)) if !user.enabled => {
             err!(
@@ -345,7 +405,11 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
                     user.name = user_name.clone();
                 }
 
-                user.save(conn).await?;
+                if CONFIG.is_multi_tenant() {
+                    crate::tenancy::update_sso_user(&mut user, &user_infos.issuer, &user_infos.subject, conn).await?;
+                } else {
+                    user.save(conn).await?;
+                }
             }
 
             if user.email != user_infos.email {
@@ -454,10 +518,22 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             if resend_limit == 0 || user.login_verify_count < resend_limit {
                 // We want to send another email verification if we require signups to verify
                 // their email address, and we haven't sent them a reminder in a while...
+                let expected_stamp = user.security_stamp.clone();
                 user.last_verifying_at = Some(now);
                 user.login_verify_count += 1;
 
-                if let Err(e) = user.save(conn).await {
+                if let Err(e) = user
+                    .update_active(
+                        &expected_stamp,
+                        UserPatch {
+                            last_verifying_at: Some(user.last_verifying_at),
+                            login_verify_count: Some(user.login_verify_count),
+                            ..Default::default()
+                        },
+                        conn,
+                    )
+                    .await
+                {
                     error!("Error updating user: {e:#?}");
                 }
 
@@ -528,8 +604,8 @@ async fn authenticated_response(
         register_push_device(device, conn).await?;
     }
 
-    // Save to update `device.updated_at` to track usage and toggle new status
-    device.save(true, conn).await?;
+    // Touch `device.updated_at` (and any new `twofactor_remember`) only if the session was not revoked mid-login
+    device.touch_authenticated(twofactor_token.is_some(), conn).await?;
 
     let master_password_policy = identity_master_password_policy(user, conn).await;
 
@@ -599,6 +675,10 @@ async fn authenticated_response(
 }
 
 async fn api_key_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbConn, ip: &ClientIp) -> JsonResult {
+    if CONFIG.is_multi_tenant() {
+        err_code!("API key authentication is disabled in hosted multi-tenant mode", 403)
+    }
+
     // Ratelimit the login
     crate::ratelimit::check_limit_login(&ip.ip)?;
 
@@ -685,8 +765,8 @@ async fn user_api_key_login(
     // let orgs = Membership::find_confirmed_by_user(&user.uuid, conn).await;
     let access_claims = auth::LoginJwtClaims::default(&device, &user, &AuthMethod::UserApiKey, data.client_id);
 
-    // Save to update `device.updated_at` to track usage and toggle new status
-    device.save(true, conn).await?;
+    // Touch `device.updated_at` only if the device session was not revoked mid-login
+    device.touch_authenticated(false, conn).await?;
 
     info!("User {} logged in successfully via API key. IP: {}", user.email, ip.ip);
 
@@ -871,9 +951,8 @@ async fn twofactor_auth(
                 _ => {
                     // Always delete the current twofactor remember token here if it exists
                     if device.twofactor_remember.is_some() {
-                        device.delete_twofactor_remember();
-                        // We need to save here, since we send a err_json!() which prevents saving `device` at a later stage
-                        device.save(true, conn).await?;
+                        // Clear only `twofactor_remember` so we never overwrite a concurrently rotated refresh_token
+                        device.clear_twofactor_remember(conn).await?;
                     }
                     err_json!(
                         json_err_twofactor(&twofactor_ids, user, data, conn).await?,
@@ -914,8 +993,7 @@ async fn twofactor_auth(
             }
 
             // Remove the recovery code, not needed without twofactors
-            user.totp_recover = None;
-            user.save(conn).await?;
+            user.clear_recovery_code(conn).await?;
         }
         _ => err!(
             "Invalid two factor provider",

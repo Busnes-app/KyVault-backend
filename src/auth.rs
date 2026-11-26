@@ -21,6 +21,7 @@ use ring::hmac;
 use serde::{de::DeserializeOwned, ser::Serialize};
 
 use rocket::{
+    http::Status,
     outcome::try_outcome,
     request::{FromRequest, Outcome, Request},
 };
@@ -88,6 +89,12 @@ pub async fn initialize_keys() -> Result<(), Error> {
     let (priv_key, priv_key_buffer) = if let Some(priv_key_buffer) = priv_key_buffer {
         (Rsa::private_key_from_pem(priv_key_buffer.to_vec().as_slice())?, priv_key_buffer.to_vec())
     } else {
+        if CONFIG.is_multi_tenant() {
+            err!(
+                "Pre-provisioned shared RSA signing key '{}' is missing in multi-tenant mode; refusing to auto-generate per-replica key",
+                CONFIG.private_rsa_key()
+            );
+        }
         let rsa_key = Rsa::generate(2048)?;
         let priv_key_buffer = rsa_key.private_key_to_pem()?;
         operator.write(&rsa_key_filename, priv_key_buffer.clone()).await?;
@@ -234,6 +241,12 @@ pub struct LoginJwtClaims {
     pub scope: Vec<String>,
     // [ "Application" ]
     pub amr: Vec<String>,
+
+    // Multi-tenant KyVault claims
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_only: Option<bool>,
 }
 
 impl LoginJwtClaims {
@@ -289,6 +302,8 @@ impl LoginJwtClaims {
             client_id: client_id.unwrap_or("undefined".to_owned()),
             scope,
             amr: vec!["Application".into()],
+            tid: user.tenant_id.clone(),
+            export_only: None,
         }
     }
 
@@ -706,6 +721,29 @@ impl<'r> FromRequest<'r> for Headers {
             err_handler!("Device has no user associated")
         };
 
+        if !user.enabled {
+            err_handler!("User is disabled")
+        }
+
+        if CONFIG.is_multi_tenant() {
+            let Some(tenant_id) = user.tenant_id.as_deref().filter(|s| !s.is_empty()) else {
+                err_handler!("User has no tenant binding")
+            };
+            if claims.tid.as_deref() != Some(tenant_id) {
+                err_handler!("Token tenant mismatch")
+            }
+            if claims.export_only.unwrap_or(false) {
+                return Outcome::Error((
+                    Status::Forbidden,
+                    "Export-only sessions are not allowed on ordinary vault endpoints",
+                ));
+            }
+            if let Err(e) = crate::tenancy::check_tenant_active(tenant_id, &conn).await {
+                warn!("Rejected request for tenant {tenant_id}: {e}");
+                return Outcome::Error((Status::Forbidden, "Tenant is unavailable"));
+            }
+        }
+
         if user.security_stamp != claims.sstamp {
             if let Some(stamp_exception) =
                 user.stamp_exception.as_deref().and_then(|s| serde_json::from_str::<UserStampException>(s).ok())
@@ -721,8 +759,7 @@ impl<'r> FromRequest<'r> for Headers {
                     // If the stamp exception has been expired remove it from the database.
                     // This prevents checking this stamp exception for new requests.
                     let mut user = user;
-                    user.reset_stamp_exception();
-                    if let Err(e) = user.save(&conn).await {
+                    if let Err(e) = user.clear_stamp_exception(&conn).await {
                         error!("Error updating user: {e:#?}");
                     }
                     err_handler!("Stamp exception is expired")
@@ -797,7 +834,7 @@ impl<'r> FromRequest<'r> for OrgIdGuard {
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         match get_org_id(request) {
             Some(_) => Outcome::Success(OrgIdGuard),
-            None => Outcome::Forward(rocket::http::Status::NotFound),
+            None => Outcome::Forward(Status::NotFound),
         }
     }
 }
@@ -819,6 +856,20 @@ impl<'r> FromRequest<'r> for OrgHeaders {
                 };
 
                 let user = headers.user;
+                if CONFIG.is_multi_tenant() {
+                    let Some(org) = crate::db::models::Organization::find_by_uuid(&org_id, &conn).await else {
+                        return Outcome::Error((Status::Forbidden, "Organization not found"));
+                    };
+                    if crate::tenancy::ensure_same_tenant(
+                        user.tenant_id.as_deref(),
+                        org.tenant_id.as_deref(),
+                        "OrgHeaders",
+                    )
+                    .is_err()
+                    {
+                        return Outcome::Error((Status::Forbidden, "Cross-tenant organization access denied"));
+                    }
+                }
                 let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await else {
                     err_handler!("The current user isn't member of the organization");
                 };
@@ -1308,6 +1359,11 @@ pub struct RefreshJwtClaims {
     pub device_token: String,
 
     pub token: Option<TokenWrapper>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_only: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1352,6 +1408,8 @@ impl AuthTokens {
             sub,
             device_token: device.refresh_token.clone(),
             token: None,
+            tid: user.tenant_id.clone(),
+            export_only: None,
         };
 
         Self {
@@ -1366,7 +1424,7 @@ pub async fn refresh_tokens(
     refresh_token: &str,
     client_id: Option<String>,
     conn: &DbConn,
-) -> ApiResult<(Device, AuthTokens)> {
+) -> ApiResult<AuthTokens> {
     let refresh_claims = match decode_refresh(refresh_token) {
         Err(err) => {
             error!("Failed to decode refresh_token from {}: {err:?}", ip.ip);
@@ -1375,17 +1433,12 @@ pub async fn refresh_tokens(
         Ok(claims) => claims,
     };
 
-    // Get device by refresh token
-    let Some(mut device) = Device::find_by_refresh_token(&refresh_claims.device_token, conn).await else {
-        err!("Invalid refresh token")
-    };
+    if CONFIG.is_multi_tenant() && refresh_claims.export_only.unwrap_or(false) {
+        err_code!("Export-only sessions cannot refresh ordinary vault tokens", 403);
+    }
 
-    // Save to update `updated_at`.
-    device.save(true, conn).await?;
-
-    let Some(user) = User::find_by_uuid(&device.user_uuid, conn).await else {
-        err!("Impossible to find user")
-    };
+    let (device, user) =
+        Device::load_and_touch_for_refresh(&refresh_claims.device_token, refresh_claims.tid.as_deref(), conn).await?;
 
     let auth_tokens = match refresh_claims.sub {
         AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {
@@ -1400,7 +1453,7 @@ pub async fn refresh_tokens(
         _ => err!("Invalid auth method, cannot refresh token"),
     };
 
-    Ok((device, auth_tokens))
+    Ok(auth_tokens)
 }
 
 #[cfg(test)]

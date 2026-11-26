@@ -49,6 +49,7 @@ pub struct Send {
 
     pub disabled: bool,
     pub hide_email: Option<bool>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, num_derive::FromPrimitive)]
@@ -96,6 +97,51 @@ impl Send {
 
             disabled: false,
             hide_email: None,
+            tenant_id: None,
+        }
+    }
+
+    pub fn get_dir_path_in_cell(&self, cell: Option<&str>) -> Result<String, crate::Error> {
+        if let Some(ref tid) = self.tenant_id {
+            let Some(cell) = cell.filter(|c| crate::tenancy::is_valid_cell_slug(c)) else {
+                err_code!("Tenant cell is missing or invalid", 500);
+            };
+            Ok(format!("cells/{cell}/tenants/{tid}/sends/{}", self.uuid))
+        } else {
+            Ok(self.uuid.to_string())
+        }
+    }
+
+    pub fn get_file_path_in_cell(&self, file_id: &str, cell: Option<&str>) -> Result<String, crate::Error> {
+        if let Some(ref tid) = self.tenant_id {
+            let Some(cell) = cell.filter(|c| crate::tenancy::is_valid_cell_slug(c)) else {
+                err_code!("Tenant cell is missing or invalid", 500);
+            };
+            Ok(crate::tenancy::send_object_key(cell, tid, &self.uuid, file_id))
+        } else {
+            Ok(format!("{}/{file_id}", self.uuid))
+        }
+    }
+
+    pub async fn resolve_dir_path(&self, conn: &DbConn) -> Result<String, crate::Error> {
+        if let Some(ref tid) = self.tenant_id {
+            let Some(tenant) = super::Tenant::find_by_id(tid, conn).await else {
+                err_code!("Tenant not found for send path", 403);
+            };
+            self.get_dir_path_in_cell(Some(&tenant.home_region))
+        } else {
+            self.get_dir_path_in_cell(None)
+        }
+    }
+
+    pub async fn resolve_file_path(&self, file_id: &str, conn: &DbConn) -> Result<String, crate::Error> {
+        if let Some(ref tid) = self.tenant_id {
+            let Some(tenant) = super::Tenant::find_by_id(tid, conn).await else {
+                err_code!("Tenant not found for send path", 403);
+            };
+            self.get_file_path_in_cell(file_id, Some(&tenant.home_region))
+        } else {
+            self.get_file_path_in_cell(file_id, None)
         }
     }
 
@@ -279,11 +325,20 @@ impl Send {
 
         if self.atype == SendType::File as i32 {
             let operator = CONFIG.opendal_operator_for_path_type(&PathType::Sends)?;
-            operator.delete_with(&self.uuid).recursive(true).await.ok();
+            let dir_path = self.resolve_dir_path(conn).await?;
+            operator.delete_with(&dir_path).recursive(true).await.ok();
         }
 
+        // Hosted: flag the usage drop so even a suspended tenant reports it.
+        let tid = self.tenant_id.as_deref().filter(|_| CONFIG.is_multi_tenant());
         conn.run(move |conn| {
-            diesel::delete(sends::table.filter(sends::uuid.eq(&self.uuid))).execute(conn).map_res("Error deleting send")
+            conn.transaction(|conn| {
+                if let Some(tid) = tid {
+                    super::mark_storage_dirty(conn, tid)?;
+                }
+                diesel::delete(sends::table.filter(sends::uuid.eq(&self.uuid))).execute(conn).map(drop)
+            })
+            .map_res("Error deleting send")
         })
         .await
     }
