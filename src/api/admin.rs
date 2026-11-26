@@ -39,7 +39,7 @@ use crate::{
 };
 
 pub fn routes() -> Vec<Route> {
-    if !CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set() {
+    if CONFIG.is_multi_tenant() || (!CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set()) {
         return routes![admin_disabled];
     }
 
@@ -75,7 +75,7 @@ pub fn routes() -> Vec<Route> {
 }
 
 pub fn catchers() -> Vec<Catcher> {
-    if !CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set() {
+    if CONFIG.is_multi_tenant() || (!CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set()) {
         catchers![]
     } else {
         catchers![admin_login]
