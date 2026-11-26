@@ -1,0 +1,18 @@
+vulnerabilities:
+  # Upstream Vaultwarden keeps placeholder `version = "1.0.0"` in Cargo.toml while
+  # build.rs populates CARGO_PKG_VERSION from git tags. KyVault-backend is forked
+  # from upstream 1.37.5, which already includes all fixes below. Each entry is
+  # scoped strictly to pkg:cargo/vaultwarden@1.0.0 so real dependency findings in
+  # Cargo.lock still fail CI.
+  - id: CVE-2024-55225
+    purls:
+      - pkg:cargo/vaultwarden@1.0.0
+    statement: Fixed in upstream Vaultwarden 1.32.5; fork is based on 1.37.5 (Cargo.toml placeholder 1.0.0).
+  - id: CVE-2026-27802
+    purls:
+      - pkg:cargo/vaultwarden@1.0.0
+    statement: Fixed in upstream Vaultwarden 1.35.4; fork is based on 1.37.5 (Cargo.toml placeholder 1.0.0).
+  - id: CVE-2026-27803
+    purls:
+      - pkg:cargo/vaultwarden@1.0.0
+    statement: Fixed in upstream Vaultwarden 1.35.4; fork is based on 1.37.5 (Cargo.toml placeholder 1.0.0).
