@@ -1198,6 +1198,9 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
             if cfg.admin_token.as_deref().is_some_and(|t| !t.trim().is_empty()) {
                 err!("`ADMIN_TOKEN` must be unset when `TENANCY_MODE=multi`");
             }
+            if cfg.disable_admin_token {
+                err!("`DISABLE_ADMIN_TOKEN=false` is required when `TENANCY_MODE=multi`");
+            }
             let db_url = cfg.database_url.trim().to_ascii_lowercase();
             if !(db_url.starts_with("postgres://") || db_url.starts_with("postgresql://")) {
                 err!("PostgreSQL `DATABASE_URL` is required when `TENANCY_MODE=multi`");
@@ -2032,3 +2035,48 @@ handlebars::handlebars_helper!(webver: | web_vault_version: String |
 handlebars::handlebars_helper!(vwver: | vw_version: String |
     semver::VersionReq::parse(&vw_version).expect("Invalid Vaultwarden version compare string").matches(&VW_VERSION)
 );
+
+#[cfg(all(test, postgresql))]
+mod tests {
+    use super::*;
+
+    fn valid_multi_tenant_config() -> ConfigItems {
+        let mut cfg = ConfigBuilder::default().build();
+        cfg.tenancy_mode = "multi".to_owned();
+        cfg.ky_cells = "eu-central-1".to_owned();
+        cfg.sso_enabled = true;
+        cfg.sso_only = true;
+        cfg.sso_client_id = "kyvault-client".to_owned();
+        cfg.sso_client_secret = "kyvault-secret".to_owned();
+        cfg.sso_authority = "https://id.example.com".to_owned();
+        cfg.signups_allowed = false;
+        cfg.admin_token = None;
+        cfg.disable_admin_token = false;
+        cfg.database_url = "postgresql://kyvault:pw@127.0.0.1:5432/kyvault".to_owned();
+        cfg.attachments_folder = "s3://kyvault-attachments".to_owned();
+        cfg.tenancy_internal_api_secret = Some("0123456789abcdef0123456789abcdef".to_owned());
+        cfg
+    }
+
+    #[test]
+    fn multi_tenant_accepts_valid_config_without_admin_panel() {
+        let cfg = valid_multi_tenant_config();
+        assert!(validate_config(&cfg, false).is_ok());
+    }
+
+    #[test]
+    fn multi_tenant_refuses_disable_admin_token() {
+        let mut cfg = valid_multi_tenant_config();
+        cfg.disable_admin_token = true;
+        let err = validate_config(&cfg, false).expect_err("DISABLE_ADMIN_TOKEN=true must be refused in multi mode");
+        assert!(err.to_string().contains("DISABLE_ADMIN_TOKEN=false"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn multi_tenant_refuses_admin_token() {
+        let mut cfg = valid_multi_tenant_config();
+        cfg.admin_token = Some("super-secret-token".to_owned());
+        let err = validate_config(&cfg, false).expect_err("ADMIN_TOKEN must be refused in multi mode");
+        assert!(err.to_string().contains("ADMIN_TOKEN"), "unexpected error: {err}");
+    }
+}
