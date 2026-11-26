@@ -622,6 +622,36 @@ func TestLivePostgres(t *testing.T) {
 		if n := e.num(t, "SELECT count(*) FROM ciphers WHERE name LIKE '2.over-%'"); n != 0 {
 			t.Fatalf("refused import left %d cipher rows", n)
 		}
+
+		// (h) A share whose collection link fails after validation (the collection deleted meanwhile,
+		// simulated by a trigger) keeps the cipher personal: transfer and links are one transaction.
+		const shareCol = "c01a0000-0000-4000-8000-0000000000c1"
+		e.exec(t, `INSERT INTO collections (uuid, org_uuid, name) VALUES ($1, $2, '2.col|a|b')`, shareCol, orgOA)
+		e.exec(t, `CREATE FUNCTION e2e_refuse_link() RETURNS trigger LANGUAGE plpgsql AS
+			$$ BEGIN RAISE EXCEPTION 'e2e: collection deleted meanwhile'; END $$`)
+		e.exec(t, `CREATE TRIGGER e2e_refuse_link BEFORE INSERT ON ciphers_collections FOR EACH ROW
+			EXECUTE FUNCTION e2e_refuse_link()`)
+		shareID := e.str(t, "SELECT uuid FROM ciphers WHERE name = '2.import-0|a|b'")
+		share, _ := json.Marshal(map[string]any{"collectionIds": []string{shareCol}, "cipher": map[string]any{
+			"type": 1, "name": "2.import-0|a|b", "encryptedFor": a2.uuid, "organizationId": orgOA,
+			"login": map[string]any{"password": "pppppppp"},
+		}})
+		if r := call(t, "PUT", r1+"/api/ciphers/"+shareID+"/share", bearer(tokImp), share); r.code == 200 {
+			t.Fatalf("share with a failing collection link succeeded: %s", r.body)
+		}
+		e.exec(t, "DROP TRIGGER e2e_refuse_link ON ciphers_collections")
+		e.exec(t, "DROP FUNCTION e2e_refuse_link()")
+		if n := e.num(t, "SELECT count(*) FROM ciphers WHERE uuid = $1 AND organization_uuid IS NULL AND user_uuid = $2",
+			shareID, a2.uuid); n != 1 {
+			t.Fatal("a failed share transferred the cipher to the organization")
+		}
+		if r := call(t, "PUT", r1+"/api/ciphers/"+shareID+"/share", bearer(tokImp), share); r.code != 200 {
+			t.Fatalf("share: %d %s", r.code, r.body)
+		}
+		if n := e.num(t, `SELECT count(*) FROM ciphers c JOIN ciphers_collections cc ON cc.cipher_uuid = c.uuid
+			WHERE c.uuid = $1 AND c.organization_uuid = $2 AND cc.collection_uuid = $3`, shareID, orgOA, shareCol); n != 1 {
+			t.Fatal("share did not move the cipher into the collection")
+		}
 	})
 
 	t.Run("5 back-channel logout and webhook claim after success", func(t *testing.T) {

@@ -8,15 +8,15 @@ use crate::{
     db::{
         DbConn, DbConnInner,
         schema::{
-            attachments, ciphers, sends, sso_users, tenant_erased_subjects, tenant_pending_deletions,
-            tenant_recovery_bundles, tenants, users,
+            attachments, ciphers, ciphers_collections, sends, sso_users, tenant_erased_subjects,
+            tenant_pending_deletions, tenant_recovery_bundles, tenants, users,
         },
     },
     error::MapResult,
     util::get_uuid,
 };
 
-use super::{Attachment, Cipher, OrganizationId, SsoUser, User, UserId};
+use super::{Attachment, Cipher, CipherId, CollectionId, OrganizationId, SsoUser, User, UserId};
 
 pub const TENANT_STATUS_ACTIVE: &str = "active";
 
@@ -822,6 +822,7 @@ impl Tenant {
             tid,
             std::slice::from_ref(cipher),
             attachments,
+            &[],
             max_authority_age_secs,
             served_cells,
             default_max_ciphers,
@@ -830,13 +831,15 @@ impl Tenant {
     }
 
     /// Batch form of `save_cipher_enforcing_grant_inner`: one lock, one usage scan and one quota
-    /// count for every cipher, all saved or none (hosted imports).
+    /// count for every cipher, and the collection `links` in the same transaction, so ciphers and
+    /// their collection access land together or not at all (imports, shares).
     #[allow(clippy::too_many_arguments)]
     pub fn save_ciphers_enforcing_grant_inner(
         conn: &mut DbConnInner,
         tid: &str,
         ciphers: &[Cipher],
         attachments: &[Attachment],
+        links: &[(CipherId, CollectionId)],
         max_authority_age_secs: i64,
         served_cells: &[String],
         default_max_ciphers: i64,
@@ -844,6 +847,9 @@ impl Tenant {
     ) -> EmptyResult {
         if ciphers.iter().any(|c| c.tenant_id.as_deref() != Some(tid)) {
             err_code!("Cross-tenant cipher write denied", 403);
+        }
+        if links.iter().any(|(id, _)| !ciphers.iter().any(|c| &c.uuid == id)) {
+            err_code!("Collection link is not for a saved cipher", 400);
         }
         conn.transaction::<(), crate::Error, _>(|conn| {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
@@ -904,6 +910,7 @@ impl Tenant {
             for cipher in ciphers {
                 upsert_cipher_tx(conn, cipher)?;
             }
+            link_collections_tx(conn, links)?;
             for (att, exists) in attachments.iter().zip(att_exists) {
                 write_attachment_tx(conn, att, exists)?;
             }
@@ -917,13 +924,13 @@ impl Tenant {
         tenant_id: &str,
         ciphers: &[Cipher],
         attachments: &[Attachment],
-        max_authority_age_secs: i64,
-        served_cells: &[String],
-        default_max_ciphers: i64,
+        links: &[(CipherId, CollectionId)],
         conn: &DbConn,
     ) -> EmptyResult {
         let tid = tenant_id.to_owned();
-        let cells = served_cells.to_vec();
+        let max_authority_age_secs = crate::CONFIG.tenancy_authority_max_age_secs();
+        let cells = crate::CONFIG.served_cells();
+        let default_max_ciphers = crate::CONFIG.tenancy_max_ciphers_per_tenant();
         conn.run(move |conn| {
             if !is_postgresql(conn) {
                 err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
@@ -933,6 +940,7 @@ impl Tenant {
                 &tid,
                 ciphers,
                 attachments,
+                links,
                 max_authority_age_secs,
                 &cells,
                 default_max_ciphers,
@@ -943,7 +951,7 @@ impl Tenant {
     }
 }
 
-fn upsert_cipher_tx(conn: &mut DbConnInner, cipher: &Cipher) -> EmptyResult {
+pub fn upsert_cipher_tx(conn: &mut DbConnInner, cipher: &Cipher) -> EmptyResult {
     match conn {
         #[cfg(mysql)]
         DbConnInner::Mysql(c) => diesel::insert_into(ciphers::table)
@@ -969,6 +977,38 @@ fn upsert_cipher_tx(conn: &mut DbConnInner, cipher: &Cipher) -> EmptyResult {
     }
     .map(drop)
     .map_res("Error saving cipher")
+}
+
+pub fn link_collections_tx(conn: &mut DbConnInner, links: &[(CipherId, CollectionId)]) -> EmptyResult {
+    for (cipher_uuid, collection_uuid) in links {
+        let row = (
+            ciphers_collections::cipher_uuid.eq(cipher_uuid),
+            ciphers_collections::collection_uuid.eq(collection_uuid),
+        );
+        match conn {
+            #[cfg(mysql)]
+            DbConnInner::Mysql(c) => diesel::insert_into(ciphers_collections::table)
+                .values(row)
+                .on_conflict(diesel::dsl::DuplicatedKeys)
+                .do_nothing()
+                .execute(c),
+            #[cfg(postgresql)]
+            DbConnInner::Postgresql(c) => diesel::insert_into(ciphers_collections::table)
+                .values(row)
+                .on_conflict((ciphers_collections::cipher_uuid, ciphers_collections::collection_uuid))
+                .do_nothing()
+                .execute(c),
+            #[cfg(sqlite)]
+            DbConnInner::Sqlite(c) => diesel::insert_into(ciphers_collections::table)
+                .values(row)
+                .on_conflict((ciphers_collections::cipher_uuid, ciphers_collections::collection_uuid))
+                .do_nothing()
+                .execute(c),
+        }
+        .map(drop)
+        .map_res("Error adding cipher to collection")?;
+    }
+    Ok(())
 }
 
 fn sum_to_i64(sum: Option<BigDecimal>) -> i64 {

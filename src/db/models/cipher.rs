@@ -456,8 +456,13 @@ impl Cipher {
         self.save_with_attachments(&[], conn).await
     }
 
-    /// Hosted only: saves one owner's new ciphers under one tenant lock and one usage scan.
-    pub async fn save_hosted_batch(ciphers: &mut [Cipher], conn: &DbConn) -> EmptyResult {
+    /// Hosted only: saves one owner's new ciphers and their collection `links` under one tenant
+    /// lock and one usage scan.
+    pub async fn save_hosted_batch(
+        ciphers: &mut [Cipher],
+        links: &[(CipherId, CollectionId)],
+        conn: &DbConn,
+    ) -> EmptyResult {
         let Some(owner_tenant) = ciphers.first().map(|c| c.tenant_id.clone()) else {
             return Ok(());
         };
@@ -468,38 +473,37 @@ impl Cipher {
         for c in ciphers.iter_mut() {
             c.updated_at = now;
         }
-        super::Tenant::save_ciphers_enforcing_grant(
-            &tenant_id,
-            ciphers,
-            &[],
-            CONFIG.tenancy_authority_max_age_secs(),
-            &CONFIG.served_cells(),
-            CONFIG.tenancy_max_ciphers_per_tenant(),
-            conn,
-        )
-        .await?;
+        super::Tenant::save_ciphers_enforcing_grant(&tenant_id, ciphers, &[], links, conn).await?;
         // Every cipher in the batch has the same owner, so one revision bump covers them all.
         ciphers[0].update_users_revision(conn).await;
         Ok(())
     }
 
     /// Saves the cipher and the file name and key changes of its `attachments` (key rotation).
-    /// Hosted mode writes both in one transaction under one storage-grant check.
     pub async fn save_with_attachments(&mut self, attachments: &[Attachment], conn: &DbConn) -> EmptyResult {
+        self.save_linked(attachments, &[], conn).await
+    }
+
+    /// Saves the cipher with its `attachments` changes and links it to `collections`. The cipher
+    /// row and its links land in one transaction, so a failed share keeps the old ownership.
+    pub async fn save_linked(
+        &mut self,
+        attachments: &[Attachment],
+        collections: &[CollectionId],
+        conn: &DbConn,
+    ) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
+        let links: Vec<(CipherId, CollectionId)> = collections.iter().map(|c| (self.uuid.clone(), c.clone())).collect();
 
         if CONFIG.is_multi_tenant() {
             let Some(tenant_id) = self.tenant_id.as_deref() else {
                 err_code!("Cipher is missing tenant ownership", 403);
             };
-            let served_cells = CONFIG.served_cells();
             super::Tenant::save_ciphers_enforcing_grant(
                 tenant_id,
                 std::slice::from_ref(self),
                 attachments,
-                CONFIG.tenancy_authority_max_age_secs(),
-                &served_cells,
-                CONFIG.tenancy_max_ciphers_per_tenant(),
+                &links,
                 conn,
             )
             .await?;
@@ -507,36 +511,19 @@ impl Cipher {
             return Ok(());
         }
 
-        self.update_users_revision(conn).await;
-
-        self.upsert(conn).await?;
+        let cipher = &*self;
+        conn.run(move |conn| {
+            conn.transaction::<(), crate::Error, _>(|conn| {
+                super::upsert_cipher_tx(conn, cipher)?;
+                super::link_collections_tx(conn, &links)
+            })
+        })
+        .await?;
         for att in attachments {
             att.save(conn).await?;
         }
+        self.update_users_revision(conn).await;
         Ok(())
-    }
-
-    async fn upsert(&self, conn: &DbConn) -> EmptyResult {
-        db_run! { conn:
-            mysql {
-                diesel::insert_into(ciphers::table)
-                    .values(&*self)
-                    .on_conflict(diesel::dsl::DuplicatedKeys)
-                    .do_update()
-                    .set(&*self)
-                    .execute(conn)
-                    .map_res("Error saving cipher")
-            }
-            postgresql, sqlite {
-                diesel::insert_into(ciphers::table)
-                    .values(&*self)
-                    .on_conflict(ciphers::uuid)
-                    .do_update()
-                    .set(&*self)
-                    .execute(conn)
-                    .map_res("Error saving cipher")
-            }
-        }
     }
 
     pub async fn delete(&self, conn: &DbConn) -> EmptyResult {

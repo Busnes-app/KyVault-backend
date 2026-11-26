@@ -2981,7 +2981,7 @@ mod tests {
                 .collect()
         };
         let save = |c: &mut DbConnInner, items: &[Cipher], max: i64| {
-            Tenant::save_ciphers_enforcing_grant_inner(c, "t1", items, &[], 900, &served, max, NOW)
+            Tenant::save_ciphers_enforcing_grant_inner(c, "t1", items, &[], &[], 900, &served, max, NOW)
         };
 
         let before = USAGE_SCANS.with(std::cell::Cell::get);
@@ -2994,6 +2994,50 @@ mod tests {
         // Over the cipher quota as a whole: nothing lands.
         assert!(save(c, &batch(801, 1), 1000).is_err());
         assert_eq!(ciphers::table.count().get_result::<i64>(c).unwrap(), 200);
+    }
+
+    #[test]
+    fn failed_collection_link_rolls_back_the_transfer() {
+        use crate::db::models::{Cipher, CipherId, CollectionId, OrganizationId};
+
+        let c = &mut test_sqlite_conn();
+        let served = cells();
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+        org(c, "o1", "t1");
+        cipher(c, "pc", Some("u1"), None, "t1");
+        exec(c, "INSERT INTO collections (uuid, org_uuid, name) VALUES ('col1', 'o1', 'c')");
+        diesel::update(tenants::table.find("t1"))
+            .set((tenants::storage_ceiling_bytes.eq(1_000_000), tenants::storage_grant_expires_at.eq(Some(NOW + 300))))
+            .execute(c)
+            .unwrap();
+        let mut shared: Cipher = ciphers::table.find("pc").first(c).unwrap();
+        shared.organization_uuid = Some(OrganizationId::from("o1".to_owned()));
+        shared.user_uuid = None;
+        let link = |col: &str| [(CipherId::from("pc".to_owned()), CollectionId::from(col.to_owned()))];
+        let share = |c: &mut DbConnInner, col: &str| {
+            Tenant::save_ciphers_enforcing_grant_inner(
+                c,
+                "t1",
+                std::slice::from_ref(&shared),
+                &[],
+                &link(col),
+                900,
+                &served,
+                10,
+                NOW,
+            )
+        };
+
+        // The collection is gone by the time the link is written: the transfer is rolled back.
+        assert!(share(c, "col-deleted").is_err());
+        let kept: Cipher = ciphers::table.find("pc").first(c).unwrap();
+        assert_eq!((kept.organization_uuid, kept.user_uuid), (None, Some(UserId::from("u1".to_owned()))));
+
+        share(c, "col1").unwrap();
+        let moved: Cipher = ciphers::table.find("pc").first(c).unwrap();
+        assert_eq!(moved.organization_uuid, Some(OrganizationId::from("o1".to_owned())));
+        assert_eq!(ciphers_collections::table.count().get_result::<i64>(c).unwrap(), 1);
     }
 
     #[test]

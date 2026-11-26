@@ -1883,28 +1883,35 @@ async fn post_org_import(
         cipher_data.organization_id = Some(org_id.clone());
         items.push(cipher_data);
     }
-    let ciphers: Vec<CipherId> = if CONFIG.is_multi_tenant() {
-        import_ciphers_hosted(items, &headers, Some(collections.clone()), &conn, &nt).await?
-    } else {
-        let mut ids = Vec::with_capacity(items.len());
-        for cipher_data in items {
-            let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
-            // Single-tenant keeps upstream's behaviour of skipping items that fail.
-            update_cipher_from_data(
-                &mut cipher,
-                cipher_data,
-                &headers,
-                Some(collections.clone()),
-                &conn,
-                &nt,
-                UpdateType::None,
-            )
-            .await
-            .ok();
-            ids.push(cipher.uuid);
+    if CONFIG.is_multi_tenant() {
+        let mut links = Vec::with_capacity(relations.len());
+        for (cipher_index, col_index) in relations {
+            let Some(col_id) = collections.get(col_index) else {
+                err!(Compact, "Invalid collection relationship")
+            };
+            links.push((cipher_index, col_id.clone()));
         }
-        ids
-    };
+        import_ciphers_hosted(items, &links, &headers, Some(collections.clone()), &conn, &nt).await?;
+        let mut user = headers.user;
+        return user.update_revision(&conn).await;
+    }
+    let mut ciphers: Vec<CipherId> = Vec::with_capacity(items.len());
+    for cipher_data in items {
+        let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
+        // Single-tenant keeps upstream's behaviour of skipping items that fail.
+        update_cipher_from_data(
+            &mut cipher,
+            cipher_data,
+            &headers,
+            Some(collections.clone()),
+            &conn,
+            &nt,
+            UpdateType::None,
+        )
+        .await
+        .ok();
+        ciphers.push(cipher.uuid);
+    }
 
     // Assign the collections
     for (cipher_index, col_index) in relations {

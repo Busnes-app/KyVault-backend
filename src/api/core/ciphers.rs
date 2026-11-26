@@ -373,7 +373,7 @@ async fn post_ciphers_create(
 
     let cipher_id = cipher.uuid.clone();
     let res = share_cipher(cipher, data, &headers, &conn, &nt, None).await;
-    // A failure after the save (e.g. a collection deleted meanwhile) must not leave the new cipher behind.
+    // Personal metadata is saved after the cipher transaction and can still fail.
     if res.is_err()
         && let Some(saved) = Cipher::find_by_uuid(&cipher_id, &conn).await
         && let Err(e) = saved.delete(&conn).await
@@ -624,10 +624,12 @@ async fn finish_cipher_save(
     Ok(())
 }
 
-/// Hosted imports: applies every item first, then saves all of them under one tenant lock and one
-/// usage scan (a per-item save rescans the whole tenant), then sets folders and favorites.
+/// Hosted imports: applies every item first, then saves all of them with their collection links
+/// (`links` pairs an item index with a collection) under one tenant lock and one usage scan, so
+/// the cipher rows and collection links land together. Personal metadata is set afterwards.
 pub async fn import_ciphers_hosted(
     items: Vec<CipherData>,
+    links: &[(usize, CollectionId)],
     headers: &Headers,
     shared_to_collections: Option<Vec<CollectionId>>,
     conn: &DbConn,
@@ -645,7 +647,18 @@ pub async fn import_ciphers_hosted(
         ciphers.push(cipher);
         follow_ups.push(follow_up);
     }
-    Cipher::save_hosted_batch(&mut ciphers, conn).await?;
+    let mut cipher_links = Vec::with_capacity(links.len());
+    for (index, col_id) in links {
+        let Some(cipher) = ciphers.get(*index) else {
+            err!("Invalid collection relationship")
+        };
+        cipher_links.push((cipher.uuid.clone(), col_id.clone()));
+    }
+    Cipher::save_hosted_batch(&mut ciphers, &cipher_links, conn).await?;
+    let linked_collections: HashSet<_> = cipher_links.iter().map(|(_, collection)| collection).collect();
+    for collection in linked_collections {
+        CollectionCipher::update_users_revision(collection, conn).await;
+    }
     for (cipher, follow_up) in ciphers.iter().zip(follow_ups) {
         finish_cipher_save(cipher, follow_up, headers, shared_to_collections.clone(), conn, nt, UpdateType::None)
             .await?;
@@ -769,7 +782,7 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
         items.push(cipher_data);
     }
     if CONFIG.is_multi_tenant() {
-        import_ciphers_hosted(items, &headers, None, &conn, &nt).await?;
+        import_ciphers_hosted(items, &[], &headers, None, &conn, &nt).await?;
     } else {
         for cipher_data in items {
             let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
@@ -1267,8 +1280,8 @@ async fn share_cipher_by_uuid(
     share_cipher(cipher, data, headers, conn, nt, override_ut).await
 }
 
-/// Validates the target collections, saves the cipher, then links it. There are no transactions,
-/// so nothing is written before every check has passed.
+/// Validates the target collections, then saves the cipher and its collection links in one
+/// transaction, so a failed share leaves the cipher's ownership and access as they were.
 async fn share_cipher(
     mut cipher: Cipher,
     data: ShareCipherData,
@@ -1314,21 +1327,13 @@ async fn share_cipher(
     if ut != UpdateType::None {
         check_not_stale(&cipher, &data.cipher)?;
     }
-    // Saved with UpdateType::None so the notification goes out once the collections are linked.
-    let transfer_cipher = cipher.organization_uuid.is_none() && data.cipher.organization_id.is_some();
-    update_cipher_from_data(
-        &mut cipher,
-        data.cipher,
-        headers,
-        Some(shared_to_collections.clone()),
-        conn,
-        nt,
-        UpdateType::None,
-    )
-    .await?;
-    for col_id in &shared_to_collections {
-        CollectionCipher::save(&cipher.uuid, col_id, conn).await?;
-    }
+    let follow_up =
+        apply_cipher_data(&mut cipher, data.cipher, headers, Some(&shared_to_collections), conn, UpdateType::None)
+            .await?;
+    cipher.save_linked(&follow_up.rotated, &shared_to_collections, conn).await?;
+    let transfer_cipher = follow_up.transfer_cipher;
+    // UpdateType::None: the notification below goes out once, with the collections linked.
+    finish_cipher_save(&cipher, follow_up, headers, None, conn, nt, UpdateType::None).await?;
     notify_cipher_saved(&cipher, ut, transfer_cipher, Some(shared_to_collections), headers, conn, nt).await;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))
