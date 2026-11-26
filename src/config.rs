@@ -1186,38 +1186,50 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     match cfg.tenancy_mode.to_ascii_lowercase().as_str() {
         "single" => {}
         "multi" => {
-            if let Err(msg) = crate::tenancy::parse_ky_cells(&cfg.ky_cells) {
-                err!(msg);
+            #[cfg(not(feature = "kye2e"))]
+            {
+                err!("TENANCY_MODE=multi is not available in this release; unset it or set single");
             }
-            if !cfg.sso_enabled || !cfg.sso_only {
-                err!("`SSO_ENABLED=true` and `SSO_ONLY=true` are required when `TENANCY_MODE=multi`");
-            }
-            if cfg.signups_allowed {
-                err!("`SIGNUPS_ALLOWED=false` is required when `TENANCY_MODE=multi`");
-            }
-            if cfg.admin_token.as_deref().is_some_and(|t| !t.trim().is_empty()) {
-                err!("`ADMIN_TOKEN` must be unset when `TENANCY_MODE=multi`");
-            }
-            if cfg.disable_admin_token {
-                err!("`DISABLE_ADMIN_TOKEN=false` is required when `TENANCY_MODE=multi`");
-            }
-            let db_url = cfg.database_url.trim().to_ascii_lowercase();
-            if !(db_url.starts_with("postgres://") || db_url.starts_with("postgresql://")) {
-                err!("PostgreSQL `DATABASE_URL` is required when `TENANCY_MODE=multi`");
-            }
-            if !cfg.attachments_folder.trim().to_ascii_lowercase().starts_with("s3://") {
-                err!(
-                    "S3 `ATTACHMENTS_FOLDER` (s3://...) is required when `TENANCY_MODE=multi` (no hosted disk fallback)"
-                );
-            }
-            if cfg.tenancy_internal_api_secret.as_deref().map_or(0, |s| s.trim().len()) < 32 {
-                err!("`TENANCY_INTERNAL_API_SECRET` (>= 32 chars) is required when `TENANCY_MODE=multi`");
-            }
-            if !(60..=900).contains(&cfg.tenancy_authority_max_age_secs) {
-                err!("`TENANCY_AUTHORITY_MAX_AGE_SECS` must be between 60 and 900 seconds");
-            }
-            if !crate::tenancy::pubsub::is_safe_pg_ident(&cfg.tenancy_pg_notify_channel) {
-                err!("`TENANCY_PG_NOTIFY_CHANNEL` must be 1-63 characters of [a-z0-9_]");
+            #[cfg(feature = "kye2e")]
+            {
+                if let Err(msg) = crate::tenancy::parse_ky_cells(&cfg.ky_cells) {
+                    err!(msg);
+                }
+                if !cfg.sso_enabled || !cfg.sso_only {
+                    err!("`SSO_ENABLED=true` and `SSO_ONLY=true` are required when `TENANCY_MODE=multi`");
+                }
+                if !is_kye2e_test_issuer(&cfg.sso_authority) {
+                    err!(
+                        "`SSO_AUTHORITY` host must end with `.test` when `TENANCY_MODE=multi` is enabled via the `kye2e` feature"
+                    );
+                }
+                if cfg.signups_allowed {
+                    err!("`SIGNUPS_ALLOWED=false` is required when `TENANCY_MODE=multi`");
+                }
+                if cfg.admin_token.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                    err!("`ADMIN_TOKEN` must be unset when `TENANCY_MODE=multi`");
+                }
+                if cfg.disable_admin_token {
+                    err!("`DISABLE_ADMIN_TOKEN=false` is required when `TENANCY_MODE=multi`");
+                }
+                let db_url = cfg.database_url.trim().to_ascii_lowercase();
+                if !(db_url.starts_with("postgres://") || db_url.starts_with("postgresql://")) {
+                    err!("PostgreSQL `DATABASE_URL` is required when `TENANCY_MODE=multi`");
+                }
+                if !cfg.attachments_folder.trim().to_ascii_lowercase().starts_with("s3://") {
+                    err!(
+                        "S3 `ATTACHMENTS_FOLDER` (s3://...) is required when `TENANCY_MODE=multi` (no hosted disk fallback)"
+                    );
+                }
+                if cfg.tenancy_internal_api_secret.as_deref().map_or(0, |s| s.trim().len()) < 32 {
+                    err!("`TENANCY_INTERNAL_API_SECRET` (>= 32 chars) is required when `TENANCY_MODE=multi`");
+                }
+                if !(60..=900).contains(&cfg.tenancy_authority_max_age_secs) {
+                    err!("`TENANCY_AUTHORITY_MAX_AGE_SECS` must be between 60 and 900 seconds");
+                }
+                if !crate::tenancy::pubsub::is_safe_pg_ident(&cfg.tenancy_pg_notify_channel) {
+                    err!("`TENANCY_PG_NOTIFY_CHANNEL` must be 1-63 characters of [a-z0-9_]");
+                }
             }
         }
         other => {
@@ -1444,6 +1456,19 @@ fn validate_internal_sso_issuer_url(sso_authority: &String) -> Result<openidconn
         Err(err) => err!(format!("Invalid sso_authority URL ({sso_authority}): {err}")),
         Ok(issuer_url) => Ok(issuer_url),
     }
+}
+
+#[cfg(feature = "kye2e")]
+fn is_kye2e_test_issuer(sso_authority: &str) -> bool {
+    let Ok(url) = Url::parse(sso_authority) else {
+        return false;
+    };
+    let Some(url::Host::Domain(host)) = url.host() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.strip_suffix(".test")
+        .is_some_and(|prefix| !prefix.is_empty() && !prefix.starts_with('.') && !prefix.ends_with('.'))
 }
 
 fn validate_internal_sso_redirect_url(sso_callback_path: &String) -> Result<openidconnect::RedirectUrl, Error> {
@@ -2036,10 +2061,21 @@ handlebars::handlebars_helper!(vwver: | vw_version: String |
     semver::VersionReq::parse(&vw_version).expect("Invalid Vaultwarden version compare string").matches(&VW_VERSION)
 );
 
-#[cfg(all(test, postgresql))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    fn valid_single_tenant_config() -> ConfigItems {
+        let mut cfg = ConfigBuilder::default().build();
+        cfg.tenancy_mode = "single".to_owned();
+        #[cfg(sqlite)]
+        {
+            cfg.database_url = "sqlite://:memory:".to_owned();
+        }
+        cfg
+    }
+
+    #[cfg(postgresql)]
     fn valid_multi_tenant_config() -> ConfigItems {
         let mut cfg = ConfigBuilder::default().build();
         cfg.tenancy_mode = "multi".to_owned();
@@ -2048,7 +2084,7 @@ mod tests {
         cfg.sso_only = true;
         cfg.sso_client_id = "kyvault-client".to_owned();
         cfg.sso_client_secret = "kyvault-secret".to_owned();
-        cfg.sso_authority = "https://id.example.com".to_owned();
+        cfg.sso_authority = "https://kyidentity.test".to_owned();
         cfg.signups_allowed = false;
         cfg.admin_token = None;
         cfg.disable_admin_token = false;
@@ -2059,11 +2095,89 @@ mod tests {
     }
 
     #[test]
+    fn single_tenant_accepts_default_config() {
+        let cfg = valid_single_tenant_config();
+        assert!(validate_config(&cfg, false).is_ok());
+    }
+
+    #[cfg(not(feature = "kye2e"))]
+    #[test]
+    fn multi_tenant_is_refused_without_kye2e() {
+        let mut cfg = valid_single_tenant_config();
+        cfg.tenancy_mode = "multi".to_owned();
+        let err = validate_config(&cfg, false).expect_err("TENANCY_MODE=multi must be refused without kye2e");
+        assert!(
+            err.to_string().contains("TENANCY_MODE=multi is not available in this release; unset it or set single"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(all(postgresql, not(feature = "kye2e")))]
+    #[test]
+    fn fully_configured_multi_tenant_is_refused_without_kye2e() {
+        let cfg = valid_multi_tenant_config();
+        let err = validate_config(&cfg, false).expect_err("TENANCY_MODE=multi must be refused without kye2e");
+        assert!(
+            err.to_string().contains("TENANCY_MODE=multi is not available in this release; unset it or set single"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "kye2e")]
+    #[test]
+    fn kye2e_test_issuer_validation() {
+        assert!(is_kye2e_test_issuer("https://kyidentity.test"));
+        assert!(is_kye2e_test_issuer("https://sub.kyidentity.test:8443/oidc"));
+        assert!(is_kye2e_test_issuer("https://KYIDENTITY.TEST"));
+        assert!(is_kye2e_test_issuer("https://kyidentity.test."));
+        assert!(!is_kye2e_test_issuer("https://id.example.com"));
+        assert!(!is_kye2e_test_issuer("https://id.busnes.app"));
+        assert!(!is_kye2e_test_issuer("https://kyidentity.test.busnes.app"));
+        assert!(!is_kye2e_test_issuer("https://test"));
+        assert!(!is_kye2e_test_issuer("https://.test"));
+        assert!(!is_kye2e_test_issuer("https://a..test"));
+        assert!(!is_kye2e_test_issuer("https://127.0.0.1:8443"));
+        assert!(!is_kye2e_test_issuer("https://[::1]:8443"));
+        assert!(!is_kye2e_test_issuer("https://kyidentity.test@evil.com"));
+    }
+
+    #[cfg(all(postgresql, feature = "kye2e"))]
+    #[test]
     fn multi_tenant_accepts_valid_config_without_admin_panel() {
         let cfg = valid_multi_tenant_config();
         assert!(validate_config(&cfg, false).is_ok());
     }
 
+    #[cfg(all(postgresql, feature = "kye2e"))]
+    #[test]
+    fn multi_tenant_accepts_case_insensitive_test_issuer() {
+        let mut cfg = valid_multi_tenant_config();
+        cfg.sso_authority = "https://ID.KYIDENTITY.TEST:8443/oidc".to_owned();
+        assert!(validate_config(&cfg, false).is_ok());
+    }
+
+    #[cfg(all(postgresql, feature = "kye2e"))]
+    #[test]
+    fn multi_tenant_refuses_non_test_issuer_under_kye2e() {
+        for bad_issuer in [
+            "https://id.example.com",
+            "https://id.busnes.app",
+            "https://kyidentity.test.busnes.app",
+            "https://test",
+            "https://127.0.0.1:8443",
+            "https://[::1]:8443",
+            "https://kyidentity.test@evil.com",
+        ] {
+            let mut cfg = valid_multi_tenant_config();
+            cfg.sso_authority = bad_issuer.to_owned();
+            let Err(err) = validate_config(&cfg, false) else {
+                panic!("non-.test issuer {bad_issuer} must be refused under kye2e");
+            };
+            assert!(err.to_string().contains(".test"), "unexpected error for {bad_issuer}: {err}");
+        }
+    }
+
+    #[cfg(all(postgresql, feature = "kye2e"))]
     #[test]
     fn multi_tenant_refuses_disable_admin_token() {
         let mut cfg = valid_multi_tenant_config();
@@ -2072,6 +2186,7 @@ mod tests {
         assert!(err.to_string().contains("DISABLE_ADMIN_TOKEN=false"), "unexpected error: {err}");
     }
 
+    #[cfg(all(postgresql, feature = "kye2e"))]
     #[test]
     fn multi_tenant_refuses_admin_token() {
         let mut cfg = valid_multi_tenant_config();

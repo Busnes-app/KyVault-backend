@@ -158,6 +158,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           cargo test --profile ci --features postgresql
+
+      - name: "test features: sqlite,mysql,postgresql,enable_mimalloc,s3,kye2e"
+        id: test_kye2e
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --profile ci --features sqlite,mysql,postgresql,enable_mimalloc,s3,kye2e
       # End Run cargo tests
 
 
@@ -167,7 +173,31 @@ jobs:
         if: ${{ !cancelled() && matrix.channel == 'rust-toolchain' }}
         run: |
           cargo clippy --profile ci --features sqlite,mysql,postgresql,enable_mimalloc,s3
+
+      - name: "clippy features: sqlite,mysql,postgresql,enable_mimalloc,s3,kye2e"
+        id: clippy_kye2e
+        if: ${{ !cancelled() && matrix.channel == 'rust-toolchain' }}
+        run: |
+          cargo clippy --profile ci --features sqlite,mysql,postgresql,enable_mimalloc,s3,kye2e
       # End Run cargo clippy
+
+
+      # Verify kye2e cannot slip into default features or release Dockerfiles/workflows
+      - name: "verify kye2e is excluded from default features and release builds"
+        id: check_no_kye2e_release
+        if: ${{ !cancelled() && matrix.channel == 'rust-toolchain' }}
+        run: |
+          python3 -c '
+          import tomllib, sys
+          with open("Cargo.toml", "rb") as f:
+              data = tomllib.load(f)
+          if "kye2e" in data.get("features", {}).get("default", []):
+              sys.exit("ERROR: kye2e must not be enabled in Cargo.toml default features")
+          '
+          if grep -rnE '\bkye2e\b' Dockerfile docker/ .github/workflows/release.yml; then
+            echo "ERROR: kye2e must not appear in release Dockerfiles or release workflow"
+            exit 1
+          fi
 
 
       # Run cargo fmt (Only run on rust-toolchain defined version)
@@ -190,7 +220,10 @@ jobs:
           TEST_SQLITE: ${{ steps.test_sqlite.outcome }}
           TEST_MYSQL: ${{ steps.test_mysql.outcome }}
           TEST_POSTGRESQL: ${{ steps.test_postgresql.outcome }}
+          TEST_KYE2E: ${{ steps.test_kye2e.outcome }}
           CLIPPY: ${{ steps.clippy.outcome }}
+          CLIPPY_KYE2E: ${{ steps.clippy_kye2e.outcome }}
+          CHECK_NO_KYE2E_RELEASE: ${{ steps.check_no_kye2e_release.outcome }}
           FMT: ${{ steps.formatting.outcome }}
         run: |
           echo "### :x: Checks Failed!" >> "${GITHUB_STEP_SUMMARY}"
@@ -203,7 +236,10 @@ jobs:
           echo "|test (sqlite)|${TEST_SQLITE}|" >> "${GITHUB_STEP_SUMMARY}"
           echo "|test (mysql)|${TEST_MYSQL}|" >> "${GITHUB_STEP_SUMMARY}"
           echo "|test (postgresql)|${TEST_POSTGRESQL}|" >> "${GITHUB_STEP_SUMMARY}"
+          echo "|test (sqlite,mysql,postgresql,enable_mimalloc,s3,kye2e)|${TEST_KYE2E}|" >> "${GITHUB_STEP_SUMMARY}"
           echo "|clippy (sqlite,mysql,postgresql,enable_mimalloc,s3)|${CLIPPY}|" >> "${GITHUB_STEP_SUMMARY}"
+          echo "|clippy (sqlite,mysql,postgresql,enable_mimalloc,s3,kye2e)|${CLIPPY_KYE2E}|" >> "${GITHUB_STEP_SUMMARY}"
+          echo "|verify no kye2e in release|${CHECK_NO_KYE2E_RELEASE}|" >> "${GITHUB_STEP_SUMMARY}"
           echo "|fmt|${FMT}|" >> "${GITHUB_STEP_SUMMARY}"
           echo "" >> "${GITHUB_STEP_SUMMARY}"
           echo "Please check the failed jobs and fix where needed." >> "${GITHUB_STEP_SUMMARY}"
