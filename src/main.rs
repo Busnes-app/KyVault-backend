@@ -202,11 +202,87 @@ fn parse_args() {
     }
 }
 
+// aws-lc-rs with `prefer-post-quantum` offers X25519MLKEM768 first; ring has no ML-KEM.
+// Rocket's own `ROCKET_TLS` listener ignores this and always uses ring.
+fn rustls_crypto_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
+
 fn install_rustls_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("failed to install rustls ring crypto provider");
+        rustls_crypto_provider().install_default().expect("failed to install rustls aws-lc-rs crypto provider");
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use std::sync::Arc;
+
+    use openssl::{asn1::Asn1Time, ec, hash::MessageDigest, nid::Nid, pkey::PKey, x509};
+    use rustls::{
+        ClientConfig, ClientConnection, NamedGroup, RootCertStore, ServerConfig, ServerConnection,
+        pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+    };
+
+    // Self-signed P-256 certificate for "localhost", used as its own trust anchor.
+    fn test_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let key = PKey::from_ec_key(
+            ec::EcKey::generate(&ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut name = x509::X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "localhost").unwrap();
+        let name = name.build();
+        let mut b = x509::X509Builder::new().unwrap();
+        b.set_version(2).unwrap();
+        b.set_subject_name(&name).unwrap();
+        b.set_issuer_name(&name).unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
+        let san = x509::extension::SubjectAlternativeName::new().dns("localhost").build(&b.x509v3_context(None, None));
+        b.append_extension(san.unwrap()).unwrap();
+        b.sign(&key, MessageDigest::sha256()).unwrap();
+        let der = b.build().to_der().unwrap();
+        (der.into(), PrivateKeyDer::Pkcs8(key.private_key_to_pkcs8().unwrap().into()))
+    }
+
+    #[test]
+    fn tls13_handshake_negotiates_x25519mlkem768() {
+        let provider = Arc::new(super::rustls_crypto_provider());
+        assert_eq!(provider.kx_groups[0].name(), NamedGroup::X25519MLKEM768, "hybrid must be offered first");
+
+        let (cert, key) = test_cert();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let client_cfg = ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_cfg = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+
+        let name = ServerName::try_from("localhost").unwrap();
+        let mut client = ClientConnection::new(Arc::new(client_cfg), name).unwrap();
+        let mut server = ServerConnection::new(Arc::new(server_cfg)).unwrap();
+        while client.is_handshaking() || server.is_handshaking() {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            server.read_tls(&mut buf.as_slice()).unwrap();
+            server.process_new_packets().unwrap();
+            buf.clear();
+            server.write_tls(&mut buf).unwrap();
+            client.read_tls(&mut buf.as_slice()).unwrap();
+            client.process_new_packets().unwrap();
+        }
+
+        assert_eq!(client.negotiated_key_exchange_group().unwrap().name(), NamedGroup::X25519MLKEM768);
+        assert_eq!(server.negotiated_key_exchange_group().unwrap().name(), NamedGroup::X25519MLKEM768);
     }
 }
 

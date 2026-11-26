@@ -132,7 +132,7 @@ libsqlite3-sys = { version = "0.38.2", optional = true }
 # Crypto-related libraries
 rand = "0.10.3"
 ring = "0.17.14"
-rustls = { version = "0.23.46", features = ["ring", "std"], default-features = false }
+rustls = { version = "0.23.46", features = ["aws-lc-rs", "prefer-post-quantum", "std"], default-features = false }
 subtle = "2.6.1"
 
 # UUID generation
@@ -176,7 +176,7 @@ lettre = { version = "0.11.23", default-features = false, features = [
     "builder",
     "hostname",
     # TLS/Security
-    "ring",
+    "aws-lc-rs",
     "rustls-native-certs",
     "tokio1-rustls",
     # Transport
