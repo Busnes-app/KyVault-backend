@@ -126,8 +126,8 @@ What this PR does instead (Part 2):
 
 ## Unverified
 
-- Docker image builds for arm64, armv7 and armv6 with aws-lc-sys (cross-compiled through `xx`). Only the host x86_64
-  build and the CI container were run. See the PR's verification record.
+- Docker cross builds: the `Dockerfile.debian` build stage succeeded for armv6 and arm64 (dev profile), and both
+  binaries link aws-lc. Not built: armv7, the Alpine images, the release (LTO) profile and the final image stage.
 - Whether every outbound peer (SMTP relays, S3 endpoints, the Bitwarden push relay) accepts X25519MLKEM768. rustls
   falls back to X25519 when a peer doesn't.
 - Android and iOS code search for PQ terms was cut short by GitHub rate limits. Their SDK pins were checked directly.
