@@ -2072,6 +2072,22 @@ mod tests {
     }
 
     #[test]
+    fn storage_counts_numeric_and_string_file_send_sizes() {
+        let c = &mut test_sqlite_conn();
+        active_tenant(c, "t1");
+        user(c, "u1", "t1", "sub1");
+        file_send(c, "numeric", "u1", "t1", "file1");
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 50);
+
+        file_send(c, "string", "u1", "t1", "file2");
+        diesel::update(sends::table.filter(sends::uuid.eq("string")))
+            .set(sends::data.eq(r#"{"id":"file2","Size":"1024"}"#))
+            .execute(c)
+            .unwrap();
+        assert_eq!(committed_bytes(c, "t1").unwrap(), 1074, "include Send sizes stored as strings");
+    }
+
+    #[test]
     fn storage_prepare_apply_replay_stale_and_repair() {
         let c = &mut test_sqlite_conn();
         active_tenant(c, "t1");

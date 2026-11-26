@@ -1268,7 +1268,10 @@ pub fn committed_bytes(conn: &mut DbConnInner, tenant_id: &str) -> QueryResult<i
     let send_bytes = send_data
         .iter()
         .filter_map(|d| serde_json::from_str::<Value>(d).ok())
-        .filter_map(|v| v.get("size").or_else(|| v.get("Size")).and_then(Value::as_i64))
+        .filter_map(|v| {
+            let size = v.get("size").or_else(|| v.get("Size"))?;
+            size.as_i64().or_else(|| size.as_str()?.parse().ok())
+        })
         .fold(0i64, |acc, sz| acc.saturating_add(sz.max(0)));
 
     Ok(sum_to_i64(att)
