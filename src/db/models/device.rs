@@ -5,15 +5,18 @@ use diesel::prelude::*;
 use serde_json::Value;
 
 use crate::{
-    api::EmptyResult,
+    api::{ApiResult, EmptyResult},
     crypto,
-    db::{DbConn, schema::devices},
+    db::{
+        DbConn, DbConnInner,
+        schema::{devices, tenants, users},
+    },
     error::MapResult,
     util::{format_date, get_uuid},
 };
 use macros::{IdFromParam, UuidFromParam};
 
-use super::{AuthRequest, UserId};
+use super::{AuthRequest, Tenant, User, UserId};
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = devices)]
@@ -171,6 +174,213 @@ impl Device {
         }
     }
 
+    /// Atomically validates a refresh token against the live `users`, `tenants`, and `devices`
+    /// rows and updates only `devices.updated_at`.
+    ///
+    /// Locks `users` (`FOR SHARE` on PostgreSQL) before updating `devices` to match the global
+    /// `tenants -> users -> devices` lock order, serializing cleanly with `fence_user` /
+    /// `sync_user` / `erase_user` so a concurrent revocation can neither be undone nor paired
+    /// with a post-revocation `security_stamp`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_and_touch_for_refresh_tx(
+        conn: &mut DbConnInner,
+        device_token: &str,
+        expected_tid: Option<&str>,
+        now: NaiveDateTime,
+        multi_tenant: bool,
+        served_cells: &[String],
+        now_ts: i64,
+        max_authority_age_secs: i64,
+    ) -> ApiResult<(Self, User)> {
+        conn.transaction(|conn| {
+            let Some((device_uuid, user_uuid)): Option<(DeviceId, UserId)> = devices::table
+                .filter(devices::refresh_token.eq(device_token))
+                .select((devices::uuid, devices::user_uuid))
+                .first(conn)
+                .optional()
+                .map_res("Error loading device")?
+            else {
+                err!("Invalid refresh token");
+            };
+
+            let Some(user) = lock_user_for_share(conn, &user_uuid).map_res("Error loading user")? else {
+                err!("Impossible to find user");
+            };
+            if !user.enabled {
+                err_code!("User is disabled", 403);
+            }
+            if multi_tenant {
+                let tid = crate::tenancy::require_user_tenant(&user)?;
+                if expected_tid != Some(tid) {
+                    err_code!("Refresh token tenant mismatch", 403);
+                }
+                let Some(tenant) =
+                    tenants::table.find(tid).first::<Tenant>(conn).optional().map_res("Error loading tenant")?
+                else {
+                    err_code!("Tenant not found or not provisioned in this cell", 403);
+                };
+                crate::tenancy::check_tenant_active_for_cells(&tenant, served_cells, now_ts, max_authority_age_secs)?;
+            }
+
+            let updated: usize = diesel::update(
+                devices::table
+                    .filter(devices::uuid.eq(&device_uuid))
+                    .filter(devices::user_uuid.eq(&user_uuid))
+                    .filter(devices::refresh_token.eq(device_token)),
+            )
+            .set(devices::updated_at.eq(now))
+            .execute(conn)
+            .map_res("Error updating device")?;
+            if updated == 0 {
+                err!("Invalid refresh token");
+            }
+
+            let Some(device) = devices::table
+                .filter(devices::uuid.eq(&device_uuid))
+                .filter(devices::user_uuid.eq(&user_uuid))
+                .first::<Self>(conn)
+                .optional()
+                .map_res("Error loading device")?
+            else {
+                err!("Invalid refresh token");
+            };
+            Ok((device, user))
+        })
+    }
+
+    pub async fn load_and_touch_for_refresh(
+        device_token: &str,
+        expected_tid: Option<&str>,
+        conn: &DbConn,
+    ) -> ApiResult<(Self, User)> {
+        let token = device_token.to_owned();
+        let expected_tid = expected_tid.map(ToOwned::to_owned);
+        let now = Utc::now().naive_utc();
+        let now_ts = Utc::now().timestamp();
+        let multi_tenant = crate::CONFIG.is_multi_tenant();
+        let served_cells = crate::CONFIG.served_cells();
+        let max_authority_age_secs = crate::CONFIG.tenancy_authority_max_age_secs();
+        conn.run(move |conn| {
+            Self::load_and_touch_for_refresh_tx(
+                conn,
+                &token,
+                expected_tid.as_deref(),
+                now,
+                multi_tenant,
+                &served_cells,
+                now_ts,
+                max_authority_age_secs,
+            )
+        })
+        .await
+    }
+
+    /// Touches `updated_at` (and optionally persists `twofactor_remember`) for an existing
+    /// device only if its `refresh_token` is still unchanged. Never overwrites `refresh_token`
+    /// and never resurrects a deleted device.
+    pub fn touch_authenticated_tx(
+        conn: &mut DbConnInner,
+        device: &Self,
+        now: NaiveDateTime,
+        update_twofactor_remember: bool,
+    ) -> EmptyResult {
+        let updated: usize = if update_twofactor_remember {
+            diesel::update(
+                devices::table
+                    .filter(devices::uuid.eq(&device.uuid))
+                    .filter(devices::user_uuid.eq(&device.user_uuid))
+                    .filter(devices::refresh_token.eq(&device.refresh_token)),
+            )
+            .set((devices::updated_at.eq(now), devices::twofactor_remember.eq(&device.twofactor_remember)))
+            .execute(conn)
+            .map_res("Error saving device")?
+        } else {
+            diesel::update(
+                devices::table
+                    .filter(devices::uuid.eq(&device.uuid))
+                    .filter(devices::user_uuid.eq(&device.user_uuid))
+                    .filter(devices::refresh_token.eq(&device.refresh_token)),
+            )
+            .set(devices::updated_at.eq(now))
+            .execute(conn)
+            .map_res("Error saving device")?
+        };
+        if updated == 0 {
+            err_code!("Device session was revoked during login", 401);
+        }
+        Ok(())
+    }
+
+    pub async fn touch_authenticated(&mut self, update_twofactor_remember: bool, conn: &DbConn) -> EmptyResult {
+        let now = Utc::now().naive_utc();
+        self.updated_at = now;
+        let device = &*self;
+        conn.run(move |conn| Self::touch_authenticated_tx(conn, device, now, update_twofactor_remember)).await
+    }
+
+    /// Updates only `push_token` and `updated_at` without touching `refresh_token` or
+    /// `twofactor_remember`.
+    pub async fn update_push_token(&mut self, token: String, conn: &DbConn) -> EmptyResult {
+        let now = Utc::now().naive_utc();
+        self.push_token = Some(token);
+        self.updated_at = now;
+        let uuid = self.uuid.clone();
+        let user_uuid = self.user_uuid.clone();
+        let push_token = self.push_token.clone();
+        conn.run(move |conn| {
+            let updated: usize = diesel::update(
+                devices::table.filter(devices::uuid.eq(&uuid)).filter(devices::user_uuid.eq(&user_uuid)),
+            )
+            .set((devices::push_token.eq(&push_token), devices::updated_at.eq(now)))
+            .execute(conn)
+            .map_res("Error saving device push token")?;
+            if updated == 0 {
+                err_code!("Device not found", 404);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Updates only `push_uuid` and `updated_at` without touching `refresh_token` or
+    /// `twofactor_remember`.
+    pub async fn update_push_uuid(&mut self, conn: &DbConn) -> EmptyResult {
+        let now = Utc::now().naive_utc();
+        self.updated_at = now;
+        let uuid = self.uuid.clone();
+        let user_uuid = self.user_uuid.clone();
+        let push_uuid = self.push_uuid.clone();
+        conn.run(move |conn| {
+            let updated: usize = diesel::update(
+                devices::table.filter(devices::uuid.eq(&uuid)).filter(devices::user_uuid.eq(&user_uuid)),
+            )
+            .set((devices::push_uuid.eq(&push_uuid), devices::updated_at.eq(now)))
+            .execute(conn)
+            .map_res("Error saving device push uuid")?;
+            if updated == 0 {
+                err_code!("Device not found", 404);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Clears `twofactor_remember` and updates `updated_at` without touching `refresh_token`.
+    pub async fn clear_twofactor_remember(&mut self, conn: &DbConn) -> EmptyResult {
+        let now = Utc::now().naive_utc();
+        self.twofactor_remember = None;
+        self.updated_at = now;
+        let uuid = self.uuid.clone();
+        let user_uuid = self.user_uuid.clone();
+        conn.run(move |conn| {
+            diesel::update(devices::table.filter(devices::uuid.eq(&uuid)).filter(devices::user_uuid.eq(&user_uuid)))
+                .set((devices::twofactor_remember.eq::<Option<String>>(None), devices::updated_at.eq(now)))
+                .execute(conn)
+                .map_res("Error clearing device twofactor remember")
+        })
+        .await
+    }
+
     pub async fn delete_all_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
         conn.run(move |conn| {
             diesel::delete(devices::table.filter(devices::user_uuid.eq(user_uuid)))
@@ -264,15 +474,29 @@ impl Device {
     }
 
     pub async fn rotate_refresh_tokens_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
-        // Generate a new token per device.
-        // We cannot do a single UPDATE with one value because each device needs a unique token.
-        let devices = Self::find_by_user(user_uuid, conn).await;
-        for mut device in devices {
-            device.refresh_token = Device::generate_refresh_token();
-            device.twofactor_remember = None;
-            device.save(false, conn).await?;
-        }
-        Ok(())
+        // Generate a new token per device without upserting so deleted devices are never resurrected.
+        let user_uuid = user_uuid.clone();
+        conn.run(move |conn| {
+            let device_uuids: Vec<DeviceId> = devices::table
+                .filter(devices::user_uuid.eq(&user_uuid))
+                .select(devices::uuid)
+                .load(conn)
+                .map_res("Error loading devices for token rotation")?;
+            for device_uuid in device_uuids {
+                diesel::update(
+                    devices::table.filter(devices::uuid.eq(&device_uuid)).filter(devices::user_uuid.eq(&user_uuid)),
+                )
+                .set((
+                    devices::refresh_token.eq(Self::generate_refresh_token()),
+                    devices::twofactor_remember.eq::<Option<String>>(None),
+                ))
+                .execute(conn)
+                .map(drop)
+                .map_res("Error rotating device refresh token")?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     pub async fn clear_twofactor_remember_by_user(user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
@@ -284,6 +508,15 @@ impl Device {
                 .map_res("Error removing two factor remember tokens")
         })
         .await
+    }
+}
+
+fn lock_user_for_share(conn: &mut DbConnInner, uid: &UserId) -> QueryResult<Option<User>> {
+    match conn {
+        #[cfg(postgresql)]
+        DbConnInner::Postgresql(pg) => users::table.find(uid).for_share().first::<User>(pg).optional(),
+        #[allow(unreachable_patterns, reason = "only reachable when another backend is compiled in")]
+        _ => users::table.find(uid).first::<User>(conn).optional(),
     }
 }
 

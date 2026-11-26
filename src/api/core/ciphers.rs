@@ -441,9 +441,9 @@ pub async fn update_cipher_from_data(
     nt: &Notify<'_>,
     ut: UpdateType,
 ) -> EmptyResult {
-    let follow_up = apply_cipher_data(cipher, data, headers, shared_to_collections.as_ref(), conn, ut).await?;
+    let follow_up = apply_cipher_data(cipher, data, headers, shared_to_collections.as_ref(), &[], conn, ut).await?;
     cipher.save_with_attachments(&follow_up.rotated, conn).await?;
-    finish_cipher_save(cipher, follow_up, headers, shared_to_collections, conn, nt, ut).await
+    finish_cipher_save(cipher, follow_up, headers, shared_to_collections, false, conn, nt, ut).await
 }
 
 /// What is left to do for a cipher once `apply_cipher_data` has filled it and its row is saved.
@@ -461,6 +461,7 @@ async fn apply_cipher_data(
     data: CipherData,
     headers: &Headers,
     shared_to_collections: Option<&Vec<CollectionId>>,
+    pending_folders: &[Folder],
     conn: &DbConn,
     ut: UpdateType,
 ) -> ApiResult<CipherFollowUp> {
@@ -527,6 +528,7 @@ async fn apply_cipher_data(
     }
 
     if let Some(ref folder_id) = data.folder_id
+        && !pending_folders.iter().any(|f| &f.uuid == folder_id && f.user_uuid == headers.user.uuid)
         && Folder::find_by_uuid_and_user(folder_id, &headers.user.uuid, conn).await.is_none()
     {
         err!("Invalid folder", "Folder does not exist or belongs to another user");
@@ -600,16 +602,20 @@ async fn apply_cipher_data(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_cipher_save(
     cipher: &Cipher,
     follow_up: CipherFollowUp,
     headers: &Headers,
     shared_to_collections: Option<Vec<CollectionId>>,
+    folder_already_linked: bool,
     conn: &DbConn,
     nt: &Notify<'_>,
     ut: UpdateType,
 ) -> EmptyResult {
-    cipher.move_to_folder(follow_up.folder_id, &headers.user.uuid, conn).await?;
+    if !folder_already_linked {
+        cipher.move_to_folder(follow_up.folder_id, &headers.user.uuid, conn).await?;
+    }
     cipher.set_favorite(follow_up.favorite, &headers.user.uuid, conn).await?;
 
     match follow_up.archived_date {
@@ -624,25 +630,41 @@ async fn finish_cipher_save(
     Ok(())
 }
 
-/// Hosted imports: applies every item first, then saves all of them with their collection links
-/// (`links` pairs an item index with a collection) under one tenant lock and one usage scan, so
-/// the cipher rows and collection links land together. Personal metadata is set afterwards.
+/// Hosted imports: applies every item first, then saves newly staged folders/collections,
+/// ciphers, folder links, and collection links (`links` pairs an item index with a collection)
+/// under one tenant lock and one usage scan, so folders/collections and ciphers land together
+/// or roll back together. Personal metadata is set afterwards.
+#[allow(clippy::too_many_arguments)]
 pub async fn import_ciphers_hosted(
     items: Vec<CipherData>,
+    mut pending_folders: Vec<Folder>,
+    pending_collections: Vec<Collection>,
     links: &[(usize, CollectionId)],
     headers: &Headers,
     shared_to_collections: Option<Vec<CollectionId>>,
     conn: &DbConn,
     nt: &Notify<'_>,
 ) -> ApiResult<Vec<CipherId>> {
+    let tenant_id = crate::tenancy::require_user_tenant(&headers.user)?;
     let mut ciphers = Vec::with_capacity(items.len());
     let mut follow_ups = Vec::with_capacity(items.len());
+    let mut folder_links = Vec::new();
     for data in items {
         let mut cipher = Cipher::new(data.r#type, data.name.clone());
         cipher.tenant_id.clone_from(&headers.user.tenant_id);
-        let follow_up =
-            apply_cipher_data(&mut cipher, data, headers, shared_to_collections.as_ref(), conn, UpdateType::None)
-                .await?;
+        let follow_up = apply_cipher_data(
+            &mut cipher,
+            data,
+            headers,
+            shared_to_collections.as_ref(),
+            &pending_folders,
+            conn,
+            UpdateType::None,
+        )
+        .await?;
+        if let Some(ref folder_id) = follow_up.folder_id {
+            folder_links.push((cipher.uuid.clone(), folder_id.clone()));
+        }
         // A new cipher owns no attachments, so `follow_up.rotated` is empty.
         ciphers.push(cipher);
         follow_ups.push(follow_up);
@@ -654,13 +676,22 @@ pub async fn import_ciphers_hosted(
         };
         cipher_links.push((cipher.uuid.clone(), col_id.clone()));
     }
-    Cipher::save_hosted_batch(&mut ciphers, &cipher_links, conn).await?;
+    Cipher::save_hosted_batch(
+        tenant_id,
+        &mut ciphers,
+        &mut pending_folders,
+        &pending_collections,
+        &folder_links,
+        &cipher_links,
+        conn,
+    )
+    .await?;
     let linked_collections: HashSet<_> = cipher_links.iter().map(|(_, collection)| collection).collect();
     for collection in linked_collections {
         CollectionCipher::update_users_revision(collection, conn).await;
     }
     for (cipher, follow_up) in ciphers.iter().zip(follow_ups) {
-        finish_cipher_save(cipher, follow_up, headers, shared_to_collections.clone(), conn, nt, UpdateType::None)
+        finish_cipher_save(cipher, follow_up, headers, shared_to_collections.clone(), true, conn, nt, UpdateType::None)
             .await?;
     }
     Ok(ciphers.into_iter().map(|c| c.uuid).collect())
@@ -752,13 +783,21 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
     let existing_folders: HashSet<Option<FolderId>> =
         Folder::find_by_user(&headers.user.uuid, &conn).await.into_iter().map(|f| Some(f.uuid)).collect();
     let mut folders: Vec<FolderId> = Vec::with_capacity(data.folders.len());
+    let mut pending_folders: Vec<Folder> = Vec::new();
     for folder in data.folders {
         let folder_id = if existing_folders.contains(&folder.id) {
             folder.id.unwrap()
         } else {
             let mut new_folder = Folder::new(headers.user.uuid.clone(), folder.name);
-            new_folder.save(&conn).await?;
-            new_folder.uuid
+            let uuid = new_folder.uuid.clone();
+            if CONFIG.is_multi_tenant() {
+                // Stage new folders for the atomic tenant-locked import transaction so a failed
+                // quota/grant/batch check leaves no orphaned folders behind.
+                pending_folders.push(new_folder);
+            } else {
+                new_folder.save(&conn).await?;
+            }
+            uuid
         };
 
         folders.push(folder_id);
@@ -782,7 +821,7 @@ async fn post_ciphers_import(data: Json<ImportData>, headers: Headers, conn: DbC
         items.push(cipher_data);
     }
     if CONFIG.is_multi_tenant() {
-        import_ciphers_hosted(items, &[], &headers, None, &conn, &nt).await?;
+        import_ciphers_hosted(items, pending_folders, Vec::new(), &[], &headers, None, &conn, &nt).await?;
     } else {
         for cipher_data in items {
             let mut cipher = Cipher::new(cipher_data.r#type, cipher_data.name.clone());
@@ -1328,12 +1367,12 @@ async fn share_cipher(
         check_not_stale(&cipher, &data.cipher)?;
     }
     let follow_up =
-        apply_cipher_data(&mut cipher, data.cipher, headers, Some(&shared_to_collections), conn, UpdateType::None)
+        apply_cipher_data(&mut cipher, data.cipher, headers, Some(&shared_to_collections), &[], conn, UpdateType::None)
             .await?;
     cipher.save_linked(&follow_up.rotated, &shared_to_collections, conn).await?;
     let transfer_cipher = follow_up.transfer_cipher;
     // UpdateType::None: the notification below goes out once, with the collections linked.
-    finish_cipher_save(&cipher, follow_up, headers, None, conn, nt, UpdateType::None).await?;
+    finish_cipher_save(&cipher, follow_up, headers, None, false, conn, nt, UpdateType::None).await?;
     notify_cipher_saved(&cipher, ut, transfer_cipher, Some(shared_to_collections), headers, conn, nt).await;
 
     Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, None, CipherSyncType::User, conn).await?))

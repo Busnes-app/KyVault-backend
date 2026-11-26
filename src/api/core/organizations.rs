@@ -1833,11 +1833,15 @@ async fn post_org_import(
     // Bitwarden does not process the import if there is one item invalid.
     // Since we check for the size of the encrypted note length, we need to do that here to pre-validate it.
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
+    crate::tenancy::check_import_limits(data.ciphers.len(), data.collections.len())?;
+    crate::tenancy::check_cipher_quota(&headers.user, i64::try_from(data.ciphers.len()).unwrap_or(i64::MAX), &conn)
+        .await?;
     Cipher::validate_cipher_data(&data.ciphers)?;
 
     let existing_collections: HashMap<CollectionId, Collection> =
         Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
     let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
+    let mut pending_collections: Vec<Collection> = Vec::new();
     for col in data.collections {
         let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
         let collection_uuid = if let Some(collection) = existing {
@@ -1855,8 +1859,15 @@ async fn post_org_import(
                 err!(Compact, "The current user isn't allowed to create new collections")
             }
             let new_collection = Collection::new(org_id.clone(), col.name, col.external_id);
-            new_collection.save(&conn).await?;
-            new_collection.uuid
+            let uuid = new_collection.uuid.clone();
+            if CONFIG.is_multi_tenant() {
+                // Stage new collections for the atomic tenant-locked import transaction so a failed
+                // quota/grant/batch check leaves no orphaned collections behind.
+                pending_collections.push(new_collection);
+            } else {
+                new_collection.save(&conn).await?;
+            }
+            uuid
         };
 
         collections.push(collection_uuid);
@@ -1870,10 +1881,6 @@ async fn post_org_import(
     }
 
     let headers: Headers = headers.into();
-
-    crate::tenancy::check_import_limits(data.ciphers.len(), collections.len())?;
-    crate::tenancy::check_cipher_quota(&headers.user, i64::try_from(data.ciphers.len()).unwrap_or(i64::MAX), &conn)
-        .await?;
 
     let mut items = Vec::with_capacity(data.ciphers.len());
     for mut cipher_data in data.ciphers {
@@ -1891,7 +1898,17 @@ async fn post_org_import(
             };
             links.push((cipher_index, col_id.clone()));
         }
-        import_ciphers_hosted(items, &links, &headers, Some(collections.clone()), &conn, &nt).await?;
+        import_ciphers_hosted(
+            items,
+            Vec::new(),
+            pending_collections,
+            &links,
+            &headers,
+            Some(collections.clone()),
+            &conn,
+            &nt,
+        )
+        .await?;
         let mut user = headers.user;
         return user.update_revision(&conn).await;
     }
@@ -3022,6 +3039,9 @@ async fn recover_account(
         err!(format!("Error sending user reset password email: {e:#?}"));
     }
 
+    let expected_stamp = user.security_stamp.clone();
+    let expected_enabled = CONFIG.is_multi_tenant().then_some(true);
+    let has_new_password = new_password.is_some();
     if let Some((new_master_password_hash, new_key)) = new_password {
         user.set_password(&new_master_password_hash, Some(new_key), true, None, &conn).await?;
     }
@@ -3035,7 +3055,18 @@ async fn recover_account(
         }
     }
 
-    user.save(&conn).await?;
+    user.update_if_unchanged(
+        &expected_stamp,
+        expected_enabled,
+        crate::db::models::UserPatch {
+            password_hash: has_new_password.then(|| user.password_hash.clone()),
+            akey: has_new_password.then(|| user.akey.clone()),
+            security_stamp: has_new_password.then(|| user.security_stamp.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await?;
 
     nt.send_logout(&user, None, &conn).await;
 

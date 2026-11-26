@@ -718,8 +718,22 @@ async fn password_emergency_access(
         };
 
     // change grantor_user password
+    let expected_stamp = grantor_user.security_stamp.clone();
+    let expected_enabled = CONFIG.is_multi_tenant().then_some(true);
     grantor_user.set_password(&new_master_password_hash, Some(new_key), true, None, &conn).await?;
-    grantor_user.save(&conn).await?;
+    grantor_user
+        .update_if_unchanged(
+            &expected_stamp,
+            expected_enabled,
+            crate::db::models::UserPatch {
+                password_hash: Some(grantor_user.password_hash.clone()),
+                akey: Some(grantor_user.akey.clone()),
+                security_stamp: Some(grantor_user.security_stamp.clone()),
+                ..Default::default()
+            },
+            &conn,
+        )
+        .await?;
 
     // Disable TwoFactor providers since they will otherwise block logins
     TwoFactor::delete_all_by_user(&grantor_user.uuid, &conn).await?;

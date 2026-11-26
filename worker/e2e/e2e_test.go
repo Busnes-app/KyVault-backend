@@ -43,17 +43,23 @@ const (
 	bundleA = "ba000000-0000-4000-8000-0000000000a1"
 )
 
+// seedUser inserts an enabled SSO user with one device whose refresh token is "rt-<uuid>".
+func (e *env) seedUser(t *testing.T, u vaultUser) {
+	t.Helper()
+	e.exec(t, `INSERT INTO users (uuid, enabled, created_at, updated_at, email, name, password_hash, salt,
+		password_iterations, akey, security_stamp, equivalent_domains, excluded_globals, client_kdf_type,
+		client_kdf_iter, tenant_id) VALUES ($1::text, TRUE, now(), now(), $1::text || '@e2e.test', $1::text, '\x00', '\x00',
+		600000, 'akey', 'stamp-' || $1::text, '[]', '[]', 0, 600000, $2)`, u.uuid, u.tenant)
+	e.exec(t, `INSERT INTO sso_users (user_uuid, identifier, tenant_id) VALUES ($1, $2, $3)`,
+		u.uuid, issuer+"/"+u.subject, u.tenant)
+	e.exec(t, `INSERT INTO devices (uuid, created_at, updated_at, user_uuid, name, atype, refresh_token)
+		VALUES ($1, now(), now(), $2::text, 'e2e', 8, 'rt-' || $2::text)`, u.device(), u.uuid)
+}
+
 func (e *env) seed(t *testing.T) {
 	t.Helper()
 	for _, u := range []vaultUser{a1, a2, a3, b1} {
-		e.exec(t, `INSERT INTO users (uuid, enabled, created_at, updated_at, email, name, password_hash, salt,
-			password_iterations, akey, security_stamp, equivalent_domains, excluded_globals, client_kdf_type,
-			client_kdf_iter, tenant_id) VALUES ($1::text, TRUE, now(), now(), $1::text || '@e2e.test', $1::text, '\x00', '\x00',
-			600000, 'akey', 'stamp-' || $1::text, '[]', '[]', 0, 600000, $2)`, u.uuid, u.tenant)
-		e.exec(t, `INSERT INTO sso_users (user_uuid, identifier, tenant_id) VALUES ($1, $2, $3)`,
-			u.uuid, issuer+"/"+u.subject, u.tenant)
-		e.exec(t, `INSERT INTO devices (uuid, created_at, updated_at, user_uuid, name, atype, refresh_token)
-			VALUES ($1, now(), now(), $2::text, 'e2e', 8, 'rt-' || $2::text)`, u.device(), u.uuid)
+		e.seedUser(t, u)
 	}
 	for _, o := range [][2]string{{orgOA, orgA}, {orgOB, orgB}} {
 		e.exec(t, `INSERT INTO organizations (uuid, name, billing_email, tenant_id) VALUES ($1, 'org', 'b@e2e.test', $2)`, o[0], o[1])
@@ -129,6 +135,23 @@ func (e *env) stamp(t *testing.T, u vaultUser) (stamp, refresh string) {
 	t.Helper()
 	return e.str(t, "SELECT security_stamp FROM users WHERE uuid = $1", u.uuid),
 		e.str(t, "SELECT refresh_token FROM devices WHERE user_uuid = $1", u.uuid)
+}
+
+// fence opens a transaction that writes what logout and sync_user(active=false) write
+// (ops::fence_user), in their lock order: users, then devices. The caller commits it.
+func (e *env) fence(t *testing.T, u vaultUser, disable bool) pgx.Tx {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := e.db.Begin(ctx)
+	must(t, err)
+	t.Cleanup(func() { _ = tx.Rollback(ctx) }) // releases the locks if the step fails first
+	_, err = tx.Exec(ctx, `UPDATE users SET enabled = enabled AND NOT $2, security_stamp = 'fenced-' || uuid,
+		stamp_exception = NULL, updated_at = now() WHERE uuid = $1`, u.uuid, disable)
+	must(t, err)
+	_, err = tx.Exec(ctx, `UPDATE devices SET refresh_token = 'rt-fenced-' || user_uuid, twofactor_remember = NULL
+		WHERE user_uuid = $1`, u.uuid)
+	must(t, err)
+	return tx
 }
 
 func revisionDate(t *testing.T, base, token string) int {
@@ -612,8 +635,9 @@ func TestLivePostgres(t *testing.T) {
 		gi := e.mustTenant(t, orgA)
 		room := gi.Ceiling - e.committed(t, orgA) - gi.Reserved
 		over, _ := json.Marshal(map[string]any{
-			"folders": []any{}, "folderRelationships": []any{},
-			"ciphers": []map[string]any{item("2.over-0|a|b", 8), item("2.over-1|a|b", int(room))},
+			"folders":             []map[string]any{{"name": "2.over-f|a|b"}},
+			"folderRelationships": []map[string]any{{"key": 0, "value": 0}},
+			"ciphers":             []map[string]any{item("2.over-0|a|b", 8), item("2.over-1|a|b", int(room))},
 		})
 		if r := call(t, "POST", r2+"/api/ciphers/import", bearer(tokImp), over); r.code == 200 ||
 			!strings.Contains(string(r.body), "quota exceeded") {
@@ -621,6 +645,24 @@ func TestLivePostgres(t *testing.T) {
 		}
 		if n := e.num(t, "SELECT count(*) FROM ciphers WHERE name LIKE '2.over-%'"); n != 0 {
 			t.Fatalf("refused import left %d cipher rows", n)
+		}
+		// A retry would duplicate a folder the refused import left behind.
+		if n := e.num(t, "SELECT count(*) FROM folders WHERE name = '2.over-f|a|b'"); n != 0 {
+			t.Errorf("refused import left %d folder rows", n)
+		}
+		orgItem := item("2.over-org|a|b", int(room))
+		orgItem["organizationId"] = orgOA
+		overOrg, _ := json.Marshal(map[string]any{
+			"collections":             []map[string]any{{"name": "2.over-col|a|b"}},
+			"collectionRelationships": []map[string]any{{"key": 0, "value": 0}},
+			"ciphers":                 []map[string]any{orgItem},
+		})
+		if r := call(t, "POST", r1+"/api/ciphers/import-organization?organizationId="+orgOA, bearer(tokImp), overOrg); r.code == 200 ||
+			!strings.Contains(string(r.body), "quota exceeded") {
+			t.Fatalf("org import over the grant: %d %s", r.code, r.body)
+		}
+		if n := e.num(t, "SELECT count(*) FROM collections WHERE name = '2.over-col|a|b'"); n != 0 {
+			t.Errorf("refused org import left %d collection rows", n)
 		}
 
 		// (h) A share whose collection link fails after validation (the collection deleted meanwhile,
@@ -651,6 +693,48 @@ func TestLivePostgres(t *testing.T) {
 		if n := e.num(t, `SELECT count(*) FROM ciphers c JOIN ciphers_collections cc ON cc.cipher_uuid = c.uuid
 			WHERE c.uuid = $1 AND c.organization_uuid = $2 AND cc.collection_uuid = $3`, shareID, orgOA, shareCol); n != 1 {
 			t.Fatal("share did not move the cipher into the collection")
+		}
+	})
+
+	t.Run("4b refresh racing a logout keeps the rotated token", func(t *testing.T) {
+		rr := vaultUser{"ae100000-0000-4000-8000-0000000000e1", orgA, "sub-race-refresh"}
+		e.seedUser(t, rr)
+		oldRefresh := e.refreshToken(rr, "rt-"+rr.uuid)
+		if r, err := refresh(r1, oldRefresh); err != nil || r.code != 200 {
+			t.Fatalf("refresh before logout: %v %d %s", err, r.code, r.body)
+		}
+		r := e.commitWhenBlocked(t, e.fence(t, rr, false), func() (resp, error) { return refresh(r1, oldRefresh) })
+		if r.code == 200 {
+			t.Errorf("refresh overlapping logout issued tokens: %s", r.body)
+		}
+		if _, rt := e.stamp(t, rr); rt != "rt-fenced-"+rr.uuid {
+			t.Fatalf("refresh undid the logout's token rotation: refresh token %q", rt)
+		}
+		if r, err := refresh(r2, oldRefresh); err != nil || r.code == 200 {
+			t.Fatalf("revoked refresh token still works: %v %d", err, r.code)
+		}
+	})
+
+	t.Run("4c profile save racing a deactivation keeps the user disabled", func(t *testing.T) {
+		rp := vaultUser{"ae200000-0000-4000-8000-0000000000e2", orgA, "sub-race-profile"}
+		e.seedUser(t, rp)
+		tokP := e.accessToken(t, rp)
+		if c := revisionDate(t, r1, tokP); c != 200 {
+			t.Fatalf("access token before sync: %d", c)
+		}
+		profile, _ := json.Marshal(map[string]any{"name": "2.race-name"})
+		r := e.commitWhenBlocked(t, e.fence(t, rp, true), func() (resp, error) {
+			return callErr("PUT", r2+"/api/accounts/profile", bearer(tokP), profile)
+		})
+		if r.code == 200 {
+			t.Errorf("profile save overlapping deactivation succeeded: %s", r.body)
+		}
+		if n := e.num(t, "SELECT count(*) FROM users WHERE uuid = $1 AND NOT enabled AND security_stamp = 'fenced-' || uuid",
+			rp.uuid); n != 1 {
+			t.Fatal("profile save undid the deactivation")
+		}
+		if c := revisionDate(t, r1, tokP); c != 401 {
+			t.Fatalf("deactivated user's old access token: want 401, got %d", c)
 		}
 	})
 

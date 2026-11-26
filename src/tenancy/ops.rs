@@ -733,6 +733,14 @@ fn erase_personal_data(
         .set(sends::user_uuid.eq(None::<String>))
         .execute(conn)?;
 
+    // Lock the user row before deleting devices to preserve `tenants -> users -> devices`
+    // lock order against concurrent refresh-token checks (`users FOR SHARE -> devices UPDATE`).
+    #[cfg(postgresql)]
+    #[allow(irrefutable_let_patterns, reason = "single-variant when only postgresql is compiled in")]
+    if let DbConnInner::Postgresql(pg) = conn {
+        users::table.find(uid).select(users::uuid).for_update().first::<String>(pg).optional()?;
+    }
+
     diesel::delete(devices::table.filter(devices::user_uuid.eq(uid))).execute(conn)?;
     diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(uid))).execute(conn)?;
     diesel::delete(twofactor_incomplete::table.filter(twofactor_incomplete::user_uuid.eq(uid))).execute(conn)?;
@@ -964,6 +972,17 @@ fn purge_tenant_rows(
     .execute(conn)?;
 
     // 5. Per-user state, then users and organizations themselves.
+    // Lock tenant users in uuid order before deleting devices to preserve `tenants -> users -> devices`.
+    #[cfg(postgresql)]
+    #[allow(irrefutable_let_patterns, reason = "single-variant when only postgresql is compiled in")]
+    if let DbConnInner::Postgresql(pg) = conn {
+        users::table
+            .filter(users::tenant_id.eq(tid))
+            .order(users::uuid.asc())
+            .select(users::uuid)
+            .for_update()
+            .load::<String>(pg)?;
+    }
     diesel::delete(folders::table.filter(folders::user_uuid.eq_any(u()))).execute(conn)?;
     diesel::delete(devices::table.filter(devices::user_uuid.eq_any(u()))).execute(conn)?;
     diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq_any(u()))).execute(conn)?;

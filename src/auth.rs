@@ -759,8 +759,7 @@ impl<'r> FromRequest<'r> for Headers {
                     // If the stamp exception has been expired remove it from the database.
                     // This prevents checking this stamp exception for new requests.
                     let mut user = user;
-                    user.reset_stamp_exception();
-                    if let Err(e) = user.save(&conn).await {
+                    if let Err(e) = user.clear_stamp_exception(&conn).await {
                         error!("Error updating user: {e:#?}");
                     }
                     err_handler!("Stamp exception is expired")
@@ -1425,7 +1424,7 @@ pub async fn refresh_tokens(
     refresh_token: &str,
     client_id: Option<String>,
     conn: &DbConn,
-) -> ApiResult<(Device, AuthTokens)> {
+) -> ApiResult<AuthTokens> {
     let refresh_claims = match decode_refresh(refresh_token) {
         Err(err) => {
             error!("Failed to decode refresh_token from {}: {err:?}", ip.ip);
@@ -1434,32 +1433,12 @@ pub async fn refresh_tokens(
         Ok(claims) => claims,
     };
 
-    // Get device by refresh token
-    let Some(mut device) = Device::find_by_refresh_token(&refresh_claims.device_token, conn).await else {
-        err!("Invalid refresh token")
-    };
-
-    // Save to update `updated_at`.
-    device.save(true, conn).await?;
-
-    let Some(user) = User::find_by_uuid(&device.user_uuid, conn).await else {
-        err!("Impossible to find user")
-    };
-
-    if !user.enabled {
-        err_code!("User is disabled", 403);
+    if CONFIG.is_multi_tenant() && refresh_claims.export_only.unwrap_or(false) {
+        err_code!("Export-only sessions cannot refresh ordinary vault tokens", 403);
     }
 
-    if CONFIG.is_multi_tenant() {
-        if refresh_claims.export_only.unwrap_or(false) {
-            err_code!("Export-only sessions cannot refresh ordinary vault tokens", 403);
-        }
-        let user_tid = crate::tenancy::require_user_tenant(&user)?;
-        if refresh_claims.tid.as_deref() != Some(user_tid) {
-            err_code!("Refresh token tenant mismatch", 403);
-        }
-        crate::tenancy::check_tenant_active(user_tid, conn).await?;
-    }
+    let (device, user) =
+        Device::load_and_touch_for_refresh(&refresh_claims.device_token, refresh_claims.tid.as_deref(), conn).await?;
 
     let auth_tokens = match refresh_claims.sub {
         AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {
@@ -1474,7 +1453,7 @@ pub async fn refresh_tokens(
         _ => err!("Invalid auth method, cannot refresh token"),
     };
 
-    Ok((device, auth_tokens))
+    Ok(auth_tokens)
 }
 
 #[cfg(test)]

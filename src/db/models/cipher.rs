@@ -456,26 +456,47 @@ impl Cipher {
         self.save_with_attachments(&[], conn).await
     }
 
-    /// Hosted only: saves one owner's new ciphers and their collection `links` under one tenant
-    /// lock and one usage scan.
+    /// Hosted only: saves one owner's new ciphers together with any newly staged folders,
+    /// collections, folder links, and collection links under one tenant lock and one usage scan.
     pub async fn save_hosted_batch(
+        tenant_id: &str,
         ciphers: &mut [Cipher],
-        links: &[(CipherId, CollectionId)],
+        folders: &mut [super::Folder],
+        collections: &[super::Collection],
+        folder_links: &[(CipherId, FolderId)],
+        collection_links: &[(CipherId, CollectionId)],
         conn: &DbConn,
     ) -> EmptyResult {
-        let Some(owner_tenant) = ciphers.first().map(|c| c.tenant_id.clone()) else {
+        if ciphers.is_empty() && folders.is_empty() && collections.is_empty() {
             return Ok(());
-        };
-        let Some(tenant_id) = owner_tenant else {
-            err_code!("Cipher is missing tenant ownership", 403);
-        };
+        }
         let now = Utc::now().naive_utc();
         for c in ciphers.iter_mut() {
             c.updated_at = now;
         }
-        super::Tenant::save_ciphers_enforcing_grant(&tenant_id, ciphers, &[], links, conn).await?;
+        for f in folders.iter_mut() {
+            f.updated_at = now;
+        }
+        super::Tenant::save_hosted_import(
+            tenant_id,
+            ciphers,
+            &[],
+            super::HostedBatchExtras {
+                folders,
+                collections,
+                folder_links,
+                collection_links,
+            },
+            conn,
+        )
+        .await?;
         // Every cipher in the batch has the same owner, so one revision bump covers them all.
-        ciphers[0].update_users_revision(conn).await;
+        if let Some(first) = ciphers.first() {
+            first.update_users_revision(conn).await;
+        }
+        for collection in collections {
+            collection.update_users_revision(conn).await;
+        }
         Ok(())
     }
 

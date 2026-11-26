@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/Busnes-app/ky-primitives/syncauth"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -209,6 +210,57 @@ func (e *env) accessToken(t *testing.T, u vaultUser) string {
 		"device": u.device(), "devicetype": "Linux", "client_id": "web",
 		"scope": []string{"api", "offline_access"}, "amr": []string{"Application"}, "tid": u.tenant,
 	})
+}
+
+// refreshToken mints an SSO refresh JWT for the user's device refresh token.
+func (e *env) refreshToken(u vaultUser, deviceToken string) string {
+	now := time.Now().Unix()
+	return signRS256(e.vaultKey, map[string]any{"alg": "RS256", "typ": "JWT"}, map[string]any{
+		"nbf": now - 5, "exp": now + 3600, "iss": domain + "|login", "sub": "sso",
+		"device_token": deviceToken, "tid": u.tenant,
+	})
+}
+
+// refresh redeems a refresh JWT at the token endpoint.
+func refresh(base, token string) (resp, error) {
+	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {token}, "client_id": {"web"}}
+	return callErr("POST", base+"/identity/connect/token",
+		map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, []byte(form.Encode()))
+}
+
+// commitWhenBlocked starts req while tx holds the rows a revocation just wrote, waits until
+// req's backend is blocked on one of them, then commits tx. req read those rows before
+// blocking, so it resumes with a pre-revocation snapshot: the race the vault must survive.
+func (e *env) commitWhenBlocked(t *testing.T, tx pgx.Tx, req func() (resp, error)) resp {
+	t.Helper()
+	ctx := context.Background()
+	type result struct {
+		r   resp
+		err error
+	}
+	done := make(chan result, 1)
+	go func() { r, err := req(); done <- result{r, err} }()
+	eventually(t, 20*time.Second, "request blocked on the revocation's row lock", func() error {
+		var n int64
+		if err := e.db.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			AND wait_event IN ('transactionid', 'tuple')`).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("not blocked yet")
+		}
+		return nil
+	})
+	must(t, tx.Commit(ctx))
+	select {
+	case res := <-done:
+		must(t, res.err)
+		return res.r
+	case <-time.After(30 * time.Second):
+		t.Fatal("request did not finish after the revocation committed")
+	}
+	return resp{}
 }
 
 func (e *env) logoutToken(key *rsa.PrivateKey, kid, sub, jti string) string {
@@ -666,6 +718,7 @@ func replicaEnv(port string) []string {
 		"TENANCY_PG_NOTIFY_ENABLED=true",
 		"SSO_ENABLED=true", "SSO_ONLY=true", "SSO_AUTHORITY=" + issuer,
 		"SSO_CLIENT_ID=" + clientID, "SSO_CLIENT_SECRET=" + clientSecret,
+		"SSO_AUTH_ONLY_NOT_SESSION=true",
 		"SIGNUPS_ALLOWED=false",
 		"DOMAIN=" + domain,
 		"ATTACHMENTS_FOLDER=s3://" + bucket + "/attachments?endpoint=http://127.0.0.1:" + s3Port +

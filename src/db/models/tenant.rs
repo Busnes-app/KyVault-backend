@@ -8,15 +8,17 @@ use crate::{
     db::{
         DbConn, DbConnInner,
         schema::{
-            attachments, ciphers, ciphers_collections, sends, sso_users, tenant_erased_subjects,
-            tenant_pending_deletions, tenant_recovery_bundles, tenants, users,
+            attachments, ciphers, ciphers_collections, collections, folders, folders_ciphers, organizations, sends,
+            sso_users, tenant_erased_subjects, tenant_pending_deletions, tenant_recovery_bundles, tenants, users,
         },
     },
     error::MapResult,
     util::get_uuid,
 };
 
-use super::{Attachment, Cipher, CipherId, CollectionId, OrganizationId, SsoUser, User, UserId};
+use super::{
+    Attachment, Cipher, CipherId, Collection, CollectionId, Folder, FolderId, OrganizationId, SsoUser, User, UserId,
+};
 
 pub const TENANT_STATUS_ACTIVE: &str = "active";
 
@@ -845,17 +847,78 @@ impl Tenant {
         default_max_ciphers: i64,
         now_ts: i64,
     ) -> EmptyResult {
+        Self::save_hosted_import_inner(
+            conn,
+            tid,
+            ciphers,
+            attachments,
+            HostedBatchExtras {
+                collection_links: links,
+                ..Default::default()
+            },
+            max_authority_age_secs,
+            served_cells,
+            default_max_ciphers,
+            now_ts,
+        )
+    }
+
+    /// Saves ciphers together with any newly staged folders, collections, folder links,
+    /// collection links, and attachments inside a single tenant-locked transaction.
+    ///
+    /// If tenant validation, active cipher quota, storage grant admission, or cross-tenant
+    /// ownership checks fail, nothing is written — preventing orphaned folders or collections
+    /// from surviving a rejected import and duplicating on retry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_hosted_import_inner(
+        conn: &mut DbConnInner,
+        tid: &str,
+        ciphers: &[Cipher],
+        attachments: &[Attachment],
+        extras: HostedBatchExtras<'_>,
+        max_authority_age_secs: i64,
+        served_cells: &[String],
+        default_max_ciphers: i64,
+        now_ts: i64,
+    ) -> EmptyResult {
         if ciphers.iter().any(|c| c.tenant_id.as_deref() != Some(tid)) {
             err_code!("Cross-tenant cipher write denied", 403);
         }
-        if links.iter().any(|(id, _)| !ciphers.iter().any(|c| &c.uuid == id)) {
+        if extras.collection_links.iter().any(|(id, _)| !ciphers.iter().any(|c| &c.uuid == id)) {
             err_code!("Collection link is not for a saved cipher", 400);
+        }
+        if extras.folder_links.iter().any(|(id, _)| !ciphers.iter().any(|c| &c.uuid == id)) {
+            err_code!("Folder link is not for a saved cipher", 400);
         }
         conn.transaction::<(), crate::Error, _>(|conn| {
             let Some(tenant) = lock_tenant(conn, tid).map_res("Error locking tenant")? else {
                 err_code!("Tenant not found", 403);
             };
             validate_tenant_growth_tx(&tenant, served_cells, now_ts, max_authority_age_secs)?;
+
+            // Validate tenant ownership of any staged folders/collections before writing anything.
+            for folder in extras.folders {
+                let owner_tid: Option<Option<String>> = users::table
+                    .find(&folder.user_uuid)
+                    .select(users::tenant_id)
+                    .first(conn)
+                    .optional()
+                    .map_res("Error checking folder owner tenant")?;
+                if owner_tid.flatten().as_deref() != Some(tid) {
+                    err_code!("Cross-tenant folder write denied", 403);
+                }
+            }
+            for collection in extras.collections {
+                let org_tid: Option<Option<String>> = organizations::table
+                    .find(&collection.org_uuid)
+                    .select(organizations::tenant_id)
+                    .first(conn)
+                    .optional()
+                    .map_res("Error checking collection organization tenant")?;
+                if org_tid.flatten().as_deref() != Some(tid) {
+                    err_code!("Cross-tenant collection write denied", 403);
+                }
+            }
 
             let mut delta_bytes = 0i64;
             let mut activating = 0i64;
@@ -907,10 +970,25 @@ impl Tenant {
                 }
             }
 
+            for folder in extras.folders {
+                diesel::insert_into(folders::table)
+                    .values(folder)
+                    .execute(conn)
+                    .map(drop)
+                    .map_res("Error saving folder")?;
+            }
+            for collection in extras.collections {
+                diesel::insert_into(collections::table)
+                    .values(collection)
+                    .execute(conn)
+                    .map(drop)
+                    .map_res("Error saving collection")?;
+            }
             for cipher in ciphers {
                 upsert_cipher_tx(conn, cipher)?;
             }
-            link_collections_tx(conn, links)?;
+            link_folders_tx(conn, extras.folder_links)?;
+            link_collections_tx(conn, extras.collection_links)?;
             for (att, exists) in attachments.iter().zip(att_exists) {
                 write_attachment_tx(conn, att, exists)?;
             }
@@ -927,6 +1005,28 @@ impl Tenant {
         links: &[(CipherId, CollectionId)],
         conn: &DbConn,
     ) -> EmptyResult {
+        Self::save_hosted_import(
+            tenant_id,
+            ciphers,
+            attachments,
+            HostedBatchExtras {
+                collection_links: links,
+                ..Default::default()
+            },
+            conn,
+        )
+        .await
+    }
+
+    /// Persists ciphers along with newly staged folders, collections, and links atomically under
+    /// the PostgreSQL tenant lock.
+    pub async fn save_hosted_import(
+        tenant_id: &str,
+        ciphers: &[Cipher],
+        attachments: &[Attachment],
+        extras: HostedBatchExtras<'_>,
+        conn: &DbConn,
+    ) -> EmptyResult {
         let tid = tenant_id.to_owned();
         let max_authority_age_secs = crate::CONFIG.tenancy_authority_max_age_secs();
         let cells = crate::CONFIG.served_cells();
@@ -935,12 +1035,12 @@ impl Tenant {
             if !is_postgresql(conn) {
                 err_code!("Hosted multi-tenant storage requires PostgreSQL", 503);
             }
-            Self::save_ciphers_enforcing_grant_inner(
+            Self::save_hosted_import_inner(
                 conn,
                 &tid,
                 ciphers,
                 attachments,
-                links,
+                extras,
                 max_authority_age_secs,
                 &cells,
                 default_max_ciphers,
@@ -949,6 +1049,15 @@ impl Tenant {
         })
         .await
     }
+}
+
+/// Optional folders, collections, and join-table links committed atomically with a hosted batch.
+#[derive(Clone, Copy, Default)]
+pub struct HostedBatchExtras<'a> {
+    pub folders: &'a [Folder],
+    pub collections: &'a [Collection],
+    pub folder_links: &'a [(CipherId, FolderId)],
+    pub collection_links: &'a [(CipherId, CollectionId)],
 }
 
 pub fn upsert_cipher_tx(conn: &mut DbConnInner, cipher: &Cipher) -> EmptyResult {
@@ -977,6 +1086,35 @@ pub fn upsert_cipher_tx(conn: &mut DbConnInner, cipher: &Cipher) -> EmptyResult 
     }
     .map(drop)
     .map_res("Error saving cipher")
+}
+
+pub fn link_folders_tx(conn: &mut DbConnInner, links: &[(CipherId, FolderId)]) -> EmptyResult {
+    for (cipher_uuid, folder_uuid) in links {
+        let row = (folders_ciphers::cipher_uuid.eq(cipher_uuid), folders_ciphers::folder_uuid.eq(folder_uuid));
+        match conn {
+            #[cfg(mysql)]
+            DbConnInner::Mysql(c) => diesel::insert_into(folders_ciphers::table)
+                .values(row)
+                .on_conflict(diesel::dsl::DuplicatedKeys)
+                .do_nothing()
+                .execute(c),
+            #[cfg(postgresql)]
+            DbConnInner::Postgresql(c) => diesel::insert_into(folders_ciphers::table)
+                .values(row)
+                .on_conflict((folders_ciphers::cipher_uuid, folders_ciphers::folder_uuid))
+                .do_nothing()
+                .execute(c),
+            #[cfg(sqlite)]
+            DbConnInner::Sqlite(c) => diesel::insert_into(folders_ciphers::table)
+                .values(row)
+                .on_conflict((folders_ciphers::cipher_uuid, folders_ciphers::folder_uuid))
+                .do_nothing()
+                .execute(c),
+        }
+        .map(drop)
+        .map_res("Error adding cipher to folder")?;
+    }
+    Ok(())
 }
 
 pub fn link_collections_tx(conn: &mut DbConnInner, links: &[(CipherId, CollectionId)]) -> EmptyResult {

@@ -31,7 +31,7 @@ use crate::{
         models::{
             AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError,
             OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TenantErasedSubject, TwoFactor,
-            TwoFactorIncomplete, TwoFactorType, User, UserId,
+            TwoFactorIncomplete, TwoFactorType, User, UserId, UserPatch,
         },
     },
     error::MapResult,
@@ -170,10 +170,7 @@ async fn refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> JsonR
                 format!("Unable to refresh login credentials: {}", err.message())
             )
         }
-        Ok((mut device, auth_tokens)) => {
-            // Save to update `device.updated_at` to track usage and toggle new status
-            device.save(true, conn).await?;
-
+        Ok(auth_tokens) => {
             let result = json!({
                 "refresh_token": auth_tokens.refresh_token(),
                 "access_token": auth_tokens.access_token(),
@@ -521,10 +518,22 @@ async fn password_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &
             if resend_limit == 0 || user.login_verify_count < resend_limit {
                 // We want to send another email verification if we require signups to verify
                 // their email address, and we haven't sent them a reminder in a while...
+                let expected_stamp = user.security_stamp.clone();
                 user.last_verifying_at = Some(now);
                 user.login_verify_count += 1;
 
-                if let Err(e) = user.save(conn).await {
+                if let Err(e) = user
+                    .update_active(
+                        &expected_stamp,
+                        UserPatch {
+                            last_verifying_at: Some(user.last_verifying_at),
+                            login_verify_count: Some(user.login_verify_count),
+                            ..Default::default()
+                        },
+                        conn,
+                    )
+                    .await
+                {
                     error!("Error updating user: {e:#?}");
                 }
 
@@ -595,8 +604,8 @@ async fn authenticated_response(
         register_push_device(device, conn).await?;
     }
 
-    // Save to update `device.updated_at` to track usage and toggle new status
-    device.save(true, conn).await?;
+    // Touch `device.updated_at` (and any new `twofactor_remember`) only if the session was not revoked mid-login
+    device.touch_authenticated(twofactor_token.is_some(), conn).await?;
 
     let master_password_policy = identity_master_password_policy(user, conn).await;
 
@@ -756,8 +765,8 @@ async fn user_api_key_login(
     // let orgs = Membership::find_confirmed_by_user(&user.uuid, conn).await;
     let access_claims = auth::LoginJwtClaims::default(&device, &user, &AuthMethod::UserApiKey, data.client_id);
 
-    // Save to update `device.updated_at` to track usage and toggle new status
-    device.save(true, conn).await?;
+    // Touch `device.updated_at` only if the device session was not revoked mid-login
+    device.touch_authenticated(false, conn).await?;
 
     info!("User {} logged in successfully via API key. IP: {}", user.email, ip.ip);
 
@@ -942,9 +951,8 @@ async fn twofactor_auth(
                 _ => {
                     // Always delete the current twofactor remember token here if it exists
                     if device.twofactor_remember.is_some() {
-                        device.delete_twofactor_remember();
-                        // We need to save here, since we send a err_json!() which prevents saving `device` at a later stage
-                        device.save(true, conn).await?;
+                        // Clear only `twofactor_remember` so we never overwrite a concurrently rotated refresh_token
+                        device.clear_twofactor_remember(conn).await?;
                     }
                     err_json!(
                         json_err_twofactor(&twofactor_ids, user, data, conn).await?,

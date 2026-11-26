@@ -126,11 +126,21 @@ async fn post_settings_domains(
     let equivalent_domains = data.equivalent_domains.unwrap_or_default();
 
     let mut user = headers.user;
+    let expected_stamp = user.security_stamp.clone();
 
     user.excluded_globals = to_string(&excluded_globals).unwrap_or_else(|_| "[]".to_owned());
     user.equivalent_domains = to_string(&equivalent_domains).unwrap_or_else(|_| "[]".to_owned());
 
-    user.save(&conn).await?;
+    user.update_active(
+        &expected_stamp,
+        crate::db::models::UserPatch {
+            excluded_globals: Some(user.excluded_globals.clone()),
+            equivalent_domains: Some(user.equivalent_domains.clone()),
+            ..Default::default()
+        },
+        &conn,
+    )
+    .await?;
 
     nt.send_user_update(UpdateType::SyncSettings, &user, headers.device.push_uuid.as_ref(), &conn).await;
 
