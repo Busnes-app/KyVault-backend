@@ -11,7 +11,7 @@ use crate::{
     auth::{encode_jwt, generate_file_download_claims},
     config::PathType,
     db::{
-        DbConn,
+        DbConn, DbConnInner,
         schema::{attachments, ciphers},
     },
     error::MapResult,
@@ -136,26 +136,35 @@ impl Attachment {
 /// Database methods
 impl Attachment {
     pub async fn save(&self, conn: &DbConn) -> EmptyResult {
-        db_run! { conn:
-            mysql {
-                diesel::insert_into(attachments::table)
-                    .values(self)
-                    .on_conflict(diesel::dsl::DuplicatedKeys)
-                    .do_update()
-                    .set(self)
-                    .execute(conn)
-                    .map_res("Error saving attachment")
-            }
-            postgresql, sqlite {
-                diesel::insert_into(attachments::table)
-                    .values(self)
-                    .on_conflict(attachments::id)
-                    .do_update()
-                    .set(self)
-                    .execute(conn)
-                    .map_res("Error saving attachment")
-            }
+        conn.run(move |conn| self.upsert_on_conn(conn)).await
+    }
+
+    pub(super) fn upsert_on_conn(&self, conn: &mut DbConnInner) -> EmptyResult {
+        match conn {
+            #[cfg(mysql)]
+            DbConnInner::Mysql(conn) => diesel::insert_into(attachments::table)
+                .values(self)
+                .on_conflict(diesel::dsl::DuplicatedKeys)
+                .do_update()
+                .set(self)
+                .execute(conn),
+            #[cfg(postgresql)]
+            DbConnInner::Postgresql(conn) => diesel::insert_into(attachments::table)
+                .values(self)
+                .on_conflict(attachments::id)
+                .do_update()
+                .set(self)
+                .execute(conn),
+            #[cfg(sqlite)]
+            DbConnInner::Sqlite(conn) => diesel::insert_into(attachments::table)
+                .values(self)
+                .on_conflict(attachments::id)
+                .do_update()
+                .set(self)
+                .execute(conn),
         }
+        .map(drop)
+        .map_res("Error saving attachment")
     }
 
     /// Updates `file_size` only if the attachment still exists for its cipher.

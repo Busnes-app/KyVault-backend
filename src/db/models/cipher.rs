@@ -484,8 +484,7 @@ impl Cipher {
         self.save_linked(attachments, &[], conn).await
     }
 
-    /// Saves the cipher with its `attachments` changes and links it to `collections`. The cipher
-    /// row and its links land in one transaction, so a failed share keeps the old ownership.
+    /// Saves the cipher, attachment changes, and collection links in one transaction.
     pub async fn save_linked(
         &mut self,
         attachments: &[Attachment],
@@ -515,13 +514,14 @@ impl Cipher {
         conn.run(move |conn| {
             conn.transaction::<(), crate::Error, _>(|conn| {
                 super::upsert_cipher_tx(conn, cipher)?;
-                super::link_collections_tx(conn, &links)
+                super::link_collections_tx(conn, &links)?;
+                for attachment in attachments {
+                    attachment.upsert_on_conn(conn)?;
+                }
+                Ok(())
             })
         })
         .await?;
-        for att in attachments {
-            att.save(conn).await?;
-        }
         self.update_users_revision(conn).await;
         Ok(())
     }
