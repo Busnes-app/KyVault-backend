@@ -216,7 +216,12 @@ fn install_rustls_crypto_provider() {
 
 #[cfg(test)]
 mod tls_tests {
-    use std::sync::Arc;
+    use std::{
+        net::{TcpListener, TcpStream},
+        sync::Arc,
+        thread,
+        time::Duration,
+    };
 
     use openssl::{asn1::Asn1Time, ec, hash::MessageDigest, nid::Nid, pkey::PKey, x509};
     use rustls::{
@@ -267,22 +272,38 @@ mod tls_tests {
             .with_single_cert(vec![cert], key)
             .unwrap();
 
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let timeout = Duration::from_secs(10);
+        let mut socket = TcpStream::connect_timeout(&listener.local_addr().unwrap(), timeout).unwrap();
+        socket.set_read_timeout(Some(timeout)).unwrap();
+        socket.set_write_timeout(Some(timeout)).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(timeout)).unwrap();
+            socket.set_write_timeout(Some(timeout)).unwrap();
+            let mut server = ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            server.complete_io(&mut socket).expect("server TLS 1.3 handshake failed");
+            assert!(!server.is_handshaking());
+            assert_eq!(server.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
+            assert_eq!(
+                server.negotiated_key_exchange_group().unwrap().name(),
+                NamedGroup::X25519MLKEM768,
+                "server negotiated classical-only TLS instead of X25519MLKEM768"
+            );
+        });
+
         let name = ServerName::try_from("localhost").unwrap();
         let mut client = ClientConnection::new(Arc::new(client_cfg), name).unwrap();
-        let mut server = ServerConnection::new(Arc::new(server_cfg)).unwrap();
-        while client.is_handshaking() || server.is_handshaking() {
-            let mut buf = Vec::new();
-            client.write_tls(&mut buf).unwrap();
-            server.read_tls(&mut buf.as_slice()).unwrap();
-            server.process_new_packets().unwrap();
-            buf.clear();
-            server.write_tls(&mut buf).unwrap();
-            client.read_tls(&mut buf.as_slice()).unwrap();
-            client.process_new_packets().unwrap();
-        }
-
-        assert_eq!(client.negotiated_key_exchange_group().unwrap().name(), NamedGroup::X25519MLKEM768);
-        assert_eq!(server.negotiated_key_exchange_group().unwrap().name(), NamedGroup::X25519MLKEM768);
+        client.complete_io(&mut socket).expect("client TLS 1.3 handshake failed");
+        server.join().expect("server hybrid TLS assertion failed");
+        assert!(!client.is_handshaking());
+        assert_eq!(client.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
+        assert_eq!(
+            client.negotiated_key_exchange_group().unwrap().name(),
+            NamedGroup::X25519MLKEM768,
+            "client negotiated classical-only TLS instead of X25519MLKEM768"
+        );
     }
 }
 

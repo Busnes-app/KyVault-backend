@@ -1,0 +1,41 @@
+name: Worker
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths: ['worker/**', 'scripts/check-pqc-tls.sh', '.github/workflows/worker.yml']
+  pull_request:
+    paths: ['worker/**', 'scripts/check-pqc-tls.sh', '.github/workflows/worker.yml']
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      PUSH_RELAY_URL: ''
+      APNS_RELAY_URL: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: worker/go.mod
+          cache-dependency-path: worker/go.sum
+      - name: Refuse TLS overrides
+        run: scripts/check-pqc-tls.sh
+      - name: Race tests (including default PQ TLS)
+        working-directory: worker
+        run: go test -race ./...
+      - name: PQ TLS with FIPS mode enabled
+        working-directory: worker
+        env:
+          GODEBUG: fips140=on
+        run: go test -count=1 -v -run PQ ./...
