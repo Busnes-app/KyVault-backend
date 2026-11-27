@@ -54,7 +54,7 @@ const (
 	label         = "kyvault-e2e=1"
 	rustImage     = "kyvault-e2e-rust:local"
 	targetVolume  = "kyvault-e2e-target"
-	pgImage       = "postgres:17-alpine"
+	pgImage       = "postgres:18-alpine"
 	s3Image       = "rustfs/rustfs:1.0.3"
 	cellA         = "eu-west-1"
 	cellB         = "eu-west-2"

@@ -192,7 +192,7 @@ cargo test --features sqlite,s3            # tenancy ops run against SQLite
 cd worker && GOWORK=off go test -race ./...
 
 # Live: Rust built with PostgreSQL in Docker, two multi-tenant replicas and one
-# single-tenant SQLite replica, PostgreSQL 17, RustFS, the worker binary and a TLS
+# single-tenant SQLite replica, PostgreSQL 18, RustFS, the worker binary and a TLS
 # KyIdentity fake on the SUITE-DIRECTORY.md wire format.
 worker/e2e/run.sh            # --clean also drops the cargo cache volumes
 worker/e2e/cargo.sh test --features postgresql,s3
