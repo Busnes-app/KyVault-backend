@@ -720,7 +720,7 @@ func (e *env) exec(t *testing.T, q string, args ...any) {
 }
 
 func replicaEnv(port string) []string {
-	return []string{
+	return append([]string{
 		"DATA_FOLDER=/data",
 		"DATABASE_URL=postgresql://vault:vaultpw@127.0.0.1:" + pgPort + "/vault",
 		"TENANCY_MODE=multi",
@@ -732,14 +732,20 @@ func replicaEnv(port string) []string {
 		"SSO_AUTH_ONLY_NOT_SESSION=true", "SSL_CERT_FILE=/data/ca.pem",
 		"SIGNUPS_ALLOWED=false",
 		"DOMAIN=" + domain,
-		"ATTACHMENTS_FOLDER=s3://" + bucket + "/attachments?endpoint=http://127.0.0.1:" + s3Port +
-			"&region=us-east-1&enable_virtual_host_style=false&default_storage_class=STANDARD",
-		"AWS_ACCESS_KEY_ID=" + s3Access, "AWS_SECRET_ACCESS_KEY=" + s3Secret, "AWS_REGION=us-east-1",
 		"AWS_EC2_METADATA_DISABLED=true",
 		"ROCKET_ADDRESS=127.0.0.1", "ROCKET_PORT=" + port,
 		"WEB_VAULT_ENABLED=false", "LOG_LEVEL=info",
 		"LOGIN_RATELIMIT_MAX_BURST=1000", // the journey signs in many times a minute
 		"JOB_POLL_INTERVAL_MS=200", "EMERGENCY_REQUEST_TIMEOUT_SCHEDULE=* * * * * *",
+	}, s3Env()...)
+}
+
+// s3Env is the attachments storage config the replicas and the worker share verbatim.
+func s3Env() []string {
+	return []string{
+		"ATTACHMENTS_FOLDER=s3://" + bucket + "/attachments?endpoint=http://127.0.0.1:" + s3Port +
+			"&region=us-east-1&enable_virtual_host_style=false&default_storage_class=STANDARD",
+		"AWS_ACCESS_KEY_ID=" + s3Access, "AWS_SECRET_ACCESS_KEY=" + s3Secret, "AWS_REGION=us-east-1",
 	}
 }
 
@@ -896,11 +902,10 @@ func (e *env) startWorker(t *testing.T, fromZero bool) {
 		"SYNC_WEBHOOK_SECRET=" + webhookSecret,
 		"ORG_POLL_INTERVAL=1s", "ERASED_POLL_INTERVAL=1s", "STORAGE_REPORT_INTERVAL=1s", "CLEANUP_INTERVAL=1s",
 		"STORAGE_WANT_BYTES=" + strconv.Itoa(wantBytes),
-		"ATTACHMENTS_FOLDER=s3://" + bucket + "/attachments", "SENDS_FOLDER=" + e.sendsDir,
-		"S3_ENDPOINT=http://127.0.0.1:" + s3Port, "S3_REGION=us-east-1",
-		"S3_ACCESS_KEY_ID=" + s3Access, "S3_SECRET_ACCESS_KEY=" + s3Secret, "S3_FORCE_PATH_STYLE=true",
+		"SENDS_FOLDER=" + e.sendsDir,
 		"TENANCY_RECONCILE_FROM_ZERO=" + strconv.FormatBool(fromZero),
 	}
+	cmd.Env = append(cmd.Env, s3Env()...)
 	must(t, cmd.Start())
 	e.workerP = cmd
 	e.workerW = make(chan error, 1)

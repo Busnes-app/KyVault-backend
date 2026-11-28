@@ -166,7 +166,7 @@ and `oidcverify` (RS256 back-channel logout).
 | `TENANCY_MAX_IMPORT_CIPHERS` / `TENANCY_MAX_IMPORT_FOLDERS` | `5000` / `500` | Per import request |
 | `TENANCY_ALLOW_EMERGENCY_ACCESS` | `false` | |
 | `TENANCY_MAX_CIPHERS_PER_TENANT` | `50000` | Default when the org's quotas set no `max_ciphers` |
-| `ATTACHMENTS_FOLDER` | — | `s3://bucket/prefix?endpoint=…&region=…`; credentials from the AWS chain |
+| `ATTACHMENTS_FOLDER` | — | An S3 root (below); credentials from the AWS chain |
 
 Plus the Vaultwarden SSO settings (`SSO_ENABLED`, `SSO_ONLY`, `SSO_AUTHORITY`,
 `SSO_CLIENT_ID`, `SSO_CLIENT_SECRET`), `DATABASE_URL` and `DOMAIN`, which all replicas share.
@@ -191,8 +191,31 @@ Plus the Vaultwarden SSO settings (`SSO_ENABLED`, `SSO_ONLY`, `SSO_AUTHORITY`,
 | `STORAGE_WANT_BYTES` | `268435456` | Growth requested per active tenant |
 | `STORAGE_RENEW_BEFORE` | `180s` | < 900 s. Sent to the vault, which currently reports every live tenant on each pass. |
 | `TENANCY_RECONCILE_FROM_ZERO` | `false` | Restore reconciliation (above) |
-| `ATTACHMENTS_FOLDER` / `SENDS_FOLDER` | `$DATA_FOLDER/attachments` / `…/sends` | The vault's roots: a local dir or `s3://bucket/prefix` with no query string |
-| `S3_ENDPOINT` / `S3_REGION` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_FORCE_PATH_STYLE` | — / `us-east-1` / — / — / `true` | For `s3://` roots |
+| `ATTACHMENTS_FOLDER` / `SENDS_FOLDER` | `$DATA_FOLDER/attachments` / `…/sends` | The vault's roots, set to the replicas' values: a local dir or an S3 root (below) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — / — / `us-east-1` | For S3 roots; static keys only. `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` win when set |
+| `S3_ENDPOINT` / `S3_FORCE_PATH_STYLE` | — / `true` | Legacy, for roots without options. Setting any of these or `S3_REGION` refuses roots with options |
+
+### S3 roots
+
+The replicas and the worker read the same root, so give both the same `ATTACHMENTS_FOLDER`
+(and `SENDS_FOLDER`, `DATA_FOLDER`) and the same `AWS_*` credentials:
+
+```
+s3://<bucket>/<prefix>?endpoint=https://fsn1.your-objectstorage.com&region=fsn1&enable_virtual_host_style=false&default_storage_class=STANDARD
+```
+
+| Option | Default | |
+| --- | --- | --- |
+| `endpoint` | AWS for `region` | `http(s)://host[:port]` |
+| `region` | `AWS_REGION` | |
+| `enable_virtual_host_style` | `true` | `false` for path-style providers (MinIO, RustFS, Hetzner) |
+| `default_storage_class` | `INTELLIGENT_TIERING` | Writes only; most non-AWS providers need `STANDARD` |
+
+The replicas take any OpenDAL S3 option; the worker refuses every option not listed here,
+credential options included. `worker/internal/s3clean/testdata/backend-s3-root.txt` is
+parsed by both test suites. An old worker config with `S3_ENDPOINT` and a root without
+options keeps working unchanged; a worker with no `S3_*` set now defaults to virtual-host
+style, as the replicas do.
 
 ## Tests
 

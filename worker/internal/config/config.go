@@ -54,7 +54,8 @@ type Config struct {
 	StorageRenewBefore time.Duration
 
 	// Storage roots, exactly as the Rust server resolves them: a local directory or
-	// s3://bucket/prefix. Object keys (cells/<cell>/tenants/<tid>/...) are relative to these.
+	// s3://bucket/prefix[?endpoint=…&region=…&enable_virtual_host_style=…]. Object keys
+	// (cells/<cell>/tenants/<tid>/...) are relative to these.
 	AttachmentsRoot string
 	SendsRoot       string
 
@@ -63,6 +64,9 @@ type Config struct {
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 	S3ForcePathStyle  bool
+	// S3EnvOptions names the legacy S3_ENDPOINT/S3_REGION/S3_FORCE_PATH_STYLE settings that
+	// are set; they cannot be mixed with options in an s3:// root.
+	S3EnvOptions []string
 
 	// Warnings lists settings LoadFromEnv adjusted, for the caller to log.
 	Warnings []string
@@ -85,6 +89,13 @@ func LoadFromEnv() (Config, error) {
 	cells, err := ParseCells(env("KY_CELLS"))
 	if err != nil {
 		errs = append(errs, fmt.Errorf("KY_CELLS: %w", err))
+	}
+
+	var s3EnvOptions []string
+	for _, k := range []string{"S3_ENDPOINT", "S3_REGION", "S3_FORCE_PATH_STYLE"} {
+		if env(k) != "" {
+			s3EnvOptions = append(s3EnvOptions, k)
+		}
 	}
 
 	issuer := strings.TrimRight(env("SSO_AUTHORITY"), "/")
@@ -111,10 +122,12 @@ func LoadFromEnv() (Config, error) {
 		AttachmentsRoot:    envOr("ATTACHMENTS_FOLDER", joinRoot(dataFolder, "attachments")),
 		SendsRoot:          envOr("SENDS_FOLDER", joinRoot(dataFolder, "sends")),
 		S3Endpoint:         strings.TrimRight(env("S3_ENDPOINT"), "/"),
-		S3Region:           envOr("S3_REGION", "us-east-1"),
-		S3AccessKeyID:      env("S3_ACCESS_KEY_ID"),
-		S3SecretAccessKey:  env("S3_SECRET_ACCESS_KEY"),
-		S3ForcePathStyle:   boolVar("S3_FORCE_PATH_STYLE", true),
+		S3Region:           envOr("S3_REGION", envOr("AWS_REGION", "us-east-1")),
+		S3AccessKeyID:      envOr("S3_ACCESS_KEY_ID", env("AWS_ACCESS_KEY_ID")),
+		S3SecretAccessKey:  envOr("S3_SECRET_ACCESS_KEY", env("AWS_SECRET_ACCESS_KEY")),
+		// Legacy S3_* configs default to path style; otherwise virtual host, as the backend.
+		S3ForcePathStyle: boolVar("S3_FORCE_PATH_STYLE", len(s3EnvOptions) > 0),
+		S3EnvOptions:     s3EnvOptions,
 	}
 	want, err := envInt("STORAGE_WANT_BYTES", 256<<20)
 	errs = append(errs, err)
@@ -186,7 +199,12 @@ func (c Config) Validate() error {
 	}
 	usesS3 := strings.HasPrefix(c.AttachmentsRoot, "s3://") || strings.HasPrefix(c.SendsRoot, "s3://")
 	if usesS3 && (c.S3AccessKeyID == "" || c.S3SecretAccessKey == "") {
-		errs = append(errs, errors.New("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are required for s3:// storage roots"))
+		errs = append(errs, errors.New("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY) are required for s3:// storage roots"))
+	}
+	for _, r := range []struct{ name, root string }{{"ATTACHMENTS_FOLDER", c.AttachmentsRoot}, {"SENDS_FOLDER", c.SendsRoot}} {
+		if strings.HasPrefix(r.root, "s3://") && strings.Contains(r.root, "?") && len(c.S3EnvOptions) > 0 {
+			errs = append(errs, fmt.Errorf("%s carries S3 options; unset %s", r.name, strings.Join(c.S3EnvOptions, ", ")))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -276,7 +294,12 @@ func joinRoot(base, child string) string {
 		return ""
 	}
 	if strings.HasPrefix(base, "s3://") {
-		return strings.TrimRight(base, "/") + "/" + child
+		// Before the options, as the backend's join_path does.
+		p, q, hasQ := strings.Cut(base, "?")
+		if hasQ {
+			q = "?" + q
+		}
+		return strings.TrimRight(p, "/") + "/" + child + q
 	}
 	return path.Join(base, child)
 }

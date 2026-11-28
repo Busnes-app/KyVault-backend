@@ -341,9 +341,50 @@ func TestForRoot(t *testing.T) {
 	if e, err := ForRoot("", base); e != nil || err != nil {
 		t.Fatal("empty root must be unconfigured")
 	}
-	for _, bad := range []string{"s3://", "s3:///x", "s3://b/x?endpoint=http://evil"} {
+	for _, bad := range []string{
+		"s3://", "s3:///x", "s3://b/x#f", "s3://b/x?region=r#f",
+		"s3://b/x?access_key_id=k", "s3://b/x?root=/other", "s3://b/x?Endpoint=https://e",
+		"s3://b/x?endpoint=ftp://e", "s3://b/x?endpoint=https://u:p@e", "s3://b/x?endpoint=e",
+		"s3://b/x?endpoint=https://a&endpoint=https://b", "s3://b/x?enable_virtual_host_style=maybe",
+		"s3://b/x?enable_virtual_host_style=false&virtual_hosted_style_request=true",
+	} {
 		if _, err := ForRoot(bad, base); err == nil {
 			t.Errorf("ForRoot(%q) accepted", bad)
 		}
+	}
+}
+
+// The backend's s3:// root, shared with src/storage.rs's tests, drives the worker as is.
+func TestForRootBackendFormat(t *testing.T) {
+	raw, err := os.ReadFile("testdata/backend-s3-root.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := ForRoot(strings.TrimSpace(string(raw)), Client{Region: "us-east-1", AccessKeyID: "k", SecretAccessKey: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := e.(*Client)
+	if c.Bucket != "kyvault-fsn1" || c.Root != "kyvault/attachments" || c.Endpoint != "https://fsn1.your-objectstorage.com" ||
+		c.Region != "fsn1" || !c.ForcePathStyle {
+		t.Fatalf("parsed %+v", c)
+	}
+	if e, _ := ForRoot("s3://b/x?aws_virtual_hosted_style_request=true", Client{ForcePathStyle: true}); e.(*Client).ForcePathStyle {
+		t.Fatal("virtual host style option ignored")
+	}
+
+	f, srv := newFakeS3(t)
+	f.put("data/attachments/cells/eu-west-1/tenants/org-a/attachments/c1/a1", "v1")
+	f.put("data/attachments/cells/eu-west-1/tenants/org-b/attachments/c9/a9", "v1")
+	e, err = ForRoot("s3://bucket/data/attachments?endpoint="+srv.URL+"&region=us-east-1&enable_virtual_host_style=false&default_storage_class=STANDARD",
+		Client{AccessKeyID: "AKIA", SecretAccessKey: "secret", HTTPClient: srv.Client(), Now: testClient(srv).Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DeletePrefix(context.Background(), "cells/eu-west-1/tenants/org-a/"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.remaining(); len(got) != 1 || !strings.Contains(got[0], "org-b") {
+		t.Fatalf("remaining = %v, want only org-b", got)
 	}
 }
