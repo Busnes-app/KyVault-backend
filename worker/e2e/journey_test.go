@@ -327,6 +327,19 @@ func TestLiveHostedJourney(t *testing.T) {
 			t.Fatalf("ordinary sign-in to a deletion-scheduled org: want 403, got %d %s", r.code, r.body)
 		}
 
+		// An ordinary token, valid in every other way, still does not open the export.
+		now := time.Now().Unix()
+		ordinary := signRS256(e.vaultKey, map[string]any{"alg": "RS256", "typ": "JWT"}, map[string]any{
+			"nbf": now - 5, "exp": now + 3600, "iss": domain + "|login", "sub": alice.uuid,
+			"premium": true, "name": "alice", "email": alice.email, "email_verified": true,
+			"sstamp": e.str(t, "SELECT security_stamp FROM users WHERE uuid = $1", alice.uuid),
+			"device": alice.device(), "devicetype": "Linux", "client_id": "web",
+			"scope": []string{"api", "offline_access"}, "amr": []string{"Application"}, "tid": orgA,
+		})
+		if r := call(t, "GET", r1+"/api/tenancy/export", bearer(ordinary), nil); r.code != 403 {
+			t.Fatalf("an ordinary token read the restricted export: %d %s", r.code, r.body)
+		}
+
 		r := e.ssoSignIn(t, r2, export(alice), alice.device())
 		tok := signedIn(t, r)
 		if tok.RefreshToken != nil || bytes.Contains(r.body, []byte(`"refresh_token"`)) {
@@ -364,7 +377,6 @@ func TestLiveHostedJourney(t *testing.T) {
 			t.Fatalf("export session opened the notifications hub: %v %d", err, ws.code)
 		}
 		devToken := e.str(t, "SELECT refresh_token FROM devices WHERE uuid = $1 AND user_uuid = $2", alice.device(), alice.uuid)
-		now := time.Now().Unix()
 		forged := signRS256(e.vaultKey, map[string]any{"alg": "RS256", "typ": "JWT"}, map[string]any{
 			"nbf": now - 5, "exp": now + 3600, "iss": domain + "|login", "sub": "sso",
 			"device_token": devToken, "tid": orgA, "export_only": true,
@@ -393,6 +405,19 @@ func TestLiveHostedJourney(t *testing.T) {
 		if r := call(t, "GET", r1+"/api/sync", bearer(bobTok), nil); r.code != 200 {
 			t.Fatalf("orgB lost access when orgA was scheduled for deletion: %d", r.code)
 		}
+
+		// KyIdentity resumes the org: the export window closes, and the still-unexpired export
+		// token gains no ordinary access (a resume rotates nothing).
+		e.kyid.setOrg(orgA, "active", true, cellA)
+		e.waitStatus(t, orgA, "active")
+		for _, path := range []string{"/api/sync", "/api/tenancy/export"} {
+			if r := call(t, "GET", r1+path, bearer(tok.AccessToken), nil); r.code != 403 {
+				t.Fatalf("export token after the org resumed, %s: want 403, got %d", path, r.code)
+			}
+		}
+		e.kyid.setOrg(orgA, "deletion_scheduled", true, cellA)
+		e.waitStatus(t, orgA, "deletion_scheduled")
+		carolTok = signedIn(t, e.ssoSignIn(t, r1, export(carol), carol.device())).AccessToken
 
 		// C5: once orgA is fenced off this deployment's cells, its export session and sign-in fail too.
 		e.kyid.setOrg(orgA, "deletion_scheduled", true, foreignCell)
