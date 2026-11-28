@@ -209,10 +209,10 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
 
     let (sso_auth, user_infos) = sso::exchange_code(code, code_verifier, conn).await?;
 
+    // KyIdentity's restricted export session: only for an existing vault, only while its org is
+    // `deletion_scheduled`, and it reaches only the export route (`ExportHeaders`).
+    let export_only = CONFIG.is_multi_tenant() && user_infos.export_only;
     let multi_tenant_id = if CONFIG.is_multi_tenant() {
-        if user_infos.export_only {
-            err_code!("Export-only principals cannot open ordinary vault sessions", 403);
-        }
         if user_infos.is_staff_admin {
             err_code!("Platform staff principals cannot sign in to customer vaults", 403);
         }
@@ -222,7 +222,11 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
         let Some(tid) = user_infos.org_id.as_deref().filter(|s| !s.trim().is_empty()) else {
             err_code!("OIDC token is missing required org_id claim", 403);
         };
-        crate::tenancy::check_tenant_active(tid, conn).await?;
+        if export_only {
+            crate::tenancy::check_tenant_exportable(tid, conn).await?;
+        } else {
+            crate::tenancy::check_tenant_active(tid, conn).await?;
+        }
         Some(tid.to_owned())
     } else {
         None
@@ -327,6 +331,10 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
     let now = Utc::now().naive_utc();
     // Will trigger 2FA flow if needed
     let (user, mut device, twofactor_token, sso_user) = match user_with_sso {
+        None if export_only => err_code!("Export-only sessions cannot create an account", 403),
+        Some((user, _)) if export_only && user.private_key.is_none() => {
+            err_code!("Export-only sessions need an existing vault", 403)
+        }
         None => {
             if !CONFIG.is_multi_tenant() && !CONFIG.is_sso_signup_allowed(&user_infos.email) {
                 if CONFIG.signups_domains_whitelist().is_empty() {
@@ -664,6 +672,13 @@ async fn authenticated_response(
 
     if !user.akey.is_empty() {
         result["Key"] = Value::String(user.akey.clone());
+    }
+
+    // An export-only session carries no refresh token (KyIdentity tenancy design).
+    if auth_tokens.access_claims.export_only == Some(true)
+        && let Some(obj) = result.as_object_mut()
+    {
+        obj.remove("refresh_token");
     }
 
     if let Some(token) = twofactor_token {

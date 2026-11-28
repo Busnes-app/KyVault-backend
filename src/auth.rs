@@ -678,12 +678,36 @@ pub struct Headers {
     pub ip: ClientIp,
 }
 
+/// A hosted `export_only` session (KyIdentity `export_only` claim) on its one export route.
+/// `Headers` refuses these sessions everywhere else, and this guard refuses every other session.
+pub struct ExportHeaders(pub Headers);
+
+/// Request-local marker set by `ExportHeaders`. The first guard to read it fixes it, so a request
+/// that resolved `Headers` before `ExportHeaders` stays ordinary and refuses the export session.
+struct ExportRoute(bool);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ExportHeaders {
+    type Error = &'static str;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        if !CONFIG.is_multi_tenant() {
+            return Outcome::Forward(Status::NotFound);
+        }
+        if !request.local_cache(|| ExportRoute(true)).0 {
+            err_handler!("Export route guard resolved after ordinary headers")
+        }
+        Headers::from_request(request).await.map(ExportHeaders)
+    }
+}
+
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for Headers {
     type Error = &'static str;
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = request.headers();
+        let export = request.local_cache(|| ExportRoute(false)).0;
 
         let host = try_outcome!(Host::from_request(request).await).host;
         let Outcome::Success(ip) = ClientIp::from_request(request).await else {
@@ -732,13 +756,22 @@ impl<'r> FromRequest<'r> for Headers {
             if claims.tid.as_deref() != Some(tenant_id) {
                 err_handler!("Token tenant mismatch")
             }
-            if claims.export_only.unwrap_or(false) {
+            if claims.export_only.unwrap_or(false) != export {
                 return Outcome::Error((
                     Status::Forbidden,
-                    "Export-only sessions are not allowed on ordinary vault endpoints",
+                    if export {
+                        "Only export-only sessions may use the restricted export"
+                    } else {
+                        "Export-only sessions are not allowed on ordinary vault endpoints"
+                    },
                 ));
             }
-            if let Err(e) = crate::tenancy::check_tenant_active(tenant_id, &conn).await {
+            let tenant = if export {
+                crate::tenancy::check_tenant_exportable(tenant_id, &conn).await
+            } else {
+                crate::tenancy::check_tenant_active(tenant_id, &conn).await
+            };
+            if let Err(e) = tenant {
                 warn!("Rejected request for tenant {tenant_id}: {e}");
                 return Outcome::Error((Status::Forbidden, "Tenant is unavailable"));
             }

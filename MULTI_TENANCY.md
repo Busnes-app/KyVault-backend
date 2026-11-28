@@ -21,8 +21,17 @@ Two processes share one PostgreSQL database:
   subscriptions are refused server-side. Access tokens carry the tenant in `tid`, and every
   request checks it against the user's binding.
 - Sign-in is SSO only. The tenant comes from the ID token's `org_id` claim. Platform staff
-  principals, `export_only` principals and erased `(issuer, subject)` pairs are refused.
-  No session kind short of full access exists: export-only sessions were removed.
+  principals and erased `(issuer, subject)` pairs are refused.
+- **Restricted export.** While an org is `deletion_scheduled`, KyIdentity signs the people
+  it allows to export in with `"export_only": true` (KyIdentity tenancy design, "The
+  `export_only` claim"). The vault admits that sign-in only for an existing vault in a served,
+  app-enabled, fresh org that is `deletion_scheduled`, returns no refresh token, and the
+  session reaches only `GET /api/tenancy/export`: the caller's own personal items and folders
+  as stored ciphertext, with the wrapped user key and KDF settings the client unlocks them
+  with. No organisation items and nothing in plaintext, so neither staff nor an organisation
+  admin can export a member's vault. Every other route, the WebSocket hub and the refresh
+  grant refuse export sessions, the export route refuses every other session, and an
+  `export_only` sign-in never creates an account.
 - **Cells (C1–C5):** The shared install scales by cells (`<geography>-<n>` slugs, e.g.
   `eu-west-1`, read from KyIdentity's `/api/suite/orgs` `home_region`, never from a token).
   One deployment serves 1–32 cells configured in `KY_CELLS` (shared tables keyed by
@@ -191,9 +200,12 @@ Plus the Vaultwarden SSO settings (`SSO_ENABLED`, `SSO_ONLY`, `SSO_AUTHORITY`,
 cargo test --features sqlite,s3            # tenancy ops run against SQLite
 cd worker && GOWORK=off go test -race ./...
 
-# Live: Rust built with PostgreSQL in Docker, two multi-tenant replicas and one
+# Live: Rust built with PostgreSQL and `kye2e` in Docker, two multi-tenant replicas and one
 # single-tenant SQLite replica, PostgreSQL 18, RustFS, the worker binary and a TLS
-# KyIdentity fake on the SUITE-DIRECTORY.md wire format.
+# KyIdentity fake on the SUITE-DIRECTORY.md wire format that is also the OIDC provider.
+# TestLiveHostedJourney signs in through SSO, unlocks with the master password, recovers
+# with a Personal Recovery Kit, restores the database from pg_dump, checks isolation and
+# runs the restricted export.
 worker/e2e/run.sh            # --clean also drops the cargo cache volumes
 worker/e2e/cargo.sh test --features postgresql,s3
 ```

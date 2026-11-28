@@ -369,11 +369,7 @@ pub async fn redeem(
         user_sso.save(conn).await?;
     }
 
-    if CONFIG.is_multi_tenant() && auth_user.export_only {
-        err_code!("Export-only principals cannot open ordinary vault sessions", 403);
-    }
-
-    let tokens = if CONFIG.sso_auth_only_not_session() {
+    let mut tokens = if CONFIG.sso_auth_only_not_session() {
         AuthTokens::new(device, user, AuthMethod::Sso, client_id)
     } else {
         let now = Utc::now();
@@ -390,6 +386,12 @@ pub async fn redeem(
 
         create_auth_tokens_impl(device, auth_user.refresh_token, access_claims, auth_user.access_token)?
     };
+
+    // Only `ExportHeaders` admits these tokens, and the refresh grant refuses them.
+    if CONFIG.is_multi_tenant() && auth_user.export_only {
+        tokens.access_claims.export_only = Some(true);
+        tokens.refresh_claims.export_only = Some(true);
+    }
 
     Ok(tokens)
 }
