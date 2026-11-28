@@ -1,4 +1,4 @@
-// Package e2e drives the real vault binary (two multi-tenant replicas on PostgreSQL 17 and
+// Package e2e drives the real vault binary (two multi-tenant replicas on PostgreSQL 18 and
 // one single-tenant SQLite instance), the real worker binary, RustFS for S3 and a TLS
 // KyIdentity speaking the SUITE-DIRECTORY.md wire format. Run it with worker/e2e/run.sh;
 // without KYVAULT_E2E_PG=1 it skips.

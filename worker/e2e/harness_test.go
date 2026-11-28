@@ -69,10 +69,14 @@ const (
 	clientID      = "kyvault"
 	clientSecret  = "kyvault-client-secret"
 	pgURL         = "postgres://vault:vaultpw@127.0.0.1:" + pgPort + "/vault"
-	issuer        = "https://127.0.0.1:" + kyidPort
-	ttlSeconds    = 600
-	poolBytes     = 10 << 30
-	wantBytes     = 1 << 20
+	// kye2e only starts multi-tenant mode against a `.test` issuer. Replicas resolve this host
+	// through --add-host; the worker and the test reach KyIdentity at kyidURL.
+	kyidHost   = "kyidentity.e2e.test"
+	issuer     = "https://" + kyidHost + ":" + kyidPort
+	kyidURL    = "https://127.0.0.1:" + kyidPort
+	ttlSeconds = 600
+	poolBytes  = 10 << 30
+	wantBytes  = 1 << 20
 )
 
 var (
@@ -318,6 +322,11 @@ type kyid struct {
 
 	logoutKey *rsa.PrivateKey
 	srv       *http.Server
+
+	// OIDC sign-in (sso_test.go)
+	signIns []map[string]any          // claims for the next /authorize calls, in order
+	codes   map[string]oidcGrant      // authorization code -> grant
+	access  map[string]map[string]any // access token -> userinfo claims
 }
 
 func (k *kyid) setOrg(id, status string, enabled bool, region string) {
@@ -477,10 +486,12 @@ func (k *kyid) handler() http.Handler {
 		}
 		writeJSON(w, 200, map[string]any{"results": results})
 	}))
+	k.oidcRoutes(mux)
 	return mux
 }
 
-// tlsFiles writes a throwaway CA and a 127.0.0.1 leaf; the worker trusts the CA via SSL_CERT_FILE.
+// tlsFiles writes a throwaway CA and a leaf for 127.0.0.1 and kyidHost; the worker and the
+// replicas trust the CA via SSL_CERT_FILE.
 func tlsFiles(t *testing.T, dir string) (caFile string, cert tls.Certificate) {
 	t.Helper()
 	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -498,7 +509,7 @@ func tlsFiles(t *testing.T, dir string) (caFile string, cert tls.Certificate) {
 	leafTpl := &x509.Certificate{
 		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "127.0.0.1"},
 		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, DNSNames: []string{kyidHost}, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		KeyUsage: x509.KeyUsageDigitalSignature,
 	}
 	leafDER, err := x509.CreateCertificate(rand.Reader, leafTpl, ca, &leafKey.PublicKey, caKey)
@@ -718,7 +729,7 @@ func replicaEnv(port string) []string {
 		"TENANCY_PG_NOTIFY_ENABLED=true",
 		"SSO_ENABLED=true", "SSO_ONLY=true", "SSO_AUTHORITY=" + issuer,
 		"SSO_CLIENT_ID=" + clientID, "SSO_CLIENT_SECRET=" + clientSecret,
-		"SSO_AUTH_ONLY_NOT_SESSION=true",
+		"SSO_AUTH_ONLY_NOT_SESSION=true", "SSL_CERT_FILE=/data/ca.pem",
 		"SIGNUPS_ALLOWED=false",
 		"DOMAIN=" + domain,
 		"ATTACHMENTS_FOLDER=s3://" + bucket + "/attachments?endpoint=http://127.0.0.1:" + s3Port +
@@ -727,6 +738,7 @@ func replicaEnv(port string) []string {
 		"AWS_EC2_METADATA_DISABLED=true",
 		"ROCKET_ADDRESS=127.0.0.1", "ROCKET_PORT=" + port,
 		"WEB_VAULT_ENABLED=false", "LOG_LEVEL=info",
+		"LOGIN_RATELIMIT_MAX_BURST=1000", // the journey signs in many times a minute
 		"JOB_POLL_INTERVAL_MS=200", "EMERGENCY_REQUEST_TIMEOUT_SCHEDULE=* * * * * *",
 	}
 }
@@ -734,6 +746,7 @@ func replicaEnv(port string) []string {
 func startReplica(t *testing.T, name, dataDir string, envs []string) {
 	t.Helper()
 	args := []string{"run", "-d", "--name", name, "--label", label, "--network", "host",
+		"--add-host", kyidHost + ":127.0.0.1",
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"-v", targetVolume + ":/target:ro", "-v", dataDir + ":/data"}
 	for _, e := range envs {
@@ -786,8 +799,8 @@ func setup(t *testing.T) *env {
 		return nil
 	})
 	t.Cleanup(e.db.Close)
-	if v := e.str(t, "SHOW server_version"); !strings.HasPrefix(v, "17.") {
-		t.Fatalf("want PostgreSQL 17, got %s", v)
+	if v := e.str(t, "SHOW server_version"); !strings.HasPrefix(v, "18.") {
+		t.Fatalf("want PostgreSQL 18, got %s", v)
 	}
 	eventually(t, 60*time.Second, "s3 bucket", func() error {
 		r, err := s3Do(http.MethodPut, "", "", nil)
@@ -811,12 +824,19 @@ func setup(t *testing.T) *env {
 		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(e.vaultKey)}), 0o600))
 
 	// KyIdentity fake on TLS.
-	e.kyid = &kyid{orgs: map[string]*orgState{}, lastSeq: map[string]int64{}, stale: map[string]int64{}}
+	e.kyid = &kyid{orgs: map[string]*orgState{}, lastSeq: map[string]int64{}, stale: map[string]int64{},
+		codes: map[string]oidcGrant{}, access: map[string]map[string]any{}}
 	if e.kyid.logoutKey, err = rsa.GenerateKey(rand.Reader, 2048); err != nil {
 		t.Fatal(err)
 	}
 	var cert tls.Certificate
 	e.caFile, cert = tlsFiles(t, e.dir)
+	ca, err := os.ReadFile(e.caFile)
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(data, "ca.pem"), ca, 0o644))
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(ca)
+	noRedirect.Transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}
 	ln, err := tls.Listen("tcp", "127.0.0.1:"+kyidPort, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
 	if err != nil {
 		t.Fatal(err)
@@ -872,6 +892,7 @@ func (e *env) startWorker(t *testing.T, fromZero bool) {
 		"VAULT_INTERNAL_API_URL=" + r1,
 		"TENANCY_INTERNAL_API_SECRET=" + internalToken,
 		"SSO_AUTHORITY=" + issuer, "SSO_CLIENT_ID=" + clientID, "SSO_CLIENT_SECRET=" + clientSecret,
+		"KYIDENTITY_BASE_URL=" + kyidURL, "OIDC_JWKS_URL=" + kyidURL + "/.well-known/jwks.json",
 		"SYNC_WEBHOOK_SECRET=" + webhookSecret,
 		"ORG_POLL_INTERVAL=1s", "ERASED_POLL_INTERVAL=1s", "STORAGE_REPORT_INTERVAL=1s", "CLEANUP_INTERVAL=1s",
 		"STORAGE_WANT_BYTES=" + strconv.Itoa(wantBytes),
