@@ -120,6 +120,21 @@ pub fn check_tenant_active_for_cells(
     now_ts: i64,
     max_authority_age_secs: i64,
 ) -> EmptyResult {
+    check_tenant_for_cells(tenant, served_cells, now_ts, max_authority_age_secs, false)
+}
+
+/// KyIdentity org status during which `export_only` sessions may export.
+pub const TENANT_STATUS_DELETION_SCHEDULED: &str = "deletion_scheduled";
+
+/// The tenant check, ordinary or (`export`) for an `export_only` session: then the org must be
+/// `deletion_scheduled` (never active, suspended or deleted), and still app-enabled, served and fresh.
+fn check_tenant_for_cells(
+    tenant: &Tenant,
+    served_cells: &[String],
+    now_ts: i64,
+    max_authority_age_secs: i64,
+    export: bool,
+) -> EmptyResult {
     if !is_cell_served(served_cells, &tenant.home_region) {
         warn!(
             "Tenant {} belongs to cell '{}', refused by deployment serving {:?}",
@@ -132,7 +147,14 @@ pub fn check_tenant_active_for_cells(
         err_code!("Password manager is disabled for this organization", 403);
     }
 
-    if !tenant.is_active() {
+    if export {
+        let open = tenant.status == TENANT_STATUS_DELETION_SCHEDULED
+            && tenant.deleted_at.is_none()
+            && tenant.erased_at.is_none();
+        if !open {
+            err_code!(format!("Tenant is not in its export window (status: {})", tenant.status), 403);
+        }
+    } else if !tenant.is_active() {
         err_code!(format!("Tenant is not active (status: {})", tenant.status), 403);
     }
 
@@ -149,16 +171,25 @@ pub fn check_tenant_active_for_cells(
 ///
 /// Ordinary vault access never accepts `export_only` sessions (Design §4.1 & §11 P3).
 pub async fn check_tenant_active(tenant_id: &str, conn: &DbConn) -> Result<Tenant, crate::Error> {
+    check_tenant(tenant_id, false, conn).await
+}
+
+/// The tenant check for an `export_only` session (`check_tenant_for_cells` with `export`).
+pub async fn check_tenant_exportable(tenant_id: &str, conn: &DbConn) -> Result<Tenant, crate::Error> {
+    check_tenant(tenant_id, true, conn).await
+}
+
+async fn check_tenant(tenant_id: &str, export: bool, conn: &DbConn) -> Result<Tenant, crate::Error> {
     let Some(tenant) = Tenant::find_by_id(tenant_id, conn).await else {
         err_code!("Tenant not found or not provisioned in this cell", 403);
     };
 
-    let served_cells = CONFIG.served_cells();
-    check_tenant_active_for_cells(
+    check_tenant_for_cells(
         &tenant,
-        &served_cells,
+        &CONFIG.served_cells(),
         Utc::now().timestamp(),
         CONFIG.tenancy_authority_max_age_secs(),
+        export,
     )?;
     Ok(tenant)
 }
@@ -490,5 +521,39 @@ mod tests {
         assert!(!pubsub::is_safe_pg_ident("kyvault; DROP TABLE users;--"));
         assert!(!pubsub::is_safe_pg_ident("bad-hyphen"));
         assert!(!pubsub::is_safe_pg_ident("KyVault_notify"), "the listener and config share this check");
+    }
+
+    #[test]
+    fn export_window_is_only_a_served_fresh_deletion_scheduled_org() {
+        let now = 1_000_000;
+        let served = vec!["eu-west-1".to_owned()];
+        let mut t = Tenant::new("t1".to_owned(), "eu-west-1".to_owned());
+        t.app_enabled = true;
+        t.authority_refreshed_at = Some(now);
+        let export = |t: &Tenant| check_tenant_for_cells(t, &served, now, 900, true).is_ok();
+        let ordinary = |t: &Tenant| check_tenant_active_for_cells(t, &served, now, 900).is_ok();
+
+        for status in [TENANT_STATUS_ACTIVE, "suspended", "purge_pending", "deleted"] {
+            t.status = status.to_owned();
+            assert!(!export(&t), "{status} must not open the export window");
+        }
+        t.status = TENANT_STATUS_ACTIVE.to_owned();
+        assert!(ordinary(&t));
+
+        t.status = TENANT_STATUS_DELETION_SCHEDULED.to_owned();
+        assert!(export(&t));
+        assert!(!ordinary(&t), "a deletion-scheduled org gets no ordinary session");
+
+        t.app_enabled = false;
+        assert!(!export(&t), "app disabled");
+        t.app_enabled = true;
+        t.authority_refreshed_at = Some(now - 901);
+        assert!(!export(&t), "stale authority");
+        t.authority_refreshed_at = Some(now);
+        t.home_region = "us-east-1".to_owned();
+        assert!(!export(&t), "unserved cell (C5)");
+        t.home_region = "eu-west-1".to_owned();
+        t.deleted_at = Some(Utc::now().naive_utc());
+        assert!(!export(&t), "deleted");
     }
 }

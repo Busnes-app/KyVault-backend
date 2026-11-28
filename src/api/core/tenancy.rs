@@ -11,11 +11,14 @@ use rocket::{
 
 use crate::{
     CONFIG,
-    api::{EmptyResult, JsonResult},
-    auth::Headers,
+    api::{
+        EmptyResult, JsonResult,
+        core::{CipherSyncData, CipherSyncType},
+    },
+    auth::{ExportHeaders, Headers},
     db::{
         DbConn,
-        models::{Tenant, TenantRecoveryBundle, User},
+        models::{Cipher, Folder, Tenant, TenantRecoveryBundle, User},
     },
 };
 
@@ -24,7 +27,13 @@ const MAX_KDF_PARAMS_LEN: usize = 4_096;
 const MAX_HINT_LEN: usize = 256;
 
 pub fn routes() -> Vec<Route> {
-    routes![get_tenancy_status, put_personal_recovery, get_personal_recovery, delete_personal_recovery,]
+    routes![
+        get_tenancy_status,
+        put_personal_recovery,
+        get_personal_recovery,
+        delete_personal_recovery,
+        get_restricted_export,
+    ]
 }
 
 fn effective_tenant_id(user: &User) -> Result<String, crate::Error> {
@@ -202,4 +211,43 @@ async fn get_personal_recovery(headers: Headers, conn: DbConn) -> JsonResult {
 async fn delete_personal_recovery(headers: Headers, conn: DbConn) -> EmptyResult {
     let tid = effective_tenant_id(&headers.user)?;
     TenantRecoveryBundle::revoke_personal_kit(&tid, &headers.user.uuid, &conn).await
+}
+
+/// The restricted account export (KyIdentity `export_only` claim, org `deletion_scheduled`).
+/// Only the caller's own personal items and folders, as stored ciphertext with the key material
+/// the user unlocks with their master password. No organisation data, and nothing in plaintext:
+/// the server holds none, so neither staff nor an organisation admin can export a vault.
+#[get("/tenancy/export")]
+async fn get_restricted_export(headers: ExportHeaders, conn: DbConn) -> JsonResult {
+    let Headers {
+        host,
+        user,
+        ..
+    } = headers.0;
+    let sync_data = CipherSyncData::new(&user.uuid, CipherSyncType::User, &conn).await;
+    let mut ciphers = Vec::new();
+    for c in Cipher::find_owned_by_user(&user.uuid, &conn).await {
+        if c.deleted_at.is_none() {
+            ciphers.push(c.to_json(&host, &user.uuid, Some(&sync_data), CipherSyncType::User, &conn).await?);
+        }
+    }
+    let folders: Vec<Value> = Folder::find_by_user(&user.uuid, &conn).await.iter().map(Folder::to_json).collect();
+
+    info!("AUDIT: User {} downloaded the restricted export (tenant {:?})", user.uuid, user.tenant_id);
+
+    Ok(Json(json!({
+        "object": "kyvaultRestrictedExport",
+        "userId": user.uuid,
+        "email": user.email,
+        "kdf": {
+            "kdfType": user.client_kdf_type,
+            "iterations": user.client_kdf_iter,
+            "memory": user.client_kdf_memory,
+            "parallelism": user.client_kdf_parallelism,
+        },
+        "key": user.akey,
+        "privateKey": user.private_key,
+        "folders": folders,
+        "ciphers": ciphers,
+    })))
 }
