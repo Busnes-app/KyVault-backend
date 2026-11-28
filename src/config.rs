@@ -1186,11 +1186,11 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
     match cfg.tenancy_mode.to_ascii_lowercase().as_str() {
         "single" => {}
         "multi" => {
-            #[cfg(not(feature = "kye2e"))]
+            #[cfg(not(any(feature = "hosted", feature = "kye2e")))]
             {
                 err!("TENANCY_MODE=multi is not available in this release; unset it or set single");
             }
-            #[cfg(feature = "kye2e")]
+            #[cfg(any(feature = "hosted", feature = "kye2e"))]
             {
                 if let Err(msg) = crate::tenancy::parse_ky_cells(&cfg.ky_cells) {
                     err!(msg);
@@ -1198,10 +1198,15 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
                 if !cfg.sso_enabled || !cfg.sso_only {
                     err!("`SSO_ENABLED=true` and `SSO_ONLY=true` are required when `TENANCY_MODE=multi`");
                 }
+                // kye2e stays test-only, even when built together with hosted.
+                #[cfg(feature = "kye2e")]
                 if !is_kye2e_test_issuer(&cfg.sso_authority) {
                     err!(
                         "`SSO_AUTHORITY` host must end with `.test` when `TENANCY_MODE=multi` is enabled via the `kye2e` feature"
                     );
+                }
+                if !cfg.sso_authority.trim().to_ascii_lowercase().starts_with("https://") {
+                    err!("An `https://` `SSO_AUTHORITY` is required when `TENANCY_MODE=multi`");
                 }
                 if cfg.signups_allowed {
                     err!("`SIGNUPS_ALLOWED=false` is required when `TENANCY_MODE=multi`");
@@ -2100,23 +2105,23 @@ mod tests {
         assert!(validate_config(&cfg, false).is_ok());
     }
 
-    #[cfg(not(feature = "kye2e"))]
+    #[cfg(not(any(feature = "hosted", feature = "kye2e")))]
     #[test]
-    fn multi_tenant_is_refused_without_kye2e() {
+    fn multi_tenant_is_refused_without_hosted_or_kye2e() {
         let mut cfg = valid_single_tenant_config();
         cfg.tenancy_mode = "multi".to_owned();
-        let err = validate_config(&cfg, false).expect_err("TENANCY_MODE=multi must be refused without kye2e");
+        let err = validate_config(&cfg, false).expect_err("TENANCY_MODE=multi must be refused without hosted or kye2e");
         assert!(
             err.to_string().contains("TENANCY_MODE=multi is not available in this release; unset it or set single"),
             "unexpected error: {err}"
         );
     }
 
-    #[cfg(all(postgresql, not(feature = "kye2e")))]
+    #[cfg(all(postgresql, not(any(feature = "hosted", feature = "kye2e"))))]
     #[test]
-    fn fully_configured_multi_tenant_is_refused_without_kye2e() {
+    fn fully_configured_multi_tenant_is_refused_without_hosted_or_kye2e() {
         let cfg = valid_multi_tenant_config();
-        let err = validate_config(&cfg, false).expect_err("TENANCY_MODE=multi must be refused without kye2e");
+        let err = validate_config(&cfg, false).expect_err("TENANCY_MODE=multi must be refused without hosted or kye2e");
         assert!(
             err.to_string().contains("TENANCY_MODE=multi is not available in this release; unset it or set single"),
             "unexpected error: {err}"
@@ -2141,7 +2146,7 @@ mod tests {
         assert!(!is_kye2e_test_issuer("https://kyidentity.test@evil.com"));
     }
 
-    #[cfg(all(postgresql, feature = "kye2e"))]
+    #[cfg(all(postgresql, any(feature = "hosted", feature = "kye2e")))]
     #[test]
     fn multi_tenant_accepts_valid_config_without_admin_panel() {
         let cfg = valid_multi_tenant_config();
@@ -2177,7 +2182,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(postgresql, feature = "kye2e"))]
+    #[cfg(all(postgresql, any(feature = "hosted", feature = "kye2e")))]
     #[test]
     fn multi_tenant_refuses_disable_admin_token() {
         let mut cfg = valid_multi_tenant_config();
@@ -2186,12 +2191,44 @@ mod tests {
         assert!(err.to_string().contains("DISABLE_ADMIN_TOKEN=false"), "unexpected error: {err}");
     }
 
-    #[cfg(all(postgresql, feature = "kye2e"))]
+    #[cfg(all(postgresql, any(feature = "hosted", feature = "kye2e")))]
     #[test]
     fn multi_tenant_refuses_admin_token() {
         let mut cfg = valid_multi_tenant_config();
         cfg.admin_token = Some("super-secret-token".to_owned());
         let err = validate_config(&cfg, false).expect_err("ADMIN_TOKEN must be refused in multi mode");
         assert!(err.to_string().contains("ADMIN_TOKEN"), "unexpected error: {err}");
+    }
+
+    #[cfg(all(postgresql, feature = "hosted", not(feature = "kye2e")))]
+    #[test]
+    fn multi_tenant_accepts_real_issuer_under_hosted() {
+        let mut cfg = valid_multi_tenant_config();
+        cfg.sso_authority = "https://id.busnes.app".to_owned();
+        assert!(validate_config(&cfg, false).is_ok());
+    }
+
+    #[cfg(all(postgresql, any(feature = "hosted", feature = "kye2e")))]
+    #[test]
+    fn multi_tenant_keeps_every_startup_check() {
+        let cases: [(&str, fn(&mut ConfigItems)); 9] = [
+            ("KY_CELLS", |c| c.ky_cells = String::new()),
+            ("SSO_ONLY=true", |c| c.sso_only = false),
+            ("https://", |c| c.sso_authority = "http://kyidentity.test".to_owned()),
+            ("SIGNUPS_ALLOWED=false", |c| c.signups_allowed = true),
+            ("PostgreSQL", |c| c.database_url = "mysql://kyvault:pw@127.0.0.1/kyvault".to_owned()),
+            ("S3", |c| c.attachments_folder = "data/attachments".to_owned()),
+            ("TENANCY_INTERNAL_API_SECRET", |c| c.tenancy_internal_api_secret = Some("short".to_owned())),
+            ("TENANCY_AUTHORITY_MAX_AGE_SECS", |c| c.tenancy_authority_max_age_secs = 901),
+            ("TENANCY_PG_NOTIFY_CHANNEL", |c| c.tenancy_pg_notify_channel = "Bad-Channel".to_owned()),
+        ];
+        for (want, break_it) in cases {
+            let mut cfg = valid_multi_tenant_config();
+            break_it(&mut cfg);
+            let Err(err) = validate_config(&cfg, false) else {
+                panic!("multi mode must refuse a config without {want}");
+            };
+            assert!(err.to_string().contains(want), "expected {want}, got: {err}");
+        }
     }
 }

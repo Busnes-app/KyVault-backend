@@ -60,6 +60,8 @@ oidc-accept-string-booleans = ["openidconnect/accept-string-booleans"]
 
 # Enable multi-tenant mode for E2E test builds only (requires *.test OIDC issuer)
 kye2e = []
+# Enable multi-tenant mode for the private hosted image. Never in public images or registries.
+hosted = []
 
 # Enable unstable features, requires nightly
 # Currently only used to enable rusts official ip support

@@ -20,6 +20,13 @@ KyVault-backend is the Busnes-app Vaultwarden fork, with a Go directory-sync wor
 - Worker PQ tests use `ky-primitives/pqtls.RequireHybrid` and run in separate
   default and `GODEBUG=fips140=on` processes.
 
+- `TENANCY_MODE=multi` starts only with the `hosted` feature (private hosted image:
+  `docker build --build-arg DB=postgresql,s3,hosted .`) or the test-only `kye2e`
+  feature (`.test` issuers only). Never push a hosted image to a public registry.
+  Public images get features only from Cargo defaults, `Dockerfile`, `docker/` and
+  publishing workflows; `scripts/check-public-image-features.sh` refuses either
+  feature there and `scripts/test-check-public-image-features.sh` proves it.
+
 # Work Guidance
 
 # Verification
