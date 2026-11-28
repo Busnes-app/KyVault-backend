@@ -299,4 +299,21 @@ mod s3_tests {
         assert_eq!(parent(path).as_deref(), Some("s3://bucket/base?region=us-west-2"));
         assert_eq!(file_name(path).as_deref(), Some("config.json"));
     }
+
+    // The same root the worker's tests parse (worker/internal/s3clean/testdata).
+    #[test]
+    fn reads_the_root_the_worker_reads() {
+        let root = include_str!("../worker/internal/s3clean/testdata/backend-s3-root.txt").trim();
+        let uri = opendal::OperatorUri::new(root, std::iter::empty::<(String, String)>()).unwrap();
+        let config = <opendal::services::S3Config as opendal::Configurator>::from_uri(&uri).unwrap();
+        assert_eq!(config.bucket, "kyvault-fsn1");
+        assert_eq!(config.root.as_deref(), Some("kyvault/attachments"));
+        assert_eq!(config.endpoint.as_deref(), Some("https://fsn1.your-objectstorage.com"));
+        assert_eq!(config.region.as_deref(), Some("fsn1"));
+        assert!(!config.enable_virtual_host_style);
+        assert_eq!(config.default_storage_class.as_deref(), Some("STANDARD"));
+        // Another test may have installed it already.
+        drop(crate::rustls_crypto_provider().install_default());
+        operator_for_path(root).unwrap();
+    }
 }
