@@ -1,6 +1,6 @@
 FROM playwright_oidc_vaultwarden_prebuilt AS prebuilt
 
-FROM node:22-trixie AS build
+FROM node:26.13.1-trixie@sha256:f8e5d4bb28fa55c74f1345166a082a10b7c68f22304350c1ce0d18358ae94996 AS build
 
 ARG REPO_URL
 ARG COMMIT_HASH
