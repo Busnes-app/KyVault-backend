@@ -83,6 +83,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Refuse private or test-only features in public images
+        run: scripts/check-public-image-features.sh
+
       # Normalize the architecture string for use in paths and cache keys
       - name: Normalize architecture string
         env:

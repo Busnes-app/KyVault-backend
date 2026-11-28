@@ -56,6 +56,17 @@ services:
       - 127.0.0.1:8000:80
 ```
 
+### Private hosted image (multi-tenant)
+
+`TENANCY_MODE=multi` runs only in a binary built with the private `hosted` Cargo feature (see [MULTI_TENANCY.md](MULTI_TENANCY.md)). Public images and release workflows never enable it, and CI fails if they do (`scripts/check-public-image-features.sh`). Build the hosted image by hand and push it only to the private registry:
+
+```shell
+docker build --build-arg DB=postgresql,s3,hosted -t <private-registry>/kyvault-backend:hosted .
+```
+
+> [!CAUTION]
+> Never push a `hosted` image to a public registry (Docker Hub, public GHCR, Quay) or tag it with a public image name. The test-only `kye2e` feature is never used for hosted builds.
+
 Configuration variables are documented in [`.env.template`](.env.template) and the upstream [Vaultwarden Wiki](https://github.com/dani-garcia/vaultwarden/wiki).
 
 ### Building from source and testing
